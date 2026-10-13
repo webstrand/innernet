@@ -18,6 +18,7 @@ pub mod peer;
 pub mod prompts;
 pub mod types;
 pub mod wg;
+pub mod xeddsa;
 
 pub use anyhow::Error;
 pub use types::*;
