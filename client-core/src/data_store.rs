@@ -99,18 +99,41 @@ impl DataStore {
         Ok(())
     }
 
+    /// Validates that no peer in `new_peers` has an IP pinned to a different public key, or a
+    /// public key pinned to a different IP, without modifying the store. This must be called
+    /// before `new_peers` is applied to the interface.
+    pub fn check_pins(&self, new_peers: &[Peer]) -> Result<(), Error> {
+        for new_peer in new_peers.iter() {
+            for existing_peer in self.peers() {
+                if existing_peer.ip == new_peer.ip
+                    && existing_peer.public_key != new_peer.public_key
+                {
+                    bail!("PINNING ERROR: New peer has same IP but different public key.");
+                }
+                if existing_peer.public_key == new_peer.public_key
+                    && existing_peer.ip != new_peer.ip
+                {
+                    bail!("PINNING ERROR: New peer has same public key but different IP.");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn update_peers(&mut self, new_peers: &[Peer]) -> Result<(), Error> {
+        self.check_pins(new_peers)?;
+
         let peers = match &mut self.contents {
             Contents::V1 { ref mut peers, .. } => peers,
         };
 
         for new_peer in new_peers.iter() {
-            if let Some(existing_peer) = peers.iter_mut().find(|p| p.ip == new_peer.ip) {
-                if existing_peer.public_key != new_peer.public_key {
-                    bail!("PINNING ERROR: New peer has same IP but different public key.");
-                } else {
-                    *existing_peer = new_peer.clone();
-                }
+            if let Some(existing_peer) = peers
+                .iter_mut()
+                .find(|p| p.public_key == new_peer.public_key)
+            {
+                *existing_peer = new_peer.clone();
             } else {
                 peers.push(new_peer.clone());
             }
@@ -225,6 +248,31 @@ mod tests {
 
         // Should NOT work, since peer is unmodified.
         assert!(store.update_peers(&modified).is_err());
+    }
+
+    #[test]
+    fn test_pinning_public_key_to_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+
+        // The same public key reported at another IP is refused, before and when updating.
+        let mut moved = BASE_PEERS.clone();
+        moved[0].contents.ip = "10.0.0.2".parse().unwrap();
+        assert!(store.check_pins(&moved).is_err());
+        assert!(store.update_peers(&moved).is_err());
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // Other changes to a pinned peer are applied in place, and new peers are added.
+        let mut updated = BASE_PEERS.clone();
+        updated[0].contents.name = "renamed".parse().unwrap();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
+        new_peer.contents.public_key = "def".to_string();
+        updated.push(new_peer);
+        store.update_peers(&updated).unwrap();
+        assert_eq!(store.peers(), &updated[..]);
     }
 
     #[test]

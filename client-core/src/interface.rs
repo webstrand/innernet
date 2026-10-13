@@ -231,6 +231,9 @@ pub fn fetch(
         },
     };
 
+    // Pinned (IP, PublicKey) tuples are validated before the new peers touch the interface.
+    store.check_pins(&peers).context(interface.to_string())?;
+
     // Apply the local peer endpoint overrides.
     for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
         log::debug!(
