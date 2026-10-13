@@ -3,7 +3,6 @@ authors = ["Ryo Kawaguchi <ryo@kawagu.ch>"]
 categories = ["command-line-interface", "network-programming"]
 description = "A simplistic programmatic /etc/hosts file editor"
 edition = "2021"
-homepage = "https://github.com/tonarino/innernet"
 keywords.workspace = true
 license = "MIT"
 name = "hostsfile"
