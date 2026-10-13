@@ -39,6 +39,7 @@ _innernet() {
         case $line[1] in
             (install)
 _arguments "${_arguments_options[@]}" : \
+'--listen-port=[The local WireGuard listen port]:LISTEN_PORT:_default' \
 '--hosts-path=[The path to write hosts to]:HOSTS_PATH:_files' \
 '--host-suffix=[Use a different suffix for hosts, than '\''INTERFACE.wg'\'' , ex. --host-suffix '\''evilnet'\'' names peers\: PEER.evilnet, and --host-suffix '\'''\'' gives peers no suffix, just\: PEER]:HOST_SUFFIX:_default' \
 '(--default-name)--name=[Set a specific interface name]:NAME:_default' \
@@ -191,6 +192,24 @@ _arguments "${_arguments_options[@]}" : \
 ':interface:_default' \
 && ret=0
 ;;
+(delete-peer)
+_arguments "${_arguments_options[@]}" : \
+'--name=[Name of the peer to delete/forget]:NAME:_default' \
+'--yes[Bypasses confirmation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':interface:_default' \
+&& ret=0
+;;
+(forget-peer)
+_arguments "${_arguments_options[@]}" : \
+'--name=[Name of the peer to delete/forget]:NAME:_default' \
+'--yes[Bypasses confirmation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':interface:_default' \
+&& ret=0
+;;
 (add-association)
 _arguments "${_arguments_options[@]}" : \
 '--yes[Bypass confirmation]' \
@@ -264,7 +283,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_innernet__help_commands" \
+":: :_innernet__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -330,6 +349,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(delete-peer)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(forget-peer)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (add-association)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -388,6 +415,8 @@ _innernet_commands() {
 'list-cidrs:List CIDRs' \
 'disable-peer:Disable an enabled peer' \
 'enable-peer:Enable a disabled peer' \
+'delete-peer:Permanently deletes a disabled peer, freeing its name and IP for reuse' \
+'forget-peer:Forgets a deleted peer, so that its IP may be reused' \
 'add-association:Add an association between CIDRs' \
 'delete-association:Delete an association between CIDRs' \
 'list-associations:List existing assocations between CIDRs' \
@@ -399,58 +428,68 @@ _innernet_commands() {
     )
     _describe -t commands 'innernet commands' commands "$@"
 }
-(( $+functions[_innernet__add-association_commands] )) ||
-_innernet__add-association_commands() {
+(( $+functions[_innernet__subcmd__add-association_commands] )) ||
+_innernet__subcmd__add-association_commands() {
     local commands; commands=()
     _describe -t commands 'innernet add-association commands' commands "$@"
 }
-(( $+functions[_innernet__add-cidr_commands] )) ||
-_innernet__add-cidr_commands() {
+(( $+functions[_innernet__subcmd__add-cidr_commands] )) ||
+_innernet__subcmd__add-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet add-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__add-peer_commands] )) ||
-_innernet__add-peer_commands() {
+(( $+functions[_innernet__subcmd__add-peer_commands] )) ||
+_innernet__subcmd__add-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet add-peer commands' commands "$@"
 }
-(( $+functions[_innernet__completions_commands] )) ||
-_innernet__completions_commands() {
+(( $+functions[_innernet__subcmd__completions_commands] )) ||
+_innernet__subcmd__completions_commands() {
     local commands; commands=()
     _describe -t commands 'innernet completions commands' commands "$@"
 }
-(( $+functions[_innernet__delete-association_commands] )) ||
-_innernet__delete-association_commands() {
+(( $+functions[_innernet__subcmd__delete-association_commands] )) ||
+_innernet__subcmd__delete-association_commands() {
     local commands; commands=()
     _describe -t commands 'innernet delete-association commands' commands "$@"
 }
-(( $+functions[_innernet__delete-cidr_commands] )) ||
-_innernet__delete-cidr_commands() {
+(( $+functions[_innernet__subcmd__delete-cidr_commands] )) ||
+_innernet__subcmd__delete-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet delete-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__disable-peer_commands] )) ||
-_innernet__disable-peer_commands() {
+(( $+functions[_innernet__subcmd__delete-peer_commands] )) ||
+_innernet__subcmd__delete-peer_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet delete-peer commands' commands "$@"
+}
+(( $+functions[_innernet__subcmd__disable-peer_commands] )) ||
+_innernet__subcmd__disable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet disable-peer commands' commands "$@"
 }
-(( $+functions[_innernet__down_commands] )) ||
-_innernet__down_commands() {
+(( $+functions[_innernet__subcmd__down_commands] )) ||
+_innernet__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'innernet down commands' commands "$@"
 }
-(( $+functions[_innernet__enable-peer_commands] )) ||
-_innernet__enable-peer_commands() {
+(( $+functions[_innernet__subcmd__enable-peer_commands] )) ||
+_innernet__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet enable-peer commands' commands "$@"
 }
-(( $+functions[_innernet__fetch_commands] )) ||
-_innernet__fetch_commands() {
+(( $+functions[_innernet__subcmd__fetch_commands] )) ||
+_innernet__subcmd__fetch_commands() {
     local commands; commands=()
     _describe -t commands 'innernet fetch commands' commands "$@"
 }
-(( $+functions[_innernet__help_commands] )) ||
-_innernet__help_commands() {
+(( $+functions[_innernet__subcmd__forget-peer_commands] )) ||
+_innernet__subcmd__forget-peer_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet forget-peer commands' commands "$@"
+}
+(( $+functions[_innernet__subcmd__help_commands] )) ||
+_innernet__subcmd__help_commands() {
     local commands; commands=(
 'install:Install a new innernet config' \
 'show:Enumerate all innernet connections' \
@@ -466,6 +505,8 @@ _innernet__help_commands() {
 'list-cidrs:List CIDRs' \
 'disable-peer:Disable an enabled peer' \
 'enable-peer:Enable a disabled peer' \
+'delete-peer:Permanently deletes a disabled peer, freeing its name and IP for reuse' \
+'forget-peer:Forgets a deleted peer, so that its IP may be reused' \
 'add-association:Add an association between CIDRs' \
 'delete-association:Delete an association between CIDRs' \
 'list-associations:List existing assocations between CIDRs' \
@@ -477,168 +518,178 @@ _innernet__help_commands() {
     )
     _describe -t commands 'innernet help commands' commands "$@"
 }
-(( $+functions[_innernet__help__add-association_commands] )) ||
-_innernet__help__add-association_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__add-association_commands] )) ||
+_innernet__subcmd__help__subcmd__add-association_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help add-association commands' commands "$@"
 }
-(( $+functions[_innernet__help__add-cidr_commands] )) ||
-_innernet__help__add-cidr_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__add-cidr_commands] )) ||
+_innernet__subcmd__help__subcmd__add-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help add-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__help__add-peer_commands] )) ||
-_innernet__help__add-peer_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__add-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__add-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help add-peer commands' commands "$@"
 }
-(( $+functions[_innernet__help__completions_commands] )) ||
-_innernet__help__completions_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__completions_commands] )) ||
+_innernet__subcmd__help__subcmd__completions_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help completions commands' commands "$@"
 }
-(( $+functions[_innernet__help__delete-association_commands] )) ||
-_innernet__help__delete-association_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__delete-association_commands] )) ||
+_innernet__subcmd__help__subcmd__delete-association_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help delete-association commands' commands "$@"
 }
-(( $+functions[_innernet__help__delete-cidr_commands] )) ||
-_innernet__help__delete-cidr_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__delete-cidr_commands] )) ||
+_innernet__subcmd__help__subcmd__delete-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help delete-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__help__disable-peer_commands] )) ||
-_innernet__help__disable-peer_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__delete-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__delete-peer_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet help delete-peer commands' commands "$@"
+}
+(( $+functions[_innernet__subcmd__help__subcmd__disable-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__disable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help disable-peer commands' commands "$@"
 }
-(( $+functions[_innernet__help__down_commands] )) ||
-_innernet__help__down_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__down_commands] )) ||
+_innernet__subcmd__help__subcmd__down_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help down commands' commands "$@"
 }
-(( $+functions[_innernet__help__enable-peer_commands] )) ||
-_innernet__help__enable-peer_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__enable-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help enable-peer commands' commands "$@"
 }
-(( $+functions[_innernet__help__fetch_commands] )) ||
-_innernet__help__fetch_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__fetch_commands] )) ||
+_innernet__subcmd__help__subcmd__fetch_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help fetch commands' commands "$@"
 }
-(( $+functions[_innernet__help__help_commands] )) ||
-_innernet__help__help_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__forget-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__forget-peer_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet help forget-peer commands' commands "$@"
+}
+(( $+functions[_innernet__subcmd__help__subcmd__help_commands] )) ||
+_innernet__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help help commands' commands "$@"
 }
-(( $+functions[_innernet__help__install_commands] )) ||
-_innernet__help__install_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__install_commands] )) ||
+_innernet__subcmd__help__subcmd__install_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help install commands' commands "$@"
 }
-(( $+functions[_innernet__help__list-associations_commands] )) ||
-_innernet__help__list-associations_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__list-associations_commands] )) ||
+_innernet__subcmd__help__subcmd__list-associations_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help list-associations commands' commands "$@"
 }
-(( $+functions[_innernet__help__list-cidrs_commands] )) ||
-_innernet__help__list-cidrs_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__list-cidrs_commands] )) ||
+_innernet__subcmd__help__subcmd__list-cidrs_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help list-cidrs commands' commands "$@"
 }
-(( $+functions[_innernet__help__override-endpoint_commands] )) ||
-_innernet__help__override-endpoint_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__override-endpoint_commands] )) ||
+_innernet__subcmd__help__subcmd__override-endpoint_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help override-endpoint commands' commands "$@"
 }
-(( $+functions[_innernet__help__override-peer-endpoint_commands] )) ||
-_innernet__help__override-peer-endpoint_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__override-peer-endpoint_commands] )) ||
+_innernet__subcmd__help__subcmd__override-peer-endpoint_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help override-peer-endpoint commands' commands "$@"
 }
-(( $+functions[_innernet__help__rename-cidr_commands] )) ||
-_innernet__help__rename-cidr_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__rename-cidr_commands] )) ||
+_innernet__subcmd__help__subcmd__rename-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help rename-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__help__rename-peer_commands] )) ||
-_innernet__help__rename-peer_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__rename-peer_commands] )) ||
+_innernet__subcmd__help__subcmd__rename-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help rename-peer commands' commands "$@"
 }
-(( $+functions[_innernet__help__set-listen-port_commands] )) ||
-_innernet__help__set-listen-port_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__set-listen-port_commands] )) ||
+_innernet__subcmd__help__subcmd__set-listen-port_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help set-listen-port commands' commands "$@"
 }
-(( $+functions[_innernet__help__show_commands] )) ||
-_innernet__help__show_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__show_commands] )) ||
+_innernet__subcmd__help__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help show commands' commands "$@"
 }
-(( $+functions[_innernet__help__uninstall_commands] )) ||
-_innernet__help__uninstall_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__uninstall_commands] )) ||
+_innernet__subcmd__help__subcmd__uninstall_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help uninstall commands' commands "$@"
 }
-(( $+functions[_innernet__help__up_commands] )) ||
-_innernet__help__up_commands() {
+(( $+functions[_innernet__subcmd__help__subcmd__up_commands] )) ||
+_innernet__subcmd__help__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help up commands' commands "$@"
 }
-(( $+functions[_innernet__install_commands] )) ||
-_innernet__install_commands() {
+(( $+functions[_innernet__subcmd__install_commands] )) ||
+_innernet__subcmd__install_commands() {
     local commands; commands=()
     _describe -t commands 'innernet install commands' commands "$@"
 }
-(( $+functions[_innernet__list-associations_commands] )) ||
-_innernet__list-associations_commands() {
+(( $+functions[_innernet__subcmd__list-associations_commands] )) ||
+_innernet__subcmd__list-associations_commands() {
     local commands; commands=()
     _describe -t commands 'innernet list-associations commands' commands "$@"
 }
-(( $+functions[_innernet__list-cidrs_commands] )) ||
-_innernet__list-cidrs_commands() {
+(( $+functions[_innernet__subcmd__list-cidrs_commands] )) ||
+_innernet__subcmd__list-cidrs_commands() {
     local commands; commands=()
     _describe -t commands 'innernet list-cidrs commands' commands "$@"
 }
-(( $+functions[_innernet__override-endpoint_commands] )) ||
-_innernet__override-endpoint_commands() {
+(( $+functions[_innernet__subcmd__override-endpoint_commands] )) ||
+_innernet__subcmd__override-endpoint_commands() {
     local commands; commands=()
     _describe -t commands 'innernet override-endpoint commands' commands "$@"
 }
-(( $+functions[_innernet__override-peer-endpoint_commands] )) ||
-_innernet__override-peer-endpoint_commands() {
+(( $+functions[_innernet__subcmd__override-peer-endpoint_commands] )) ||
+_innernet__subcmd__override-peer-endpoint_commands() {
     local commands; commands=()
     _describe -t commands 'innernet override-peer-endpoint commands' commands "$@"
 }
-(( $+functions[_innernet__rename-cidr_commands] )) ||
-_innernet__rename-cidr_commands() {
+(( $+functions[_innernet__subcmd__rename-cidr_commands] )) ||
+_innernet__subcmd__rename-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet rename-cidr commands' commands "$@"
 }
-(( $+functions[_innernet__rename-peer_commands] )) ||
-_innernet__rename-peer_commands() {
+(( $+functions[_innernet__subcmd__rename-peer_commands] )) ||
+_innernet__subcmd__rename-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet rename-peer commands' commands "$@"
 }
-(( $+functions[_innernet__set-listen-port_commands] )) ||
-_innernet__set-listen-port_commands() {
+(( $+functions[_innernet__subcmd__set-listen-port_commands] )) ||
+_innernet__subcmd__set-listen-port_commands() {
     local commands; commands=()
     _describe -t commands 'innernet set-listen-port commands' commands "$@"
 }
-(( $+functions[_innernet__show_commands] )) ||
-_innernet__show_commands() {
+(( $+functions[_innernet__subcmd__show_commands] )) ||
+_innernet__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'innernet show commands' commands "$@"
 }
-(( $+functions[_innernet__uninstall_commands] )) ||
-_innernet__uninstall_commands() {
+(( $+functions[_innernet__subcmd__uninstall_commands] )) ||
+_innernet__subcmd__uninstall_commands() {
     local commands; commands=()
     _describe -t commands 'innernet uninstall commands' commands "$@"
 }
-(( $+functions[_innernet__up_commands] )) ||
-_innernet__up_commands() {
+(( $+functions[_innernet__subcmd__up_commands] )) ||
+_innernet__subcmd__up_commands() {
     local commands; commands=()
     _describe -t commands 'innernet up commands' commands "$@"
 }
