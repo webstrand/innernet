@@ -129,7 +129,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     if env::var_os("RUST_LOG").is_none() {
         // Set some default log settings.
         env::set_var("RUST_LOG", "warn,warp=info,wg_manage_server=info");
@@ -138,8 +138,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
     let opts = Opts::parse();
 
+    if let Err(e) = run(opts).await {
+        log::error!("{:#}\n", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run(opts: Opts) -> Result<(), anyhow::Error> {
     if unsafe { libc::getuid() } != 0 && !matches!(opts.command, Command::Completions { .. }) {
-        return Err("innernet-server must run as root.".into());
+        anyhow::bail!("innernet-server must run as root.");
     }
 
     let conf = ServerConfig::new(opts.config_dir, opts.data_dir);
@@ -147,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match opts.command {
         Command::New { opts } => {
             if let Err(e) = initialize::init_wizard(&conf, opts) {
-                eprintln!("{}: {}.", "creation failed".red(), e);
+                eprintln!("{}: {:#}.", "creation failed".red(), e);
                 std::process::exit(1);
             }
         },
