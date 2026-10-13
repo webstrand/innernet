@@ -1,4 +1,4 @@
-use crate::{wg::PeerInfoExt, DEFAULT_HOSTS_PATH};
+use crate::{announcement::SignedAnnouncement, wg::PeerInfoExt, DEFAULT_HOSTS_PATH};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -640,6 +640,14 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+    /// The endpoints the peer announced, signed with its own key. Recipients that have once
+    /// verified one for a peer disregard `endpoint` and `candidates` from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<SignedAnnouncement>,
+    /// The endpoint the server last observed the peer's WireGuard traffic coming from, which
+    /// recipients only use if the peer's announcement allows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_endpoint: Option<Endpoint>,
 }
 
 impl PeerContents {
@@ -925,6 +933,9 @@ pub struct ServerCapabilities {
     /// Whether the server supports `DELETE /admin/peers/permanent/{id}`.
     #[serde(default)]
     pub permanent_peer_delete: bool,
+    /// Whether the server supports `PUT /user/announcement`.
+    #[serde(default)]
+    pub signed_announcements: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1091,6 +1102,8 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         };
         let builder =
@@ -1126,6 +1139,8 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         };
         let builder =
@@ -1161,6 +1176,8 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         };
         let builder =
@@ -1206,6 +1223,8 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         };
         let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();

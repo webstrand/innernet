@@ -110,6 +110,28 @@ impl EndpointAnnouncement {
             .map(|extension| extension.tag)
     }
 
+    /// The endpoint and candidates to use for the peer, given the endpoint the server observed
+    /// it at. The observed endpoint completes an absent endpoint or one with an unspecified
+    /// host, and is otherwise added to the candidates, but only if `allow_observed` is set.
+    pub fn endpoints(&self, observed: Option<&Endpoint>) -> (Option<Endpoint>, Vec<Endpoint>) {
+        let observed = observed.filter(|_| self.allow_observed);
+        let endpoint = match (&self.endpoint, observed) {
+            (None, observed) => observed.cloned(),
+            (Some(endpoint), Some(observed)) if endpoint.is_host_unspecified() => {
+                Some(endpoint.with_host_of(observed))
+            },
+            (Some(endpoint), _) if endpoint.is_host_unspecified() => None,
+            (Some(endpoint), _) => Some(endpoint.clone()),
+        };
+        let mut candidates = self.candidates.clone();
+        if let Some(observed) = observed {
+            if endpoint.as_ref() != Some(observed) && !candidates.contains(observed) {
+                candidates.push(observed.clone());
+            }
+        }
+        (endpoint, candidates)
+    }
+
     fn has_canonical_extensions(&self) -> bool {
         self.extensions.windows(2).all(|w| w[0].tag < w[1].tag)
     }
@@ -139,6 +161,59 @@ impl SignedAnnouncement {
             &EndpointAnnouncement::message(network, signer, &length, &body),
             &self.signature,
         )
+    }
+}
+
+/// How a received announcement compares with the last one accepted from the same peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Received {
+    /// Nothing was received.
+    Nothing,
+    /// The timestamp equals the accepted one's, so it was ignored.
+    Unchanged,
+    /// The signature verified and the timestamp is newer.
+    Accepted,
+    /// The timestamp is older than the accepted one's.
+    Stale,
+    /// The signature didn't verify.
+    Invalid,
+    /// The signature verified, but the announcement carries a critical extension that this
+    /// version doesn't understand.
+    UnknownCritical(u16),
+}
+
+/// Chooses the announcement to use for a peer from the one last accepted from it (if any) and
+/// the one just received (if any), and reports what was made of the received one.
+///
+/// `signer` must be the peer's pinned public key. The accepted announcement is re-verified, so
+/// it may be read back from untrusted storage; one that fails is treated as absent.
+pub fn select<'a>(
+    accepted: Option<&'a SignedAnnouncement>,
+    received: Option<&'a SignedAnnouncement>,
+    network: &Key,
+    signer: &Key,
+) -> (Option<&'a SignedAnnouncement>, Received) {
+    let accepted = accepted.filter(|accepted| accepted.verify(network, signer));
+    let Some(received) = received else {
+        return (accepted, Received::Nothing);
+    };
+    if let Some(accepted) = accepted {
+        let (new, old) = (
+            received.announcement.timestamp,
+            accepted.announcement.timestamp,
+        );
+        if new == old {
+            return (Some(accepted), Received::Unchanged);
+        } else if new < old {
+            return (Some(accepted), Received::Stale);
+        }
+    }
+    if !received.verify(network, signer) {
+        (accepted, Received::Invalid)
+    } else if let Some(tag) = received.announcement.unknown_critical_extension() {
+        (accepted, Received::UnknownCritical(tag))
+    } else {
+        (Some(received), Received::Accepted)
     }
 }
 
@@ -381,5 +456,165 @@ mod tests {
         let b = timestamp_now();
         assert!(a > 1_600_000_000_000_000_000);
         assert!(b >= a);
+    }
+
+    fn endpoint(s: &str) -> Endpoint {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_endpoints_observed_requires_opt_in() {
+        let observed = endpoint("198.51.100.7:40000");
+        let mut a = announcement();
+        a.endpoint = None;
+        a.candidates = vec![endpoint("192.168.1.2:51820")];
+
+        a.allow_observed = false;
+        assert_eq!(a.endpoints(Some(&observed)), (None, a.candidates.clone()));
+
+        a.allow_observed = true;
+        assert_eq!(
+            a.endpoints(Some(&observed)),
+            (Some(observed.clone()), a.candidates.clone())
+        );
+    }
+
+    #[test]
+    fn test_endpoints_complete_unspecified_host() {
+        let observed = endpoint("198.51.100.7:40000");
+        let mut a = announcement();
+        a.endpoint = Some(endpoint("0.0.0.0:51820"));
+        a.candidates = vec![];
+
+        assert_eq!(
+            a.endpoints(Some(&observed)),
+            (Some(endpoint("198.51.100.7:51820")), vec![observed.clone()])
+        );
+        assert_eq!(a.endpoints(None), (None, vec![]));
+        a.allow_observed = false;
+        assert_eq!(a.endpoints(Some(&observed)), (None, vec![]));
+    }
+
+    #[test]
+    fn test_endpoints_observed_appended_once() {
+        let observed = endpoint("198.51.100.7:40000");
+        let mut a = announcement();
+        a.endpoint = Some(endpoint("203.0.113.1:51820"));
+        a.candidates = vec![endpoint("192.168.1.2:51820")];
+
+        let (e, c) = a.endpoints(Some(&observed));
+        assert_eq!(e, a.endpoint);
+        assert_eq!(c, vec![endpoint("192.168.1.2:51820"), observed.clone()]);
+
+        a.candidates.push(observed.clone());
+        assert_eq!(a.endpoints(Some(&observed)).1, a.candidates);
+    }
+
+    #[test]
+    fn test_select() {
+        let (keypair, network, signer) = setup();
+        let sign = |timestamp| {
+            let mut a = announcement();
+            a.timestamp = timestamp;
+            signer.sign(&network, a).unwrap()
+        };
+        let (old, new) = (sign(10), sign(20));
+        let key = &keypair.public;
+
+        assert_eq!(select(None, None, &network, key), (None, Received::Nothing));
+        assert_eq!(
+            select(Some(&old), None, &network, key),
+            (Some(&old), Received::Nothing)
+        );
+        assert_eq!(
+            select(None, Some(&old), &network, key),
+            (Some(&old), Received::Accepted)
+        );
+        assert_eq!(
+            select(Some(&old), Some(&new), &network, key),
+            (Some(&new), Received::Accepted)
+        );
+        assert_eq!(
+            select(Some(&new), Some(&old), &network, key),
+            (Some(&new), Received::Stale)
+        );
+
+        // An equal timestamp is ignored without being verified.
+        let mut forged = new.clone();
+        forged.announcement.candidates.clear();
+        assert_eq!(
+            select(Some(&new), Some(&forged), &network, key),
+            (Some(&new), Received::Unchanged)
+        );
+
+        // A newer forgery falls back to the accepted one, or to nothing.
+        forged.announcement.timestamp = 30;
+        assert_eq!(
+            select(Some(&new), Some(&forged), &network, key),
+            (Some(&new), Received::Invalid)
+        );
+        assert_eq!(
+            select(None, Some(&forged), &network, key),
+            (None, Received::Invalid)
+        );
+
+        // A forged "accepted" announcement read back from storage is disregarded.
+        assert_eq!(
+            select(Some(&forged), Some(&old), &network, key),
+            (Some(&old), Received::Accepted)
+        );
+
+        let mut critical = announcement();
+        critical.timestamp = 40;
+        critical.extensions = vec![Extension {
+            tag: CRITICAL_EXTENSION | 1,
+            data: vec![],
+        }];
+        let critical = signer.sign(&network, critical).unwrap();
+        assert_eq!(
+            select(Some(&new), Some(&critical), &network, key),
+            (
+                Some(&new),
+                Received::UnknownCritical(CRITICAL_EXTENSION | 1)
+            )
+        );
+    }
+
+    #[test]
+    fn test_survives_peer_json_round_trip() {
+        let (keypair, network, signer) = setup();
+        let mut announcement = announcement();
+        announcement.timestamp = u64::MAX;
+        announcement.extensions = vec![Extension {
+            tag: u16::MAX,
+            data: vec![0; 3],
+        }];
+        let signed = signer.sign(&network, announcement).unwrap();
+        let mut peer: crate::Peer = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "name": "peer",
+            "ip": "10.0.0.2",
+            "cidr_id": 1,
+            "public_key": keypair.public.to_base64(),
+            "endpoint": null,
+            "persistent_keepalive_interval": null,
+            "is_admin": false,
+            "is_disabled": false,
+            "is_redeemed": true,
+            "invite_expires": null,
+        }))
+        .unwrap();
+        assert_eq!(peer.announcement, None);
+        peer.contents.announcement = Some(signed);
+        peer.contents.observed_endpoint = Some(endpoint("198.51.100.7:40000"));
+
+        let json = serde_json::to_string(&peer).unwrap();
+        let decoded: crate::Peer = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, peer);
+        assert!(decoded
+            .announcement
+            .as_ref()
+            .unwrap()
+            .verify(&network, &keypair.public));
     }
 }

@@ -8,10 +8,10 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Endpoint, EndpointContents, PeerContents, RedeemContents, ServerCapabilities, State,
-    REDEEM_TRANSITION_WAIT,
+    announcement::SignedAnnouncement, Endpoint, EndpointContents, PeerContents, RedeemContents,
+    ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
-use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
+use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
 pub async fn routes(
     req: Request<Body>,
@@ -39,6 +39,13 @@ pub async fn routes(
             }
             let form = form_body(req).await?;
             handlers::endpoint(form, session).await
+        },
+        (&Method::PUT, Some("announcement")) => {
+            if !session.user_capable() {
+                return Err(ServerError::Unauthorized);
+            }
+            let form = form_body(req).await?;
+            handlers::announcement(form, session).await
         },
         (&Method::PUT, Some("candidates")) => {
             if !session.user_capable() {
@@ -78,6 +85,7 @@ mod handlers {
         let capabilities = ServerCapabilities {
             unspecified_ip_in_override_endpoint: true,
             permanent_peer_delete: true,
+            signed_announcements: true,
         };
 
         json_response(capabilities)
@@ -160,6 +168,48 @@ mod handlers {
         status_response(StatusCode::NO_CONTENT)
     }
 
+    /// Store the peer's signed announcement of its endpoints, to be relayed to the other peers.
+    ///
+    /// Recipients verify it themselves; it is checked here only to turn away announcements that
+    /// they would reject anyway.
+    pub async fn announcement(
+        contents: SignedAnnouncement,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        if contents.announcement.candidates.len() > 10 {
+            return status_response(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let conn = session.context.db.lock();
+        let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let signer =
+            Key::from_base64(&selected_peer.public_key).map_err(|_| ServerError::WireGuard)?;
+        if !contents.verify(&session.context.public_key, &signer) {
+            log::warn!(
+                "rejecting announcement from {} with an invalid signature.",
+                *selected_peer
+            );
+            return Err(ServerError::InvalidQuery);
+        }
+        if let Some(current) = &selected_peer.announcement {
+            let (new, old) = (
+                contents.announcement.timestamp,
+                current.announcement.timestamp,
+            );
+            if new == old && contents == *current {
+                return status_response(StatusCode::NO_CONTENT);
+            } else if new <= old {
+                log::warn!(
+                    "rejecting announcement from {} that is not newer than the current one.",
+                    *selected_peer
+                );
+                return status_response(StatusCode::CONFLICT);
+            }
+        }
+        selected_peer.set_announcement(&conn, contents)?;
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
     /// Force a specific endpoint to be reported by the server.
     pub async fn endpoint(
         contents: EndpointContents,
@@ -186,7 +236,10 @@ mod tests {
     use super::*;
     use crate::{db::DatabaseAssociation, test};
     use bytes::Buf;
-    use innernet_shared::{AssociationContents, CidrContents, Endpoint, EndpointContents, Error};
+    use innernet_shared::{
+        announcement::{AnnouncementSigner, EndpointAnnouncement},
+        AssociationContents, CidrContents, Endpoint, EndpointContents, Error,
+    };
 
     #[tokio::test]
     async fn test_get_state_from_developer1() -> Result<(), Error> {
@@ -569,6 +622,166 @@ mod tests {
         assert!(developer_1.candidates.contains(&nat_candidate_1));
         assert!(developer_1.candidates.contains(&nat_candidate_2));
 
+        Ok(())
+    }
+
+    /// Gives developer1 a key pair whose private half the test knows, and returns a signer
+    /// for it along with the network key.
+    fn developer1_signer(server: &test::Server) -> (AnnouncementSigner, Key) {
+        let keypair = wireguard_control::KeyPair::generate();
+        server
+            .db()
+            .lock()
+            .execute(
+                "UPDATE peers SET public_key = ?1 WHERE id = ?2",
+                rusqlite::params![keypair.public.to_base64(), test::DEVELOPER1_PEER_ID],
+            )
+            .unwrap();
+        server.context().endpoints.write().insert(
+            keypair.public.to_base64(),
+            test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap(),
+        );
+        let signer =
+            AnnouncementSigner::new(&keypair.private.to_base64(), &keypair.public).unwrap();
+        (signer, server.context().public_key)
+    }
+
+    fn announcement(timestamp: u64) -> EndpointAnnouncement {
+        EndpointAnnouncement {
+            timestamp,
+            endpoint: None,
+            candidates: vec!["192.168.1.2:51820".parse().unwrap()],
+            allow_observed: true,
+            extensions: vec![],
+        }
+    }
+
+    async fn put_announcement(
+        server: &test::Server,
+        announcement: &SignedAnnouncement,
+    ) -> StatusCode {
+        server
+            .form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/v1/user/announcement",
+                announcement,
+            )
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_announcement_is_relayed() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (signer, network) = developer1_signer(&server);
+        let signed = signer.sign(&network, announcement(10))?;
+        assert_eq!(
+            put_announcement(&server, &signed).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let res = server
+            .request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let whole_body = hyper::body::aggregate(res).await?;
+        let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
+        let developer_1 = peers
+            .into_iter()
+            .find(|p| p.id == test::DEVELOPER1_PEER_ID)
+            .unwrap();
+
+        assert_eq!(developer_1.announcement.as_ref(), Some(&signed));
+        assert!(signed.verify(&network, signer.public_key()));
+        assert_eq!(
+            developer_1.observed_endpoint,
+            Some(test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap())
+        );
+        // The candidates are mirrored for clients that don't understand announcements.
+        assert_eq!(developer_1.candidates, signed.announcement.candidates);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_ordering() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (signer, network) = developer1_signer(&server);
+        let first = signer.sign(&network, announcement(10))?;
+        assert_eq!(
+            put_announcement(&server, &first).await,
+            StatusCode::NO_CONTENT
+        );
+
+        // Resending the same announcement is harmless.
+        assert_eq!(
+            put_announcement(&server, &first).await,
+            StatusCode::NO_CONTENT
+        );
+
+        // A different announcement must have a newer timestamp.
+        let mut same_time = announcement(10);
+        same_time.candidates.clear();
+        let same_time = signer.sign(&network, same_time)?;
+        assert_eq!(
+            put_announcement(&server, &same_time).await,
+            StatusCode::CONFLICT
+        );
+        let older = signer.sign(&network, announcement(9))?;
+        assert_eq!(
+            put_announcement(&server, &older).await,
+            StatusCode::CONFLICT
+        );
+
+        let newer = signer.sign(&network, announcement(11))?;
+        assert_eq!(
+            put_announcement(&server, &newer).await,
+            StatusCode::NO_CONTENT
+        );
+        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(peer.announcement, Some(newer));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_rejects_bad_signatures() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (signer, network) = developer1_signer(&server);
+
+        let mut tampered = signer.sign(&network, announcement(10))?;
+        tampered.announcement.allow_observed = false;
+        assert_eq!(
+            put_announcement(&server, &tampered).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Signed for another network.
+        let other_network = wireguard_control::KeyPair::generate().public;
+        let elsewhere = signer.sign(&other_network, announcement(10))?;
+        assert_eq!(
+            put_announcement(&server, &elsewhere).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Signed by another peer's key.
+        let other = wireguard_control::KeyPair::generate();
+        let other = AnnouncementSigner::new(&other.private.to_base64(), &other.public)?;
+        let impostor = other.sign(&network, announcement(10))?;
+        assert_eq!(
+            put_announcement(&server, &impostor).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut too_many = announcement(10);
+        too_many.candidates = vec!["192.168.1.2:51820".parse().unwrap(); 11];
+        let too_many = signer.sign(&network, too_many)?;
+        assert_eq!(
+            put_announcement(&server, &too_many).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(peer.announcement, None);
         Ok(())
     }
 }

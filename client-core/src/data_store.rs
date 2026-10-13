@@ -306,6 +306,8 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<Vec<Peer>, InvalidKey> {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            observed_endpoint: None,
         },
     };
     let private_key = Key::from_base64(&config.interface.private_key)?;
@@ -436,6 +438,8 @@ mod tests {
                 persistent_keepalive_interval: None,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         }]
     });

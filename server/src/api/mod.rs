@@ -20,6 +20,9 @@ pub fn inject_endpoints(session: &Session, peers: &mut Vec<Peer>) {
         let endpoints = session.context.endpoints.read();
         let wg_endpoint = endpoints.get(&peer.public_key);
 
+        // Peers that understand announcements decide for themselves whether to use this.
+        peer.contents.observed_endpoint = wg_endpoint.map(|e| e.to_owned().into());
+
         match &mut peer.contents.endpoint {
             None => {
                 // 2a. Set the peer endpoint to the wireguard endpoint.

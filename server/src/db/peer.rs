@@ -1,6 +1,9 @@
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_shared::{IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use innernet_shared::{
+    announcement::SignedAnnouncement, IpNetExt, Peer, PeerContents,
+    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+};
 use rusqlite::{params, types::Type, Connection};
 use std::{
     net::IpAddr,
@@ -20,6 +23,7 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       is_redeemed     INTEGER DEFAULT 0 NOT NULL,   /* Has the peer redeemed their invite yet?                          */
       invite_expires  INTEGER,                      /* The UNIX time that an invited peer can no longer redeem.         */
       candidates      TEXT,                         /* A list of additional endpoints that peers can use to connect.    */
+      announcement    TEXT,                         /* The peer's latest signed endpoint announcement (JSON).           */
       FOREIGN KEY (cidr_id)
          REFERENCES cidrs (id)
             ON UPDATE RESTRICT
@@ -38,6 +42,7 @@ pub static COLUMNS: &[&str] = &[
     "is_redeemed",
     "invite_expires",
     "candidates",
+    "announcement",
 ];
 
 #[derive(Debug)]
@@ -67,6 +72,12 @@ impl DerefMut for DatabasePeer {
 
 impl DatabasePeer {
     pub fn create(conn: &Connection, contents: PeerContents) -> Result<Self, ServerError> {
+        // Announcements can only be made by the peer itself, through `set_announcement`.
+        let contents = PeerContents {
+            announcement: None,
+            observed_endpoint: None,
+            ..contents
+        };
         let PeerContents {
             name,
             ip,
@@ -105,7 +116,7 @@ impl DatabasePeer {
 
         conn.execute(
             &format!(
-                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
                 COLUMNS[1..].join(", ")
             ),
             params![
@@ -167,6 +178,27 @@ impl DatabasePeer {
         Ok(())
     }
 
+    /// Stores an announcement already verified to be newer than the current one, and mirrors
+    /// its candidates for clients that don't understand announcements.
+    pub fn set_announcement(
+        &mut self,
+        conn: &Connection,
+        announcement: SignedAnnouncement,
+    ) -> Result<(), ServerError> {
+        let candidates = announcement.announcement.candidates.clone();
+        conn.execute(
+            "UPDATE peers SET announcement = ?2, candidates = ?3 WHERE id = ?1",
+            params![
+                self.id,
+                serde_json::to_string(&announcement)?,
+                serde_json::to_string(&candidates)?,
+            ],
+        )?;
+        self.contents.announcement = Some(announcement);
+        self.contents.candidates = candidates;
+        Ok(())
+    }
+
     pub fn disable(conn: &Connection, id: i64) -> Result<(), ServerError> {
         match conn.execute(
             "UPDATE peers SET is_disabled = 1 WHERE id = ?1",
@@ -206,13 +238,15 @@ impl DatabasePeer {
         }
 
         match conn.execute(
-            "UPDATE peers SET is_redeemed = 1, public_key = ?1 WHERE id = ?2 AND is_redeemed = 0",
+            "UPDATE peers SET is_redeemed = 1, public_key = ?1, announcement = NULL
+            WHERE id = ?2 AND is_redeemed = 0",
             params![pubkey, self.id],
         )? {
             0 => Err(ServerError::NotFound),
             _ => {
                 self.contents.public_key = pubkey.into();
                 self.contents.is_redeemed = true;
+                self.contents.announcement = None;
                 Ok(())
             },
         }
@@ -249,6 +283,14 @@ impl DatabasePeer {
             vec![]
         };
 
+        let announcement = if let Some(announcement) = row.get::<_, Option<String>>(11)? {
+            serde_json::from_str(&announcement).map_err(|_| {
+                rusqlite::Error::InvalidColumnType(11, "announcement (json)".into(), Type::Text)
+            })?
+        } else {
+            None
+        };
+
         let persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
 
         Ok(Peer {
@@ -265,6 +307,8 @@ impl DatabasePeer {
                 is_redeemed,
                 invite_expires,
                 candidates,
+                announcement,
+                observed_endpoint: None,
             },
         }
         .into())

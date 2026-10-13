@@ -286,6 +286,8 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
             },
         }
     }

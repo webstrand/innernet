@@ -11,8 +11,9 @@ pub use peer::DatabasePeer;
 const INVITE_EXPIRATION_VERSION: usize = 1;
 const ENDPOINT_CANDIDATES_VERSION: usize = 2;
 const NULLABLE_PEER_NAME_VERSION: usize = 3;
+const ANNOUNCEMENT_VERSION: usize = 4;
 
-pub const CURRENT_VERSION: usize = NULLABLE_PEER_NAME_VERSION;
+pub const CURRENT_VERSION: usize = ANNOUNCEMENT_VERSION;
 
 pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     let old_version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -58,6 +59,10 @@ pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> 
              DROP TABLE peers_old;
              COMMIT;",
         )?;
+    }
+
+    if old_version < ANNOUNCEMENT_VERSION {
+        conn.execute("ALTER TABLE peers ADD COLUMN announcement TEXT", params![])?;
     }
 
     if old_version != CURRENT_VERSION {
