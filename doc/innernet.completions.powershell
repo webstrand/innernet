@@ -48,6 +48,8 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('list-cidrs', 'list-cidrs', [CompletionResultType]::ParameterValue, 'List CIDRs')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('delete-peer', 'delete-peer', [CompletionResultType]::ParameterValue, 'Permanently deletes a disabled peer, freeing its name and IP for reuse')
+            [CompletionResult]::new('forget-peer', 'forget-peer', [CompletionResultType]::ParameterValue, 'Forgets a deleted peer, so that its IP may be reused')
             [CompletionResult]::new('add-association', 'add-association', [CompletionResultType]::ParameterValue, 'Add an association between CIDRs')
             [CompletionResult]::new('delete-association', 'delete-association', [CompletionResultType]::ParameterValue, 'Delete an association between CIDRs')
             [CompletionResult]::new('list-associations', 'list-associations', [CompletionResultType]::ParameterValue, 'List existing assocations between CIDRs')
@@ -59,6 +61,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             break
         }
         'innernet;install' {
+            [CompletionResult]::new('--listen-port', '--listen-port', [CompletionResultType]::ParameterName, 'The local WireGuard listen port')
             [CompletionResult]::new('--hosts-path', '--hosts-path', [CompletionResultType]::ParameterName, 'The path to write hosts to')
             [CompletionResult]::new('--host-suffix', '--host-suffix', [CompletionResultType]::ParameterName, 'Use a different suffix for hosts, than ''INTERFACE.wg'' , ex. --host-suffix ''evilnet'' names peers: PEER.evilnet, and --host-suffix '''' gives peers no suffix, just: PEER')
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Set a specific interface name')
@@ -184,6 +187,20 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'innernet;delete-peer' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer to delete/forget')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypasses confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'innernet;forget-peer' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer to delete/forget')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypasses confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
         'innernet;add-association' {
             [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
@@ -252,6 +269,8 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('list-cidrs', 'list-cidrs', [CompletionResultType]::ParameterValue, 'List CIDRs')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('delete-peer', 'delete-peer', [CompletionResultType]::ParameterValue, 'Permanently deletes a disabled peer, freeing its name and IP for reuse')
+            [CompletionResult]::new('forget-peer', 'forget-peer', [CompletionResultType]::ParameterValue, 'Forgets a deleted peer, so that its IP may be reused')
             [CompletionResult]::new('add-association', 'add-association', [CompletionResultType]::ParameterValue, 'Add an association between CIDRs')
             [CompletionResult]::new('delete-association', 'delete-association', [CompletionResultType]::ParameterValue, 'Delete an association between CIDRs')
             [CompletionResult]::new('list-associations', 'list-associations', [CompletionResultType]::ParameterValue, 'List existing assocations between CIDRs')
@@ -302,6 +321,12 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             break
         }
         'innernet;help;enable-peer' {
+            break
+        }
+        'innernet;help;delete-peer' {
+            break
+        }
+        'innernet;help;forget-peer' {
             break
         }
         'innernet;help;add-association' {

@@ -38,6 +38,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a peer to an existing network')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('delete-peer', 'delete-peer', [CompletionResultType]::ParameterValue, 'Permanently deletes a disabled peer, freeing its name and IP for reuse')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename an existing peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR to an existing network')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename an existing CIDR')
@@ -100,6 +101,13 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'innernet-server;delete-peer' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer to delete/forget')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypasses confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
         'innernet-server;rename-peer' {
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of peer to rename')
             [CompletionResult]::new('--new-name', '--new-name', [CompletionResultType]::ParameterName, 'The new name of the peer')
@@ -144,6 +152,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a peer to an existing network')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('delete-peer', 'delete-peer', [CompletionResultType]::ParameterValue, 'Permanently deletes a disabled peer, freeing its name and IP for reuse')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename an existing peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR to an existing network')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename an existing CIDR')
@@ -168,6 +177,9 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             break
         }
         'innernet-server;help;enable-peer' {
+            break
+        }
+        'innernet-server;help;delete-peer' {
             break
         }
         'innernet-server;help;rename-peer' {

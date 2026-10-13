@@ -35,6 +35,7 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand add-peer 'Add a peer to an existing network'
             cand disable-peer 'Disable an enabled peer'
             cand enable-peer 'Enable a disabled peer'
+            cand delete-peer 'Permanently deletes a disabled peer, freeing its name and IP for reuse'
             cand rename-peer 'Rename an existing peer'
             cand add-cidr 'Add a new CIDR to an existing network'
             cand rename-cidr 'Rename an existing CIDR'
@@ -90,6 +91,12 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand -h 'Print help'
             cand --help 'Print help'
         }
+        &'innernet-server;delete-peer'= {
+            cand --name 'Name of the peer to delete/forget'
+            cand --yes 'Bypasses confirmation'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
         &'innernet-server;rename-peer'= {
             cand --name 'Name of peer to rename'
             cand --new-name 'The new name of the peer'
@@ -129,6 +136,7 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand add-peer 'Add a peer to an existing network'
             cand disable-peer 'Disable an enabled peer'
             cand enable-peer 'Enable a disabled peer'
+            cand delete-peer 'Permanently deletes a disabled peer, freeing its name and IP for reuse'
             cand rename-peer 'Rename an existing peer'
             cand add-cidr 'Add a new CIDR to an existing network'
             cand rename-cidr 'Rename an existing CIDR'
@@ -147,6 +155,8 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
         &'innernet-server;help;disable-peer'= {
         }
         &'innernet-server;help;enable-peer'= {
+        }
+        &'innernet-server;help;delete-peer'= {
         }
         &'innernet-server;help;rename-peer'= {
         }

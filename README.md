@@ -107,7 +107,7 @@ sudo innernet delete-associations <interface>
 
 ### Enabling/Disabling Peers
 
-For security reasons, IP addresses cannot be re-used by new peers, and therefore peers cannot be deleted. However, they can be disabled. Disabled peers will not show up in the list of peers when fetching the config for an interface.
+Peers can be disabled. A disabled peer is omitted from the list of peers that clients fetch for an interface, but its name and IP address remain reserved.
 
 Disable a peer with
 
@@ -120,6 +120,24 @@ Or re-enable a peer with
 ```su
 sudo innernet enable-peer <interface>
 ```
+
+### Deleting Peers
+
+A disabled peer can be permanently deleted, which frees its name and IP address for use by a new peer. A disabled peer is deleted from an admin client with
+
+```sh
+sudo innernet delete-peer <interface>
+```
+
+or from the server with `innernet-server delete-peer <interface>`.
+
+For security reasons, every client pins each peer's public key to its IP address, and refuses a new peer with a different key at an IP address it has already seen. Once a deleted peer's IP address is reused, every client that has seen the old peer drops the new peer with a warning on each fetch until it forgets the old one. The following command must be run on each such client:
+
+```sh
+sudo innernet forget-peer <interface>
+```
+
+Until then, the client cannot reach the new peer. An admin client that runs `innernet delete-peer` forgets the deleted peer automatically.
 
 ### Specifying a Manual Endpoint
 
