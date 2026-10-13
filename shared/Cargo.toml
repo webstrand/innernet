@@ -18,9 +18,11 @@ version = "2.0.0"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 atty = "0.2"
 clap = { version = "4.3", features = ["derive", "wrap_help"] }
 colored.workspace = true
+curve25519-dalek = "5"
 dialoguer.workspace = true
 hostsfile = { version = "2.0.0", path = "../hostsfile" }
 indoc = "2.0.1"
@@ -30,10 +32,13 @@ ipnet = { version = "2.4", features = ["serde"] }
 libc = "0.2"
 log = "0.4"
 once_cell = "1.17.1"
+rand = { version = "0.9", default-features = false, features = ["os_rng", "std"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
 toml = "0.8.10"
 url = "2"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core.workspace = true
