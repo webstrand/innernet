@@ -8,8 +8,9 @@ use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
     prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
-    EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
-    PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
+    DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface,
+    IoErrorContext, NetworkOpts, PeerContents, RenameCidrOpts, RenamePeerOpts,
+    INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
@@ -293,6 +294,53 @@ pub fn enable_or_disable_peer(
         }
     } else {
         log::info!("exiting without enabling or disabling peer.");
+    }
+
+    Ok(())
+}
+
+pub fn delete_peer(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    network: NetworkOpts,
+    opts: DeleteForgetPeerOpts,
+) -> Result<(), Error> {
+    let conn = open_database_connection(interface, conf)?;
+    // Only disabled peers can be deleted, so that they have been removed from every
+    // up-to-date client's interface before their IP can be handed out again.
+    let disabled_peers = DatabasePeer::list(&conn)?
+        .into_iter()
+        .map(|dp| dp.inner)
+        .filter(|peer| peer.is_disabled)
+        .collect::<Vec<_>>();
+
+    if let Some(peer) = prompts::delete_or_forget_peer(&disabled_peers[..], &opts, "delete")? {
+        DatabasePeer::delete(&conn, peer.id)?;
+
+        // Disabled peers should already be absent from the interface; the removal is
+        // repeated as a safeguard.
+        let public_key = Key::from_base64(&peer.public_key).map_err(|_| ServerError::WireGuard)?;
+        if let Err(e) = DeviceUpdate::new()
+            .remove_peer_by_key(&public_key)
+            .apply(interface, network.backend)
+        {
+            log::warn!("failed to remove peer from WireGuard interface: {e}");
+        }
+
+        printdoc!(
+            "
+            Peer {name} ({ip}) deleted. Its name and IP can now be reused.
+
+            Clients that have seen this peer pin its public key to {ip}, and refuse a
+            new peer at that IP until the following command has been run on each of them:
+
+                innernet forget-peer {interface} --name {name}
+            ",
+            name = peer.name.to_string().yellow(),
+            ip = peer.ip,
+        );
+    } else {
+        log::info!("exiting without deleting peer.");
     }
 
     Ok(())

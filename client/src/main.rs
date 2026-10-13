@@ -14,10 +14,10 @@ use innernet_client_core::{
 use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
     AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
-    DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
-    Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
-    WrappedIoError,
+    DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, EndpointContents,
+    HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts,
+    OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts,
+    ServerCapabilities, WrappedIoError,
 };
 use std::{
     fs::File,
@@ -221,6 +221,17 @@ enum Command {
 
         #[clap(flatten)]
         sub_opts: EnableDisablePeerOpts,
+    },
+
+    /// Forgets a deleted peer, so that its IP may be reused
+    ///
+    /// This client pins every peer's public key to its IP, and refuses a new peer at the
+    /// same IP. This is a local-only operation, and must be run on each client.
+    ForgetPeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DeleteForgetPeerOpts,
     },
 
     /// Add an association between CIDRs
@@ -643,6 +654,30 @@ fn enable_or_disable_peer(
         rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)?;
     } else {
         log::info!("exiting without enabling or disabling peer.");
+    }
+
+    Ok(())
+}
+
+fn forget_peer(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: DeleteForgetPeerOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let mut data_store = DataStore::open(&opts.data_dir, interface, &config)?;
+    let peers = data_store.peers().to_vec();
+
+    if let Some(peer) = prompts::delete_or_forget_peer(&peers[..], &sub_opts, "forget")? {
+        data_store.forget_peer(&peer.public_key)?;
+        println!(
+            "Peer {} ({}) forgotten. The interface is updated on the next `innernet fetch {}`.",
+            peer.name.to_string().yellow(),
+            peer.ip,
+            interface
+        );
+    } else {
+        log::info!("exiting without forgetting peer.");
     }
 
     Ok(())
@@ -1222,6 +1257,10 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => enable_or_disable_peer(&interface, opts, sub_opts, true)?,
+        Command::ForgetPeer {
+            interface,
+            sub_opts,
+        } => forget_peer(&interface, opts, sub_opts)?,
         Command::AddAssociation {
             interface,
             sub_opts,

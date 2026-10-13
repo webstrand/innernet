@@ -173,10 +173,23 @@ impl DataStore {
         match self.peers.check(candidate) {
             PinStatus::New | PinStatus::Unchanged => {},
             PinStatus::ConflictingKey => {
-                bail!("PINNING ERROR: New peer has same IP but different public key.")
+                let existing_peer = self.peers.get_by_ip(&candidate.ip).unwrap();
+                bail!(
+                    "PINNING ERROR: New peer has same IP ({}) but different public key than \
+                     previously seen peer {}.",
+                    candidate.ip,
+                    existing_peer.name,
+                )
             },
             PinStatus::ConflictingIp => {
-                bail!("PINNING ERROR: New peer has same public key but different IP.")
+                let existing_peer = self.peers.get_by_public_key(&candidate.public_key).unwrap();
+                bail!(
+                    "PINNING ERROR: New peer has same public key but different IP ({}) than \
+                     previously seen peer {} ({}).",
+                    candidate.ip,
+                    existing_peer.name,
+                    existing_peer.ip,
+                )
             },
         }
         if accepted.check(candidate) != PinStatus::New {
@@ -208,6 +221,19 @@ impl DataStore {
         }
 
         dropped
+    }
+
+    /// Removes a peer from the store and persists the store to disk, un-pinning the peer's
+    /// (IP, PublicKey) tuple so that a new peer may be accepted at the same IP.
+    ///
+    /// If the peer still exists on the server, it is simply pinned again on the next fetch.
+    pub fn forget_peer(&mut self, public_key: &str) -> Result<(), Error> {
+        self.peers
+            .remove(public_key)
+            .ok_or_else(|| anyhow::anyhow!("peer not found in data store"))?;
+        self.write()?;
+
+        Ok(())
     }
 
     pub fn peers(&self) -> &[Peer] {
@@ -290,6 +316,35 @@ impl PeersIndex {
         }
 
         status
+    }
+
+    /// Removes the peer with `public_key` and returns it, or returns `None` if no peer has it.
+    /// The remaining peers keep their order.
+    fn remove(&mut self, public_key: &str) -> Option<Peer> {
+        let index = self.by_public_key.remove(public_key)?;
+        let peer = self.peers.remove(index);
+        self.by_ip.remove(&peer.ip);
+        for i in self
+            .by_ip
+            .values_mut()
+            .chain(self.by_public_key.values_mut())
+        {
+            if *i > index {
+                *i -= 1;
+            }
+        }
+
+        Some(peer)
+    }
+
+    fn get_by_ip(&self, ip: &IpAddr) -> Option<&Peer> {
+        self.by_ip.get(ip).map(|&index| &self.peers[index])
+    }
+
+    fn get_by_public_key(&self, public_key: &str) -> Option<&Peer> {
+        self.by_public_key
+            .get(public_key)
+            .map(|&index| &self.peers[index])
     }
 
     fn contains_public_key(&self, public_key: &str) -> bool {
@@ -513,6 +568,38 @@ mod tests {
         assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
         std::fs::write(&path, "\n").unwrap();
         assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
+    }
+
+    #[test]
+    fn test_forget_peer_allows_ip_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+
+        // A second peer follows the forgotten one, so that its index is shifted.
+        let mut second = BASE_PEERS[0].clone();
+        second.contents.ip = "10.0.0.2".parse().unwrap();
+        second.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        let mut peers = BASE_PEERS.clone();
+        peers.push(second.clone());
+        assert!(store.update_peers(&peers).is_empty());
+
+        let mut replacement = peers.clone();
+        replacement[0].contents.public_key =
+            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        assert_eq!(store.update_peers(&replacement).len(), 1);
+
+        store.forget_peer(&BASE_PEERS[0].public_key).unwrap();
+        assert!(store.forget_peer(&BASE_PEERS[0].public_key).is_err());
+        assert_eq!(store.peers.check(&second), PinStatus::Unchanged);
+
+        // The forgotten state is persisted.
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        assert_eq!(store.peers(), &[second.clone()]);
+        assert!(store.update_peers(&replacement).is_empty());
+        assert_eq!(store.peers(), &[second, replacement[0].clone()]);
     }
 
     #[test]

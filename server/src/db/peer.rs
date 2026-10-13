@@ -18,7 +18,7 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       endpoint        TEXT,                         /* The optional external endpoint ([ip]:[port]) of the peer.        */
       cidr_id         INTEGER NOT NULL,             /* The ID of the peer's parent CIDR.                                */
       is_admin        INTEGER DEFAULT 0 NOT NULL,   /* Admin capabilities are per-peer, not per-CIDR.                   */
-      is_disabled     INTEGER DEFAULT 0 NOT NULL,   /* Is the peer disabled? (peers cannot be deleted)                  */
+      is_disabled     INTEGER DEFAULT 0 NOT NULL,   /* Is the peer disabled? (only disabled peers can be deleted)       */
       is_redeemed     INTEGER DEFAULT 0 NOT NULL,   /* Has the peer redeemed their invite yet?                          */
       invite_expires  INTEGER,                      /* The UNIX time that an invited peer can no longer redeem.         */
       candidates      TEXT,                         /* A list of additional endpoints that peers can use to connect.    */
@@ -193,6 +193,25 @@ impl DatabasePeer {
             params![id],
         )? {
             0 => Err(ServerError::NotFound),
+            _ => Ok(()),
+        }
+    }
+
+    /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
+    ///
+    /// Clients pin each peer's (IP, public key) pair, so clients that have seen this peer
+    /// refuse a new peer at the same IP until `innernet forget-peer` has been run on them.
+    pub fn delete(conn: &Connection, id: i64) -> Result<(), ServerError> {
+        match conn.execute(
+            "DELETE FROM peers WHERE id = ?1 AND is_disabled = 1",
+            params![id],
+        )? {
+            0 => {
+                // An enabled peer is distinguished from a nonexistent one.
+                Self::get(conn, id)?;
+                log::warn!("refusing to delete peer {id}, it must be disabled first.");
+                Err(ServerError::InvalidQuery)
+            },
             _ => Ok(()),
         }
     }
