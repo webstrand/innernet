@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use innernet_shared::{
     AddCidrOpts, AddPeerOpts, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts,
-    HostsOpts, NetworkOpts, RenameCidrOpts, RenamePeerOpts,
+    HostsOpts, NetworkOpts, RenameCidrOpts, RenamePeerOpts, Timestring,
 };
 use std::{env, path::PathBuf};
 
@@ -63,6 +63,12 @@ enum Command {
 
         #[clap(flatten)]
         hosts: HostsOpts,
+
+        /// How far ahead of this server's clock a peer's signed endpoint announcement may be
+        /// dated. Announcements dated further ahead are refused. Must comfortably exceed 37s,
+        /// the difference between TAI and UTC, plus any clock skew.
+        #[clap(long, default_value = "10m")]
+        max_clock_ahead: Timestring,
     },
 
     /// Add a peer to an existing network.
@@ -167,7 +173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interface,
             network: routing,
             hosts,
-        } => serve(*interface, &conf, routing, hosts).await?,
+            max_clock_ahead,
+        } => serve(*interface, &conf, routing, hosts, max_clock_ahead.into()).await?,
         Command::AddPeer { interface, args } => add_peer(&interface, &conf, args, opts.network)?,
         Command::RenamePeer { interface, args } => rename_peer(&interface, &conf, args)?,
         Command::DisablePeer { interface, args } => {

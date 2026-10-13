@@ -56,6 +56,8 @@ pub struct Context {
     pub interface: InterfaceName,
     pub backend: Backend,
     pub public_key: Key,
+    /// How far ahead of the server's clock an announcement may be dated.
+    pub max_clock_ahead: Duration,
 }
 
 pub struct Session {
@@ -520,6 +522,7 @@ pub async fn serve(
     conf: &ServerConfig,
     network: NetworkOpts,
     hosts_opts: HostsOpts,
+    max_clock_ahead: Duration,
 ) -> Result<(), Error> {
     let config = ConfigFile::from_file(conf.config_path(&interface))?;
     log::debug!("opening database connection...");
@@ -584,6 +587,7 @@ pub async fn serve(
         interface,
         public_key,
         backend: network.backend,
+        max_clock_ahead,
     };
 
     log::info!("innernet-server {} starting.", VERSION);

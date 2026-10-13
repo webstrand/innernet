@@ -176,6 +176,7 @@ impl Server {
             interface: self.interface,
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
+            max_clock_ahead: innernet_shared::announcement::DEFAULT_MAX_CLOCK_AHEAD,
             #[cfg(target_os = "linux")]
             backend: Backend::Kernel,
             #[cfg(not(target_os = "linux"))]

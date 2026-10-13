@@ -15,7 +15,13 @@ use innernet_shared::{
     wg::{self, DeviceExt as _},
     Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
-use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
+use std::{
+    io,
+    net::SocketAddr,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
@@ -234,7 +240,12 @@ pub fn fetch(
         warn_about_server_endpoint_override(&config, &own_public_key, &state.peers);
         // The announcements are applied before the update, so that the data store keeps the
         // announcement that it accepted from each peer, and the endpoints derived from it.
-        apply_announcements(&store, &mut state.peers, &network);
+        apply_announcements(
+            &store,
+            &mut state.peers,
+            &network,
+            nat.max_clock_ahead.clone().into(),
+        );
 
         let dropped = store.update(state).context(interface.to_string())?;
         for (peer, e) in dropped {
@@ -391,7 +402,13 @@ fn print_peer_diff(store: &DataStore, diff: &PeerDiff) {
 /// The announcement used is the newer of the one received from the server and the one last
 /// accepted from the peer, kept with the peer in `store`. Once one has been accepted from a
 /// peer, the unsigned endpoints the server sends for it are disregarded.
-fn apply_announcements(store: &DataStore, peers: &mut [Peer], network: &Key) {
+fn apply_announcements(
+    store: &DataStore,
+    peers: &mut [Peer],
+    network: &Key,
+    max_clock_ahead: Duration,
+) {
+    let now = announcement::timestamp_now();
     for peer in peers {
         let Ok(signer) = Key::from_base64(&peer.public_key) else {
             continue;
@@ -402,14 +419,25 @@ fn apply_announcements(store: &DataStore, peers: &mut [Peer], network: &Key) {
             .find(|p| p.public_key == peer.public_key)
             .and_then(|p| p.announcement.as_ref());
         let received = peer.contents.announcement.take();
-        let (selected, outcome) =
-            announcement::select(accepted, received.as_ref(), network, &signer);
+        let (selected, outcome) = announcement::select(
+            accepted,
+            received.as_ref(),
+            network,
+            &signer,
+            now,
+            max_clock_ahead,
+        );
 
         match outcome {
             Received::Nothing | Received::Unchanged | Received::Accepted => {},
             Received::Stale => log::warn!(
                 "the server sent an older endpoint announcement for peer {} than one already \
                  accepted; ignoring it.",
+                peer.display_name()
+            ),
+            Received::TooFarAhead => log::warn!(
+                "the endpoint announcement for peer {} is dated too far in the future; ignoring \
+                 it for now. Either its clock or this one is wrong.",
                 peer.display_name()
             ),
             Received::Invalid => log::warn!(
@@ -502,6 +530,10 @@ fn report_endpoints(
             );
             report_candidates(rest_client, signed.announcement.candidates)?;
         },
+        Err(e) if e.has_status_of(422) => log::warn!(
+            "the server rejected this peer's endpoint announcement as dated too far in the \
+             future; this clock or the server's may be wrong. Peers keep using the previous one."
+        ),
         Err(e) if e.has_status_of(409) => log::warn!(
             "the server holds a newer endpoint announcement than this one; the clock may have \
              gone backwards. Peers keep using the newer one."
@@ -632,7 +664,12 @@ mod tests {
                 cidrs: vec![],
             };
             state.peers[0].contents.announcement = received;
-            apply_announcements(&self.store, &mut state.peers, &self.network);
+            apply_announcements(
+                &self.store,
+                &mut state.peers,
+                &self.network,
+                announcement::DEFAULT_MAX_CLOCK_AHEAD,
+            );
             assert!(self.store.update(&state).unwrap().is_empty());
             state.peers.pop().unwrap()
         }

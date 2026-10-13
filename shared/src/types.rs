@@ -568,6 +568,12 @@ pub struct NatOpts {
     /// Don't report any candidates to coordinating server.
     /// Shorthand for --exclude-nat-candidates '0.0.0.0/0'.
     pub no_nat_candidates: bool,
+
+    #[clap(long, default_value = "10m")]
+    /// How far ahead of this machine's clock a peer's signed endpoint announcement may be
+    /// dated. Announcements dated further ahead are ignored until they are near enough. Must
+    /// comfortably exceed 37s, the difference between TAI and UTC, plus any clock skew.
+    pub max_clock_ahead: Timestring,
 }
 
 impl NatOpts {
@@ -576,6 +582,7 @@ impl NatOpts {
             no_nat_traversal: true,
             exclude_nat_candidates: vec![],
             no_nat_candidates: true,
+            max_clock_ahead: "10m".parse().unwrap(),
         }
     }
 

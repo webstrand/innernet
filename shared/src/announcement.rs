@@ -17,6 +17,7 @@ use crate::{
 use anyhow::{bail, Error};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::time::Duration;
 use wireguard_control::Key;
 
 /// Domain separator for endpoint announcements. Only changes on an incompatible format change.
@@ -27,6 +28,20 @@ const CONTEXT: &[u8] = b"innernet/v1/peer-endpoints\0";
 pub const CRITICAL_EXTENSION: u16 = 0x8000;
 
 pub const SIGNATURE_LENGTH: usize = xeddsa::SIGNATURE_LENGTH;
+
+/// The default for how far ahead of the receiver's clock an announcement's timestamp may be.
+/// Accepting one from the distant future would stop the peer's later announcements from being
+/// accepted until then, as could happen if its clock were wrong or manipulated. The limit caps
+/// how long the peer can be held up, and must comfortably exceed the 37 s between `CLOCK_TAI`
+/// and `CLOCK_REALTIME` plus clock skew.
+pub const DEFAULT_MAX_CLOCK_AHEAD: Duration = Duration::from_secs(10 * 60);
+
+/// Whether `timestamp` is further ahead of `now`, both from [`timestamp_now`], than
+/// `max_ahead` allows.
+pub fn is_too_far_ahead(timestamp: u64, now: u64, max_ahead: Duration) -> bool {
+    let max_ahead = u64::try_from(max_ahead.as_nanos()).unwrap_or(u64::MAX);
+    timestamp > now.saturating_add(max_ahead)
+}
 
 /// The endpoints a peer can be reached at, as stated by the peer itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +190,9 @@ pub enum Received {
     Accepted,
     /// The timestamp is older than the accepted one's.
     Stale,
+    /// The timestamp is further in the future than the receiver allows. It may be
+    /// accepted later, once it is near enough.
+    TooFarAhead,
     /// The signature didn't verify.
     Invalid,
     /// The signature verified, but the announcement carries a critical extension that this
@@ -186,12 +204,16 @@ pub enum Received {
 /// the one just received (if any), and reports what was made of the received one.
 ///
 /// `signer` must be the peer's pinned public key. The accepted announcement is re-verified, so
-/// it may be read back from untrusted storage; one that fails is treated as absent.
+/// it may be read back from untrusted storage; one that fails is treated as absent. `now` is
+/// the receiver's [`timestamp_now`], and `max_ahead` how far ahead of it a received
+/// announcement may be dated.
 pub fn select<'a>(
     accepted: Option<&'a SignedAnnouncement>,
     received: Option<&'a SignedAnnouncement>,
     network: &Key,
     signer: &Key,
+    now: u64,
+    max_ahead: Duration,
 ) -> (Option<&'a SignedAnnouncement>, Received) {
     let accepted = accepted.filter(|accepted| accepted.verify(network, signer));
     let Some(received) = received else {
@@ -208,7 +230,9 @@ pub fn select<'a>(
             return (Some(accepted), Received::Stale);
         }
     }
-    if !received.verify(network, signer) {
+    if is_too_far_ahead(received.announcement.timestamp, now, max_ahead) {
+        (accepted, Received::TooFarAhead)
+    } else if !received.verify(network, signer) {
         (accepted, Received::Invalid)
     } else if let Some(tag) = received.announcement.unknown_critical_extension() {
         (accepted, Received::UnknownCritical(tag))
@@ -512,6 +536,8 @@ mod tests {
 
     #[test]
     fn test_select() {
+        const NOW: u64 = 1_000;
+        const MAX: Duration = DEFAULT_MAX_CLOCK_AHEAD;
         let (keypair, network, signer) = setup();
         let sign = |timestamp| {
             let mut a = announcement();
@@ -521,21 +547,24 @@ mod tests {
         let (old, new) = (sign(10), sign(20));
         let key = &keypair.public;
 
-        assert_eq!(select(None, None, &network, key), (None, Received::Nothing));
         assert_eq!(
-            select(Some(&old), None, &network, key),
+            select(None, None, &network, key, NOW, MAX),
+            (None, Received::Nothing)
+        );
+        assert_eq!(
+            select(Some(&old), None, &network, key, NOW, MAX),
             (Some(&old), Received::Nothing)
         );
         assert_eq!(
-            select(None, Some(&old), &network, key),
+            select(None, Some(&old), &network, key, NOW, MAX),
             (Some(&old), Received::Accepted)
         );
         assert_eq!(
-            select(Some(&old), Some(&new), &network, key),
+            select(Some(&old), Some(&new), &network, key, NOW, MAX),
             (Some(&new), Received::Accepted)
         );
         assert_eq!(
-            select(Some(&new), Some(&old), &network, key),
+            select(Some(&new), Some(&old), &network, key, NOW, MAX),
             (Some(&new), Received::Stale)
         );
 
@@ -543,24 +572,24 @@ mod tests {
         let mut forged = new.clone();
         forged.announcement.candidates.clear();
         assert_eq!(
-            select(Some(&new), Some(&forged), &network, key),
+            select(Some(&new), Some(&forged), &network, key, NOW, MAX),
             (Some(&new), Received::Unchanged)
         );
 
         // A newer forgery falls back to the accepted one, or to nothing.
         forged.announcement.timestamp = 30;
         assert_eq!(
-            select(Some(&new), Some(&forged), &network, key),
+            select(Some(&new), Some(&forged), &network, key, NOW, MAX),
             (Some(&new), Received::Invalid)
         );
         assert_eq!(
-            select(None, Some(&forged), &network, key),
+            select(None, Some(&forged), &network, key, NOW, MAX),
             (None, Received::Invalid)
         );
 
         // A forged "accepted" announcement read back from storage is disregarded.
         assert_eq!(
-            select(Some(&forged), Some(&old), &network, key),
+            select(Some(&forged), Some(&old), &network, key, NOW, MAX),
             (Some(&old), Received::Accepted)
         );
 
@@ -572,11 +601,57 @@ mod tests {
         }];
         let critical = signer.sign(&network, critical).unwrap();
         assert_eq!(
-            select(Some(&new), Some(&critical), &network, key),
+            select(Some(&new), Some(&critical), &network, key, NOW, MAX),
             (
                 Some(&new),
                 Received::UnknownCritical(CRITICAL_EXTENSION | 1)
             )
+        );
+
+        // Too far ahead of the receiver's clock: not accepted now, but later.
+        let ahead = MAX.as_nanos() as u64;
+        let future = sign(NOW + ahead + 1);
+        assert_eq!(
+            select(Some(&new), Some(&future), &network, key, NOW, MAX),
+            (Some(&new), Received::TooFarAhead)
+        );
+        assert_eq!(
+            select(None, Some(&future), &network, key, NOW, MAX),
+            (None, Received::TooFarAhead)
+        );
+        assert_eq!(
+            select(Some(&new), Some(&future), &network, key, NOW + 1, MAX),
+            (Some(&future), Received::Accepted)
+        );
+        assert_eq!(
+            select(Some(&new), Some(&sign(u64::MAX)), &network, key, NOW, MAX),
+            (Some(&new), Received::TooFarAhead)
+        );
+
+        // A tighter limit is honoured.
+        let tight = Duration::from_nanos(100);
+        assert_eq!(
+            select(
+                Some(&new),
+                Some(&sign(NOW + 101)),
+                &network,
+                key,
+                NOW,
+                tight
+            ),
+            (Some(&new), Received::TooFarAhead)
+        );
+        assert_eq!(
+            select(
+                Some(&new),
+                Some(&sign(NOW + 100)),
+                &network,
+                key,
+                NOW,
+                tight
+            )
+            .1,
+            Received::Accepted
         );
     }
 

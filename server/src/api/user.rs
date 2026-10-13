@@ -8,8 +8,9 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    announcement::SignedAnnouncement, Endpoint, EndpointContents, PeerContents, RedeemContents,
-    ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
+    announcement::{self, SignedAnnouncement},
+    Endpoint, EndpointContents, PeerContents, RedeemContents, ServerCapabilities, State,
+    REDEEM_TRANSITION_WAIT,
 };
 use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
@@ -189,6 +190,19 @@ mod handlers {
                 *selected_peer
             );
             return Err(ServerError::InvalidQuery);
+        }
+        // Once stored, an announcement from the far future would turn away the peer's honest
+        // ones until then.
+        if announcement::is_too_far_ahead(
+            contents.announcement.timestamp,
+            announcement::timestamp_now(),
+            session.context.max_clock_ahead,
+        ) {
+            log::warn!(
+                "rejecting announcement from {} dated too far in the future.",
+                *selected_peer
+            );
+            return status_response(StatusCode::UNPROCESSABLE_ENTITY);
         }
         if let Some(current) = &selected_peer.announcement {
             let (new, old) = (
@@ -782,6 +796,32 @@ mod tests {
 
         let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
         assert_eq!(peer.announcement, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_rejects_far_future() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (signer, network) = developer1_signer(&server);
+        let ahead = announcement::DEFAULT_MAX_CLOCK_AHEAD.as_nanos() as u64;
+
+        // Within the allowance, e.g. a signer using CLOCK_TAI.
+        let near = signer.sign(
+            &network,
+            announcement(announcement::timestamp_now() + ahead / 2),
+        )?;
+        assert_eq!(
+            put_announcement(&server, &near).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let far = signer.sign(&network, announcement(u64::MAX))?;
+        assert_eq!(
+            put_announcement(&server, &far).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(peer.announcement, Some(near));
         Ok(())
     }
 }
