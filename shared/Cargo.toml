@@ -8,7 +8,6 @@ authors = [
 categories = ["network-programming"]
 description = "Library utilities shared between innernet (client) and innernet-server"
 edition = "2021"
-homepage = "https://github.com/tonarino/innernet"
 keywords.workspace = true
 license = "MIT"
 name = "innernet-shared"

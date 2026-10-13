@@ -9,7 +9,6 @@ authors = [
 categories = ["network-programming"]
 description = "A core library to manage innernet network interfaces."
 edition = "2021"
-homepage = "https://github.com/tonarino/innernet"
 keywords.workspace = true
 license = "MIT"
 name = "innernet-client-core"

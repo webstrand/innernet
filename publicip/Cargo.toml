@@ -3,7 +3,6 @@ authors = ["Jake McGinty <me@jakebot.org>"]
 categories = ["command-line-utilities", "network-programming"]
 description = "A simple library to get your public IP (IPv4 and/or IPv6)"
 edition = "2021"
-homepage = "https://github.com/tonarino/innernet"
 keywords.workspace = true
 license = "MIT"
 name = "innernet-publicip"
