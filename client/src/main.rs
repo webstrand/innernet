@@ -1225,7 +1225,7 @@ fn main() {
 
     if let Err(e) = run(&opts) {
         println!();
-        log::error!("{}\n", e);
+        log::error!("{:#}\n", e);
         if let Some(e) = e.downcast_ref::<WrappedIoError>() {
             util::permissions_helptext(&opts.config_dir, &opts.data_dir, e);
         }
