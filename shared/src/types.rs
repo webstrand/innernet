@@ -156,6 +156,51 @@ impl Endpoint {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Returns the endpoint with its host replaced by `host`'s, keeping the port.
+    pub fn with_host_of(&self, host: &Endpoint) -> Self {
+        Self {
+            host: host.host.clone(),
+            port: self.port,
+        }
+    }
+
+    /// Whether the host is an IPv4 address that is routable on the public internet.
+    pub fn is_public_ipv4(&self) -> bool {
+        let Host::Ipv4(ip) = self.host else {
+            return false;
+        };
+        let [a, b, ..] = ip.octets();
+        !(ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_broadcast()
+            || ip.is_documentation()
+            || ip.is_multicast()
+            || (a == 100 && (64..128).contains(&b)) // Shared address space (CGNAT)
+            || a >= 240)
+    }
+
+    /// Appends the canonical encoding used in signed announcements.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match &self.host {
+            Host::Ipv4(ip) => {
+                out.push(4);
+                out.extend_from_slice(&ip.octets());
+            },
+            Host::Ipv6(ip) => {
+                out.push(6);
+                out.extend_from_slice(&ip.octets());
+            },
+            Host::Domain(domain) => {
+                out.push(b'D');
+                out.extend_from_slice(&(domain.len() as u16).to_le_bytes());
+                out.extend_from_slice(domain.as_bytes());
+            },
+        }
+        out.extend_from_slice(&self.port.to_le_bytes());
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
