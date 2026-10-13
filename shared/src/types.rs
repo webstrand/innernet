@@ -853,6 +853,9 @@ pub struct State {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
+    /// Whether the server supports `DELETE /admin/peers/permanent/{id}`.
+    #[serde(default)]
+    pub permanent_peer_delete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

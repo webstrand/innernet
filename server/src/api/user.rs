@@ -77,6 +77,7 @@ mod handlers {
     pub async fn capabilities() -> Result<Response<Body>, ServerError> {
         let capabilities = ServerCapabilities {
             unspecified_ip_in_override_endpoint: true,
+            permanent_peer_delete: true,
         };
 
         json_response(capabilities)

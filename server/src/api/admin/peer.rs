@@ -8,7 +8,7 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::PeerContents;
-use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
+use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
 pub async fn routes(
     req: Request<Body>,
@@ -25,6 +25,15 @@ pub async fn routes(
             let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
             let form = form_body(req).await?;
             handlers::update(id, form, session).await
+        },
+        // Deliberately not `/peers/{id}/permanent`: servers without this endpoint would
+        // route that to `delete` (disable) and report success.
+        (&Method::DELETE, Some("permanent")) => {
+            let id: i64 = components
+                .pop_front()
+                .and_then(|id| id.parse().ok())
+                .ok_or(ServerError::NotFound)?;
+            handlers::delete_permanently(id, session).await
         },
         (&Method::DELETE, Some(id)) => {
             let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
@@ -85,6 +94,30 @@ mod handlers {
     pub async fn delete(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         DatabasePeer::disable(&conn, id)?;
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
+    /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
+    pub async fn delete_permanently(
+        id: i64,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let peer = DatabasePeer::get(&conn, id)?;
+        DatabasePeer::delete(&conn, id)?;
+        log::info!("permanently deleted peer {}", *peer);
+
+        if cfg!(not(test)) {
+            // Disabled peers should already be absent from the interface; the removal is
+            // repeated as a safeguard.
+            let public_key =
+                Key::from_base64(&peer.public_key).map_err(|_| ServerError::WireGuard)?;
+            DeviceUpdate::new()
+                .remove_peer_by_key(&public_key)
+                .apply(&session.context.interface, session.context.backend)
+                .map_err(|_| ServerError::WireGuard)?;
+        }
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -375,6 +408,41 @@ mod tests {
 
         // Trying to delete a peer of non-existing ID will result in error.
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_permanent_delete_api() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let path = format!("/v1/admin/peers/permanent/{}", test::USER1_PEER_ID);
+
+        // Enabled peers can't be permanently deleted.
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        DatabasePeer::disable(&server.db().lock(), test::USER1_PEER_ID)?;
+
+        // Non-admins can't permanently delete peers.
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "DELETE", &path)
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(DatabasePeer::get(&server.db().lock(), test::USER1_PEER_ID).is_err());
+
+        // Already deleted.
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // The IP can be reused.
+        let peer = test::user_peer_contents("user1", test::USER1_PEER_IP)?;
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
 
         Ok(())
     }

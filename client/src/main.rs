@@ -223,6 +223,17 @@ enum Command {
         sub_opts: EnableDisablePeerOpts,
     },
 
+    /// Permanently deletes a disabled peer, freeing its name and IP for reuse
+    ///
+    /// Other clients that have seen the peer accept a new peer at the same IP only after
+    /// `innernet forget-peer` has been run on them.
+    DeletePeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DeleteForgetPeerOpts,
+    },
+
     /// Forgets a deleted peer, so that its IP may be reused
     ///
     /// This client pins every peer's public key to its IP, and refuses a new peer at the
@@ -654,6 +665,53 @@ fn enable_or_disable_peer(
         rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)?;
     } else {
         log::info!("exiting without enabling or disabling peer.");
+    }
+
+    Ok(())
+}
+
+fn delete_peer(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: DeleteForgetPeerOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    if !get_server_capabilities(&config)?.permanent_peer_delete {
+        bail!("The innernet server is too old to support permanently deleting peers.");
+    }
+    let rest_client = RestClient::new(&config.server);
+
+    log::info!("Fetching peers.");
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+    let disabled_peers: Vec<Peer> = peers.into_iter().filter(|p| p.is_disabled).collect();
+
+    if let Some(peer) = prompts::delete_or_forget_peer(&disabled_peers[..], &sub_opts, "delete")? {
+        rest_client.http::<()>("DELETE", &format!("/admin/peers/permanent/{}", peer.id))?;
+
+        // This client never sees the peer again, so the peer is un-pinned here right away.
+        let mut data_store = DataStore::open(&opts.data_dir, interface, &config)?;
+        if data_store
+            .peers()
+            .iter()
+            .any(|p| p.public_key == peer.public_key)
+        {
+            data_store.forget_peer(&peer.public_key)?;
+        }
+
+        eprintdoc!(
+            "
+            Peer {name} ({ip}) deleted. Its name and IP can now be reused.
+
+            Other clients that have seen this peer pin its public key to {ip}, and refuse a
+            new peer at that IP until the following command has been run on each of them:
+
+                innernet forget-peer {interface} --name {name}
+            ",
+            name = peer.name.to_string().yellow(),
+            ip = peer.ip,
+        );
+    } else {
+        log::info!("exiting without deleting peer.");
     }
 
     Ok(())
@@ -1257,6 +1315,10 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => enable_or_disable_peer(&interface, opts, sub_opts, true)?,
+        Command::DeletePeer {
+            interface,
+            sub_opts,
+        } => delete_peer(&interface, opts, sub_opts)?,
         Command::ForgetPeer {
             interface,
             sub_opts,
