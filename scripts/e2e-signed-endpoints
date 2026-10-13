@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# End-to-end test of signed endpoint announcements, run unprivileged in network namespaces.
+#
+# Usage: scripts/e2e-signed-endpoints [--keep]
+#
+# Topology, inside a private user, mount and network namespace:
+#
+#   198.18.0.0/24 "internet" (bridge in the outer namespace)
+#     srv     198.18.0.1   innernet-server
+#     a       198.18.0.2   peer with a public address
+#     router  198.18.0.3   NAT (nft masquerade) for 192.168.50.0/24
+#       b     192.168.50.2 peer behind the NAT
+#
+# Peer b is genuine, while the server's database is tampered with to impersonate it. Peer a
+# must keep using b's signed endpoints once it has accepted an announcement from b.
+#
+# Requires: unshare, ip, nft, sqlite3, python3, and the kernel WireGuard module.
+set -euo pipefail
+
+if [ -z "${E2E_INSIDE:-}" ]; then
+    top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    cargo build --offline --bins --manifest-path "$top/Cargo.toml" >&2
+    exec unshare --user --map-root-user --mount --net \
+        env E2E_INSIDE=1 E2E_BIN="$top/target/debug" "$0" "$@"
+fi
+
+keep=0
+[ "${1:-}" = --keep ] && keep=1
+
+mount -t tmpfs tmpfs /run
+work=$(mktemp -d "${TMPDIR:-/tmp}/innernet-e2e.XXXXXX")
+pids=()
+cleanup() {
+    local status=$?
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    if [ "$status" -ne 0 ]; then
+        echo "--- server log" >&2
+        tail -n 30 "$work/srv.log" >&2 || true
+    fi
+    if [ "$keep" -eq 1 ] || [ "$status" -ne 0 ]; then
+        echo "work directory kept: $work" >&2
+    else
+        rm -rf "$work"
+    fi
+}
+trap cleanup EXIT
+
+step() { printf '\n=== %s\n' "$*"; }
+pass() { printf 'ok: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+ns() { local name=$1; shift; ip netns exec "$name" "$@"; }
+
+server() { ns srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" "$@"; }
+client() {
+    local peer=$1; shift
+    ns "$peer" "$E2E_BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" "$@"
+}
+# Fetches as a peer, keeping its output in $work/<peer>.fetch.log for later assertions.
+fetch() {
+    local peer=$1; shift
+    client "$peer" fetch e2e --no-write-hosts "$@" >"$work/$peer.fetch.log" 2>&1 ||
+        { cat "$work/$peer.fetch.log" >&2; fail "fetch as $peer"; }
+}
+
+db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
+
+# Prints a field of the named peer from a client's data store.
+stored() {
+    python3 -I - "$work/$1/data/e2e.json" "$2" "$3" <<'EOF'
+import json, sys
+path, name, field = sys.argv[1:]
+peer = next(p for p in json.load(open(path))["peers"] if p["name"] == name)
+value = peer.get(field)
+print(json.dumps(value) if not isinstance(value, str) else value)
+EOF
+}
+
+expect_stored() {
+    local actual
+    actual=$(stored "$1" "$2" "$3")
+    [ "$actual" = "$4" ] || fail "$1's stored $3 for $2 is $actual, expected $4"
+    pass "$1's stored $3 for $2 is $4"
+}
+
+expect_log() {
+    grep -q -- "$2" "$work/$1.fetch.log" ||
+        { cat "$work/$1.fetch.log" >&2; fail "$1's fetch didn't log '$2'"; }
+    pass "$1's fetch logged '$2'"
+}
+
+expect_no_log() {
+    ! grep -q -- "$2" "$work/$1.fetch.log" ||
+        { cat "$work/$1.fetch.log" >&2; fail "$1's fetch logged '$2'"; }
+    pass "$1's fetch didn't log '$2'"
+}
+
+step "network"
+ip link set lo up
+ip link add br0 type bridge
+ip link set br0 up
+for name in srv a router b; do
+    ip netns add "$name"
+    ns "$name" ip link set lo up
+done
+attach() { # <namespace> <address>
+    ip link add "v-$1" type veth peer name eth0 netns "$1"
+    ip link set "v-$1" master br0 up
+    ns "$1" ip addr add "$2" dev eth0
+    ns "$1" ip link set eth0 up
+}
+attach srv 198.18.0.1/24
+attach a 198.18.0.2/24
+attach router 198.18.0.3/24
+ip link add v-b netns router type veth peer name eth0 netns b
+ns router ip addr add 192.168.50.1/24 dev v-b
+ns router ip link set v-b up
+ns b ip addr add 192.168.50.2/24 dev eth0
+ns b ip link set eth0 up
+ns b ip route add default via 192.168.50.1
+ns router sysctl -qw net.ipv4.ip_forward=1
+ns router nft -f - <<'EOF'
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth0" masquerade
+    }
+}
+EOF
+ns b ping -c1 -W2 198.18.0.1 >/dev/null || fail "b can't reach the server through the NAT"
+pass "b reaches the internet through the NAT"
+
+step "server"
+mkdir -p "$work/srv"
+server new --network-name e2e --network-cidr 10.66.0.0/16 \
+    --external-endpoint 198.18.0.1:51820 --listen-port 51820 >/dev/null
+server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
+for peer in a b; do
+    server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin false \
+        --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
+done
+server serve e2e --no-write-hosts >"$work/srv.log" 2>&1 &
+pids+=($!)
+sleep 1
+
+step "install peers"
+for peer in a b; do
+    mkdir -p "$work/$peer"
+    client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 --delete-invite \
+        --no-write-hosts >"$work/$peer.install.log" 2>&1 ||
+        { cat "$work/$peer.install.log" >&2; fail "install $peer"; }
+done
+pass "a and b installed"
+
+ip_of() { db "SELECT ip FROM peers WHERE name = '$1'"; }
+a_ip=$(ip_of a)
+b_ip=$(ip_of b)
+
+step "honest announcements"
+fetch b
+fetch a
+fetch b
+fetch a
+expect_no_log a "announcement"
+# b is behind NAT with no public candidate, so it lets peers use the observed endpoint.
+db "SELECT announcement FROM peers WHERE name = 'b'" | grep -q '"allow_observed":true' ||
+    fail "b's announcement doesn't allow the observed endpoint"
+pass "b's announcement allows the observed endpoint"
+expect_stored a b endpoint 198.18.0.3:51820
+expect_stored a b observed_endpoint 198.18.0.3:51820
+ns b ping -c3 -W2 "$a_ip" >/dev/null || fail "b can't ping a over innernet"
+ns a ping -c3 -W2 "$b_ip" >/dev/null || fail "a can't ping b over innernet"
+pass "a and b reach each other over innernet"
+
+accepted=$(db "SELECT announcement FROM peers WHERE name = 'b'")
+accepted_candidates=$(stored a b candidates)
+
+step "server withholds b's announcement and impersonates its endpoints"
+db "UPDATE peers SET announcement = NULL, endpoint = '198.18.0.66:9',
+    candidates = '[\"198.18.0.66:9\"]' WHERE name = 'b'"
+fetch a
+expect_stored a b endpoint 198.18.0.3:51820
+expect_stored a b candidates "$accepted_candidates"
+
+step "server forges a newer announcement for b"
+forged=$(python3 -I - "$accepted" <<'EOF'
+import json, sys
+signed = json.loads(sys.argv[1])
+signed["announcement"]["timestamp"] += 1
+signed["announcement"]["endpoint"] = "198.18.0.66:9"
+print(json.dumps(signed))
+EOF
+)
+db "UPDATE peers SET announcement = '$forged' WHERE name = 'b'"
+fetch a
+expect_log a "isn't signed by its key"
+expect_stored a b endpoint 198.18.0.3:51820
+
+step "server replays an older announcement from b"
+fetch b
+newer=$(db "SELECT announcement FROM peers WHERE name = 'b'")
+fetch a
+expect_no_log a "announcement"
+db "UPDATE peers SET announcement = '$accepted' WHERE name = 'b'"
+fetch a
+expect_log a "older endpoint announcement"
+python3 -I -c 'import json, sys; sys.exit(json.loads(sys.argv[1]) != json.loads(sys.argv[2]))' \
+    "$(stored a b announcement)" "$newer" || fail "a didn't keep b's newer announcement"
+pass "a kept b's newer announcement"
+
+step "a peer's override known only to the server"
+fetch a
+expect_no_log a "endpoint override"
+db "UPDATE peers SET endpoint = '198.18.0.77:51820' WHERE name = 'a'"
+fetch a
+expect_log a "the server has an endpoint override (198.18.0.77:51820)"
+client a override-endpoint e2e --endpoint 198.18.0.2:51820 --yes >/dev/null 2>&1 ||
+    fail "override-endpoint as a"
+grep -q '^external-endpoint = "198.18.0.2:51820"' "$work/a/conf/e2e.conf" ||
+    fail "a's override isn't in its config"
+pass "a's override is in its config"
+fetch a
+expect_no_log a "endpoint override"
+fetch b
+expect_stored b a endpoint 198.18.0.2:51820
+# a announced a specific endpoint, so the observed one isn't added to its candidates.
+db "SELECT announcement FROM peers WHERE name = 'a'" | grep -q '"allow_observed":false' ||
+    fail "a's announcement allows the observed endpoint despite its override"
+pass "a's announcement doesn't allow the observed endpoint"
+
+step "all passed"
