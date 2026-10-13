@@ -10,13 +10,14 @@ use crate::{
 use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_shared::{
+    announcement::{self, AnnouncementSigner, EndpointAnnouncement, Received},
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
-use wireguard_control::{Backend, Device, DeviceUpdate, PeerConfigBuilder};
+use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Debug, Error)]
 pub enum RedeemInviteError {
@@ -203,7 +204,7 @@ pub fn fetch(
     );
     let mut store = DataStore::open_or_create(data_dir, interface, &config)?;
     let rest_client = RestClient::new(&config.server);
-    let state = match rest_client.http::<State>("GET", "/user/state") {
+    let mut state = match rest_client.http::<State>("GET", "/user/state") {
         Ok(state) => Some(state),
         Err(e) if e.is_transport_error() => {
             if store.peers().is_empty() {
@@ -221,7 +222,20 @@ pub fn fetch(
         Err(e) => bail!(e),
     };
 
-    if let Some(state) = &state {
+    let device = Device::get(interface, network_opts.backend)?;
+    let own_public_key = device
+        .public_key
+        .clone()
+        .context("the interface has no private key")?;
+    let network = Key::from_base64(&config.server.public_key)
+        .map_err(|_| anyhow::anyhow!("the server's public key in the config is invalid"))?;
+
+    if let Some(state) = &mut state {
+        warn_about_server_endpoint_override(&config, &own_public_key, &state.peers);
+        // The announcements are applied before the update, so that the data store keeps the
+        // announcement that it accepted from each peer, and the endpoints derived from it.
+        apply_announcements(&store, &mut state.peers, &network);
+
         let dropped = store.update(state).context(interface.to_string())?;
         for (peer, e) in dropped {
             log::warn!(
@@ -244,7 +258,6 @@ pub fn fetch(
     }
     let peers = store.peers();
 
-    let device = Device::get(interface, network_opts.backend)?;
     let modifications = device.diff(peers, config.peer_endpoint_overrides());
 
     let updates = modifications
@@ -277,7 +290,10 @@ pub fn fetch(
 
     let listen_port = device.listen_port.unwrap_or(51820);
     if state.is_some() {
-        report_candidates(&rest_client, nat, listen_port)?;
+        // Fails before anything is sent if the private key doesn't match the interface.
+        let signer = AnnouncementSigner::new(&config.interface.private_key, &own_public_key)
+            .context(interface.to_string())?;
+        report_endpoints(&rest_client, nat, listen_port, &config, &signer, &network)?;
     }
 
     if nat.no_nat_traversal {
@@ -370,11 +386,132 @@ fn print_peer_diff(store: &DataStore, diff: &PeerDiff) {
     }
 }
 
-fn report_candidates(
+/// Replaces each peer's endpoints with those derived from its signed announcement.
+///
+/// The announcement used is the newer of the one received from the server and the one last
+/// accepted from the peer, kept with the peer in `store`. Once one has been accepted from a
+/// peer, the unsigned endpoints the server sends for it are disregarded.
+fn apply_announcements(store: &DataStore, peers: &mut [Peer], network: &Key) {
+    for peer in peers {
+        let Ok(signer) = Key::from_base64(&peer.public_key) else {
+            continue;
+        };
+        let accepted = store
+            .peers()
+            .iter()
+            .find(|p| p.public_key == peer.public_key)
+            .and_then(|p| p.announcement.as_ref());
+        let received = peer.contents.announcement.take();
+        let (selected, outcome) =
+            announcement::select(accepted, received.as_ref(), network, &signer);
+
+        match outcome {
+            Received::Nothing | Received::Unchanged | Received::Accepted => {},
+            Received::Stale => log::warn!(
+                "the server sent an older endpoint announcement for peer {} than one already \
+                 accepted; ignoring it.",
+                peer.display_name()
+            ),
+            Received::Invalid => log::warn!(
+                "the server sent an endpoint announcement for peer {} that isn't signed by its \
+                 key; ignoring it.",
+                peer.display_name()
+            ),
+            Received::UnknownCritical(tag) => log::warn!(
+                "the endpoint announcement for peer {} needs a newer innernet (critical \
+                 extension {tag:#06x}); ignoring it.",
+                peer.display_name()
+            ),
+        }
+
+        // Until an announcement has been accepted from the peer, its unsigned endpoints are
+        // used, since the server could equally have withheld the announcement.
+        if let Some(selected) = selected {
+            let (endpoint, candidates) = selected
+                .announcement
+                .endpoints(peer.observed_endpoint.as_ref());
+            peer.contents.endpoint = endpoint;
+            peer.contents.candidates = candidates;
+            peer.contents.announcement = Some(selected.clone());
+        }
+    }
+}
+
+/// Warns if the server holds an endpoint override for this peer that isn't in the local
+/// config, as set by `override-endpoint` before announcements were signed. It is not signed,
+/// so peers that verify announcements won't use it.
+fn warn_about_server_endpoint_override(
+    config: &InterfaceConfig,
+    own_public_key: &Key,
+    peers: &[Peer],
+) {
+    if config.interface.external_endpoint.is_some() {
+        return;
+    }
+    let own_public_key = own_public_key.to_base64();
+    let Some(own) = peers.iter().find(|p| p.public_key == own_public_key) else {
+        return;
+    };
+    // Without an override, the server reports the observed endpoint as the endpoint.
+    if let (Some(endpoint), Some(observed)) = (&own.endpoint, &own.observed_endpoint) {
+        if endpoint != observed {
+            log::warn!(
+                "the server has an endpoint override ({endpoint}) for this peer that isn't in \
+                 the local config, so peers will not use it. Run 'innernet override-endpoint' \
+                 to set it again, or 'innernet override-endpoint --unset' to clear it."
+            );
+        }
+    }
+}
+
+/// Signs and reports the endpoints this peer can be reached at: its override from the local
+/// config and its local interface addresses as NAT traversal candidates.
+fn report_endpoints(
     rest_client: &RestClient,
     nat: &NatOpts,
     listen_port: u16,
+    config: &InterfaceConfig,
+    signer: &AnnouncementSigner,
+    network: &Key,
 ) -> Result<(), Error> {
+    let mut candidates = local_candidates(nat, listen_port)?;
+    candidates.truncate(10);
+    let endpoint = config.interface.external_endpoint.clone();
+    // Let peers use the endpoint the server observes unless this peer knows a public one.
+    let allow_observed = match &endpoint {
+        Some(endpoint) => endpoint.is_host_unspecified(),
+        None => !candidates.iter().any(Endpoint::is_public_ipv4),
+    };
+    let signed = signer.sign(
+        network,
+        EndpointAnnouncement {
+            timestamp: announcement::timestamp_now(),
+            endpoint,
+            candidates,
+            allow_observed,
+            extensions: vec![],
+        },
+    )?;
+
+    match rest_client.http_form::<_, ()>("PUT", "/user/announcement", &signed) {
+        Ok(()) => log::debug!("signed endpoint announcement successfully reported"),
+        Err(e) if e.has_status_of(404) => {
+            log::warn!(
+                "your network is using an old version of innernet-server that doesn't relay \
+                 signed endpoint announcements."
+            );
+            report_candidates(rest_client, signed.announcement.candidates)?;
+        },
+        Err(e) if e.has_status_of(409) => log::warn!(
+            "the server holds a newer endpoint announcement than this one; the clock may have \
+             gone backwards. Peers keep using the newer one."
+        ),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn local_candidates(nat: &NatOpts, listen_port: u16) -> Result<Vec<Endpoint>, Error> {
     let candidates: Vec<Endpoint> = get_local_addrs()?
         .filter(|ip| !nat.is_excluded(*ip))
         .map(|addr| SocketAddr::from((addr, listen_port)).into())
@@ -387,6 +524,10 @@ fn report_candidates(
     for candidate in &candidates {
         log::debug!("  candidate: {}", candidate);
     }
+    Ok(candidates)
+}
+
+fn report_candidates(rest_client: &RestClient, candidates: Vec<Endpoint>) -> Result<(), Error> {
     if let Err(e) = rest_client.http_form::<_, ()>("PUT", "/user/candidates", &candidates) {
         if e.has_status_of(404) {
             log::warn!("your network is using an old version of innernet-server that doesn't support NAT traversal candidate reporting.")
@@ -403,5 +544,140 @@ pub fn interface_is_up(backend: Backend, interface_name: &InterfaceName) -> bool
     match Device::list(backend) {
         Ok(interfaces) => interfaces.contains(interface_name),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innernet_shared::{announcement::SignedAnnouncement, PeerContents};
+    use wireguard_control::KeyPair;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        store: DataStore,
+        network: Key,
+        signer: AnnouncementSigner,
+        peer: Peer,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let config: InterfaceConfig = serde_json::from_value(serde_json::json!({
+                "interface": {
+                    "network-name": "test0",
+                    "address": "10.0.0.3/16",
+                    "private-key": KeyPair::generate().private.to_base64(),
+                },
+                "server": {
+                    "public-key": KeyPair::generate().public.to_base64(),
+                    "external-endpoint": "198.51.100.1:51820",
+                    "internal-endpoint": "10.0.0.1:51820",
+                },
+            }))
+            .unwrap();
+            let store =
+                DataStore::open_or_create(dir.path(), &"test0".parse().unwrap(), &config).unwrap();
+            let keypair = KeyPair::generate();
+            let signer =
+                AnnouncementSigner::new(&keypair.private.to_base64(), &keypair.public).unwrap();
+            let peer = Peer {
+                id: 1,
+                contents: PeerContents {
+                    name: Some("peer".parse().unwrap()),
+                    ip: "10.0.0.2".parse().unwrap(),
+                    cidr_id: 1,
+                    public_key: keypair.public.to_base64(),
+                    endpoint: Some("203.0.113.66:1".parse().unwrap()),
+                    persistent_keepalive_interval: None,
+                    is_admin: false,
+                    is_disabled: false,
+                    is_redeemed: true,
+                    invite_expires: None,
+                    candidates: vec!["203.0.113.66:2".parse().unwrap()],
+                    announcement: None,
+                    observed_endpoint: Some("198.51.100.7:40000".parse().unwrap()),
+                },
+            };
+            Self {
+                _dir: dir,
+                store,
+                network: KeyPair::generate().public,
+                signer,
+                peer,
+            }
+        }
+
+        fn sign(&self, timestamp: u64, endpoint: &str) -> SignedAnnouncement {
+            self.signer
+                .sign(
+                    &self.network,
+                    EndpointAnnouncement {
+                        timestamp,
+                        endpoint: Some(endpoint.parse().unwrap()),
+                        candidates: vec!["192.168.1.2:51820".parse().unwrap()],
+                        allow_observed: false,
+                        extensions: vec![],
+                    },
+                )
+                .unwrap()
+        }
+
+        /// Applies announcements to a peer as received from the server, saves the result like
+        /// `fetch` does, and returns it.
+        fn fetch(&mut self, received: Option<SignedAnnouncement>) -> Peer {
+            let mut state = State {
+                peers: vec![self.peer.clone()],
+                cidrs: vec![],
+            };
+            state.peers[0].contents.announcement = received;
+            apply_announcements(&self.store, &mut state.peers, &self.network);
+            assert!(self.store.update(&state).unwrap().is_empty());
+            state.peers.pop().unwrap()
+        }
+    }
+
+    #[test]
+    fn test_unsigned_endpoints_used_until_latched() {
+        let mut f = Fixture::new();
+        let peer = f.fetch(None);
+        assert_eq!(peer.endpoint, f.peer.endpoint);
+        assert_eq!(peer.candidates, f.peer.candidates);
+    }
+
+    #[test]
+    fn test_latched_announcement_overrides_server() {
+        let mut f = Fixture::new();
+        let first = f.sign(10, "203.0.113.1:51820");
+        let peer = f.fetch(Some(first.clone()));
+        assert_eq!(peer.endpoint, Some("203.0.113.1:51820".parse().unwrap()));
+        // allow_observed is off, so the observed endpoint is not added.
+        assert_eq!(peer.candidates, first.announcement.candidates);
+
+        // Withheld, forged, or stale: the accepted announcement keeps being used.
+        let mut forged = f.sign(20, "203.0.113.1:51820");
+        forged.announcement.endpoint = Some("203.0.113.66:1".parse().unwrap());
+        let stale = f.sign(5, "203.0.113.5:51820");
+        for received in [None, Some(forged), Some(stale)] {
+            let peer = f.fetch(received);
+            assert_eq!(peer.endpoint, Some("203.0.113.1:51820".parse().unwrap()));
+            assert_eq!(peer.announcement.as_ref(), Some(&first));
+        }
+
+        let newer = f.sign(30, "203.0.113.3:51820");
+        let peer = f.fetch(Some(newer.clone()));
+        assert_eq!(peer.endpoint, Some("203.0.113.3:51820".parse().unwrap()));
+        assert_eq!(peer.announcement, Some(newer));
+    }
+
+    #[test]
+    fn test_invalid_announcement_before_latching() {
+        let mut f = Fixture::new();
+        let mut forged = f.sign(10, "203.0.113.1:51820");
+        forged.announcement.timestamp = 11;
+        let peer = f.fetch(Some(forged));
+        assert_eq!(peer.announcement, None);
+        assert_eq!(peer.endpoint, f.peer.endpoint);
     }
 }

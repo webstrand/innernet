@@ -861,7 +861,7 @@ fn override_endpoint(
     opts: &Opts,
     sub_opts: OverrideEndpointOpts,
 ) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
 
     let endpoint_contents = if sub_opts.unset {
         prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
@@ -877,9 +877,15 @@ fn override_endpoint(
 
     if let Some(contents) = endpoint_contents {
         log::info!("requesting endpoint update...");
+        let endpoint = match &contents {
+            EndpointContents::Set(endpoint) => Some(endpoint.clone()),
+            EndpointContents::Unset => None,
+        };
         RestClient::new(&config.server).http_form::<_, ()>("PUT", "/user/endpoint", contents)?;
+        config.interface.external_endpoint = endpoint;
+        config.save(&opts.config_dir, interface)?;
         log::info!(
-            "endpoint override {}",
+            "endpoint override {}; peers receive it signed on the next fetch",
             if sub_opts.unset { "unset" } else { "set" }
         );
     } else {

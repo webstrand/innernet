@@ -45,6 +45,11 @@ pub struct InterfaceInfo {
 
     /// The local listen port. A random port will be used if `None`.
     pub listen_port: Option<u16>,
+
+    /// The endpoint this peer announces that it can be reached at, set by `override-endpoint`.
+    /// Kept locally so that the peer never signs an endpoint it learned from the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_endpoint: Option<Endpoint>,
 }
 
 impl InterfaceInfo {
@@ -54,6 +59,7 @@ impl InterfaceInfo {
             private_key: keypair.private.to_base64(),
             address,
             listen_port: None,
+            external_endpoint: None,
         }
     }
 }
