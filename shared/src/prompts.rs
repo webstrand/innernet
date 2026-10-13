@@ -1,8 +1,8 @@
 use crate::{
     interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
-    AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
-    Endpoint, Error, Hostname, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, Peer,
-    PeerContents, RenameCidrOpts, RenamePeerOpts,
+    AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts,
+    EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt, ListenPortOpts,
+    OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -468,6 +468,48 @@ pub fn enable_or_disable_peer(
             ))?
         {
             Some(peer.clone())
+        } else {
+            None
+        },
+    )
+}
+
+/// Selects a peer to permanently delete (on the server) or forget (on a client).
+pub fn delete_or_forget_peer<'a>(
+    peers: &'a [Peer],
+    args: &DeleteForgetPeerOpts,
+    action: &str,
+) -> Result<Option<&'a Peer>, Error> {
+    let peer = if let Some(name) = &args.name {
+        peers
+            .iter()
+            .find(|p| &p.name == name)
+            .ok_or_else(|| anyhow!("No eligible peer named '{}'", name))?
+    } else {
+        if peers.is_empty() {
+            bail!("No eligible peers to {}.", action);
+        }
+        let peer_selection: Vec<_> = peers
+            .iter()
+            .map(|peer| {
+                let disabled = if peer.is_disabled { " [disabled]" } else { "" };
+                format!("{} ({}){}", peer.name, peer.ip, disabled)
+            })
+            .collect();
+        let (index, _) = select(&format!("Peer to {action}"), &peer_selection)?;
+        &peers[index]
+    };
+
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Permanently {} peer {} ({})?",
+                action,
+                peer.name.yellow(),
+                peer.ip
+            ))?
+        {
+            Some(peer)
         } else {
             None
         },

@@ -378,4 +378,33 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_permanent_delete_frees_ip() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let db = server.db();
+        let conn = db.lock();
+
+        // Enabled peers can't be permanently deleted.
+        assert!(DatabasePeer::delete(&conn, test::USER1_PEER_ID).is_err());
+
+        // While disabled, the peer still reserves its name and IP.
+        DatabasePeer::disable(&conn, test::USER1_PEER_ID)?;
+        assert!(DatabasePeer::create(
+            &conn,
+            test::user_peer_contents("user1", test::USER1_PEER_IP)?
+        )
+        .is_err());
+
+        DatabasePeer::delete(&conn, test::USER1_PEER_ID)?;
+        assert!(DatabasePeer::get(&conn, test::USER1_PEER_ID).is_err());
+
+        let new_peer = DatabasePeer::create(
+            &conn,
+            test::user_peer_contents("user1", test::USER1_PEER_IP)?,
+        )?;
+        assert_eq!(new_peer.ip.to_string(), test::USER1_PEER_IP);
+
+        Ok(())
+    }
 }

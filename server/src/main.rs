@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use innernet_shared::{
-    AddCidrOpts, AddPeerOpts, DeleteCidrOpts, EnableDisablePeerOpts, HostsOpts, NetworkOpts,
-    RenameCidrOpts, RenamePeerOpts,
+    AddCidrOpts, AddPeerOpts, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts,
+    HostsOpts, NetworkOpts, RenameCidrOpts, RenamePeerOpts,
 };
 use std::{env, path::PathBuf};
 
 use innernet_server::{
-    add_cidr, add_peer, delete_cidr, enable_or_disable_peer,
+    add_cidr, add_peer, delete_cidr, delete_peer, enable_or_disable_peer,
     initialize::{self, InitializeOpts},
     rename_cidr, rename_peer, serve, uninstall, ServerConfig,
 };
@@ -89,6 +89,17 @@ enum Command {
         args: EnableDisablePeerOpts,
     },
 
+    /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
+    ///
+    /// Clients that have seen the peer accept a new peer at the same IP only after
+    /// `innernet forget-peer` has been run on them.
+    DeletePeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: DeleteForgetPeerOpts,
+    },
+
     /// Rename an existing peer.
     RenamePeer {
         interface: Interface,
@@ -164,6 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::EnablePeer { interface, args } => {
             enable_or_disable_peer(&interface, &conf, true, opts.network, args)?
+        },
+        Command::DeletePeer { interface, args } => {
+            delete_peer(&interface, &conf, opts.network, args)?
         },
         Command::AddCidr { interface, args } => add_cidr(&interface, &conf, args)?,
         Command::RenameCidr { interface, args } => rename_cidr(&interface, &conf, args)?,

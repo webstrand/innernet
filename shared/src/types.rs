@@ -389,6 +389,17 @@ pub struct EnableDisablePeerOpts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct DeleteForgetPeerOpts {
+    /// Name of the peer to delete/forget
+    #[clap(long)]
+    pub name: Option<Hostname>,
+
+    /// Bypasses confirmation
+    #[clap(long, requires("name"))]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct AddCidrOpts {
     /// The CIDR name (eg. 'engineers')
     #[clap(long)]

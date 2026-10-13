@@ -108,12 +108,25 @@ impl DataStore {
                 if existing_peer.ip == new_peer.ip
                     && existing_peer.public_key != new_peer.public_key
                 {
-                    bail!("PINNING ERROR: New peer has same IP but different public key.");
+                    bail!(
+                        "PINNING ERROR: New peer {} has same IP ({}) but different public key \
+                         than previously seen peer {}.",
+                        new_peer.name,
+                        new_peer.ip,
+                        existing_peer.name,
+                    );
                 }
                 if existing_peer.public_key == new_peer.public_key
                     && existing_peer.ip != new_peer.ip
                 {
-                    bail!("PINNING ERROR: New peer has same public key but different IP.");
+                    bail!(
+                        "PINNING ERROR: New peer {} has same public key but different IP ({}) \
+                         than previously seen peer {} ({}).",
+                        new_peer.name,
+                        new_peer.ip,
+                        existing_peer.name,
+                        existing_peer.ip,
+                    );
                 }
             }
         }
@@ -147,6 +160,25 @@ impl DataStore {
                 existing_peer.contents.is_disabled = true;
             }
         }
+
+        Ok(())
+    }
+
+    /// Removes a peer from the store and persists the store to disk, un-pinning the peer's
+    /// (IP, PublicKey) tuple so that a new peer may be accepted at the same IP.
+    ///
+    /// If the peer still exists on the server, it is simply pinned again on the next fetch.
+    pub fn forget_peer(&mut self, public_key: &str) -> Result<(), Error> {
+        let peers = match &mut self.contents {
+            Contents::V1 { ref mut peers, .. } => peers,
+        };
+
+        let index = peers
+            .iter()
+            .position(|p| p.public_key == public_key)
+            .ok_or_else(|| anyhow::anyhow!("peer not found in data store"))?;
+        peers.remove(index);
+        self.write()?;
 
         Ok(())
     }
@@ -273,6 +305,28 @@ mod tests {
         updated.push(new_peer);
         store.update_peers(&updated).unwrap();
         assert_eq!(store.peers(), &updated[..]);
+    }
+
+    #[test]
+    fn test_forget_peer_allows_ip_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+
+        let mut replacement = BASE_PEERS.clone();
+        replacement[0].contents.public_key = "foo".to_string();
+        assert!(store.update_peers(&replacement).is_err());
+
+        store.forget_peer(&BASE_PEERS[0].public_key).unwrap();
+        assert!(store.forget_peer(&BASE_PEERS[0].public_key).is_err());
+
+        // The forgotten state is persisted.
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+        assert!(store.peers().is_empty());
+        store.update_peers(&replacement).unwrap();
+        assert_eq!(store.peers(), &replacement[..]);
     }
 
     #[test]
