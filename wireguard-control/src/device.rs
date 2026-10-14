@@ -110,7 +110,7 @@ impl PeerInfo {
 /// The peer statistics are retrieved once at construction time,
 /// and need to be updated manually by calling [`Self::get()`].
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct Device {
     /// The interface name of this device
     pub name: InterfaceName,

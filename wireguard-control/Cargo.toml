@@ -30,3 +30,7 @@ netlink-sys.workspace = true
 
 [target.'cfg(target_os = "openbsd")'.dependencies]
 nix = { version = "0.30.1", features = ["net"] }
+
+[features]
+# Allows `Device` to be constructed outside of this crate, for tests.
+test-util = []
