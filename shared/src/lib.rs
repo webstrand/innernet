@@ -45,8 +45,9 @@ pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
     Ok(())
 }
 
-pub fn warn_on_dangerous_mode(path: &Path) -> Result<(), io::Error> {
-    let file = File::open(path)?;
+/// Warns if `file` is world-accessible. The permissions are read from the open file, so that they
+/// are those of the file that the caller uses; `path` is only used in the warning.
+pub fn warn_on_dangerous_mode(file: &File, path: &Path) -> Result<(), io::Error> {
     let metadata = file.metadata()?;
     let permissions = metadata.permissions();
     let mode = permissions.mode() & 0o777;

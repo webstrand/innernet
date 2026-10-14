@@ -20,6 +20,7 @@ use innernet_shared::{
     WrappedIoError,
 };
 use std::{
+    fs::File,
     io,
     path::{Path, PathBuf},
     thread,
@@ -280,7 +281,9 @@ fn install(
     invite: &Path,
     listen_port: Option<u16>,
 ) -> Result<(), Error> {
-    let mut config = InterfaceConfig::from_file(invite)?;
+    let mut invite_file = File::open(invite).with_path(invite)?;
+    innernet_shared::warn_on_dangerous_mode(&invite_file, invite).with_path(invite)?;
+    let mut config = InterfaceConfig::from_file(&mut invite_file)?;
     if let Some(listen_port) = listen_port {
         config.interface.listen_port = Some(listen_port);
     }
