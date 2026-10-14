@@ -7,10 +7,10 @@ use indoc::printdoc;
 use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
-    prompts, tls, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
-    DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface,
-    IoErrorContext, NetworkOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
-    INNERNET_PUBKEY_HEADER,
+    prompts, tls, update_hosts_file, wg, AddCidrOpts, AddDeleteDelegationOpts, AddPeerOpts,
+    CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, Error,
+    HostsOpts, Interface, IoErrorContext, NetworkOpts, Peer, PeerContents, RenameCidrOpts,
+    RenamePeerOpts, INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
@@ -363,6 +363,75 @@ pub fn delete_peer(
         );
     } else {
         log::info!("exiting without deleting peer.");
+    }
+
+    Ok(())
+}
+
+pub fn add_delegation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    network: NetworkOpts,
+    opts: AddDeleteDelegationOpts,
+) -> Result<(), Error> {
+    let conn = open_database_connection(interface, conf)?;
+    let peers = DatabasePeer::list(&conn)?
+        .into_iter()
+        .map(|dp| dp.inner)
+        .collect::<Vec<_>>();
+    let cidrs = DatabaseCidr::list(&conn)?;
+
+    if let Some((peer, prefix)) = prompts::add_delegation(&peers, &cidrs, &opts)? {
+        let mut db_peer = DatabasePeer::get(&conn, peer.id)?;
+        db_peer.add_delegation(&conn, prefix)?;
+        if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+            update_allowed_ips(&db_peer, interface, network.backend)?;
+        }
+
+        println!(
+            "{} delegated to peer {}, from the next fetch of the peers that see it.",
+            prefix,
+            peer.display_name().yellow()
+        );
+    } else {
+        log::info!("exiting without delegating.");
+    }
+
+    Ok(())
+}
+
+pub fn delete_delegation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    network: NetworkOpts,
+    opts: AddDeleteDelegationOpts,
+) -> Result<(), Error> {
+    let conn = open_database_connection(interface, conf)?;
+    let peers = DatabasePeer::list(&conn)?
+        .into_iter()
+        .map(|dp| dp.inner)
+        .collect::<Vec<_>>();
+
+    if let Some((peer, prefix)) = prompts::delete_delegation(&peers, &opts)? {
+        let mut db_peer = DatabasePeer::get(&conn, peer.id)?;
+        db_peer.remove_delegation(&conn, prefix)?;
+        if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+            update_allowed_ips(&db_peer, interface, network.backend)?;
+        }
+
+        printdoc!(
+            "
+            {prefix} withdrawn from peer {name}. It can now be delegated again.
+
+            Clients that have seen it pin it to {name}'s public key, and refuse it for
+            another peer until the following command has been run on each of them:
+
+                innernet forget-peer {interface} --name {name}
+            ",
+            name = peer.display_name().yellow(),
+        );
+    } else {
+        log::info!("exiting without withdrawing delegation.");
     }
 
     Ok(())

@@ -443,6 +443,22 @@ pub struct DeleteForgetPeerOpts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct AddDeleteDelegationOpts {
+    /// Name of the peer the prefix is delegated to
+    #[clap(long)]
+    pub name: Option<Hostname>,
+
+    /// The prefix, within the peer's CIDR (eg. '10.42.1.32/28', or '10.42.1.40/32' for a
+    /// single address)
+    #[clap(long)]
+    pub prefix: Option<IpNet>,
+
+    /// Bypass confirmation
+    #[clap(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct AddCidrOpts {
     /// The CIDR name (eg. 'engineers')
     #[clap(long)]

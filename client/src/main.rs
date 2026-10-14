@@ -13,11 +13,12 @@ use innernet_client_core::{
 };
 use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
-    AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
-    DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, EndpointContents,
-    HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts,
-    OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts,
-    ServerCapabilities, WrappedIoError,
+    AddDeleteAssociationOpts, AddDeleteDelegationOpts, AddPeerOpts, Association,
+    AssociationContents, Cidr, CidrTree, DelegationContents, DeleteCidrOpts, DeleteForgetPeerOpts,
+    EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
+    IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
+    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
+    WrappedIoError,
 };
 use std::{
     fs::File,
@@ -243,6 +244,30 @@ enum Command {
 
         #[clap(flatten)]
         sub_opts: DeleteForgetPeerOpts,
+    },
+
+    /// Delegate a prefix of a peer's CIDR to it
+    ///
+    /// The prefix is routed to the peer as if it were that many more peers with its key, for
+    /// it to hand to containers, devices behind it, or more addresses of its own, eg:
+    ///
+    /// --name 'router' --prefix '10.42.1.32/28'
+    AddDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddDeleteDelegationOpts,
+    },
+
+    /// Withdraw a prefix delegated to a peer, freeing it for reuse
+    ///
+    /// Clients that have seen the delegation accept it for another peer only after
+    /// `innernet forget-peer` has been run on them.
+    DeleteDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddDeleteDelegationOpts,
     },
 
     /// Add an association between CIDRs
@@ -728,6 +753,78 @@ fn forget_peer(
     Ok(())
 }
 
+fn add_delegation(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddDeleteDelegationOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    if !get_server_capabilities(&config)?.delegations {
+        bail!("The innernet server is too old to support delegations.");
+    }
+    let rest_client = RestClient::new(&config)?;
+
+    log::info!("Fetching CIDRs");
+    let cidrs = rest_client.get_cidrs()?;
+    log::info!("Fetching peers");
+    let peers = rest_client.get_peers()?;
+
+    if let Some((peer, prefix)) = prompts::add_delegation(&peers, &cidrs, &sub_opts)? {
+        rest_client.http_form::<_, Peer>(
+            "POST",
+            &format!("/admin/peers/delegations/{}", peer.id),
+            DelegationContents { prefix },
+        )?;
+        log::info!(
+            "{} delegated to peer {}, from the next fetch of the peers that see it.",
+            prefix,
+            peer.display_name().yellow()
+        );
+    } else {
+        log::info!("exiting without delegating.");
+    }
+
+    Ok(())
+}
+
+fn delete_delegation(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddDeleteDelegationOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    if !get_server_capabilities(&config)?.delegations {
+        bail!("The innernet server is too old to support delegations.");
+    }
+    let rest_client = RestClient::new(&config)?;
+
+    log::info!("Fetching peers");
+    let peers = rest_client.get_peers()?;
+
+    if let Some((peer, prefix)) = prompts::delete_delegation(&peers, &sub_opts)? {
+        rest_client.http::<()>(
+            "DELETE",
+            &format!("/admin/peers/delegations/{}/{}", peer.id, prefix),
+        )?;
+
+        eprintdoc!(
+            "
+            {prefix} withdrawn from peer {name}. It can now be delegated again.
+
+            Clients that have seen it, this one included, pin it to {name}'s public key, and
+            refuse it for another peer until the following command has been run on each of them:
+
+                innernet forget-peer {interface} --name {name}
+            ",
+            name = peer.display_name().yellow(),
+        );
+    } else {
+        log::info!("exiting without withdrawing delegation.");
+    }
+
+    Ok(())
+}
+
 fn add_association(
     interface: &InterfaceName,
     opts: &Opts,
@@ -1184,6 +1281,15 @@ fn print_peer(
             public_key.yellow(),
         );
         println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);
+        if !peer.delegations.is_empty() {
+            let delegations: Vec<_> = peer.delegations.iter().map(|d| d.to_string()).collect();
+            println_pad!(
+                pad,
+                "  {}: {}",
+                "delegations".bold(),
+                delegations.join(", ")
+            );
+        }
         if let Some(info) = info {
             if let Some(endpoint) = info.config.endpoint {
                 println_pad!(
@@ -1318,6 +1424,14 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => forget_peer(&interface, opts, sub_opts)?,
+        Command::AddDelegation {
+            interface,
+            sub_opts,
+        } => add_delegation(&interface, opts, sub_opts)?,
+        Command::DeleteDelegation {
+            interface,
+            sub_opts,
+        } => delete_delegation(&interface, opts, sub_opts)?,
         Command::AddAssociation {
             interface,
             sub_opts,

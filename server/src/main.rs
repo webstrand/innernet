@@ -1,13 +1,14 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use innernet_shared::{
-    AddCidrOpts, AddPeerOpts, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts,
-    HostsOpts, NetworkOpts, RenameCidrOpts, RenamePeerOpts, Timestring,
+    AddCidrOpts, AddDeleteDelegationOpts, AddPeerOpts, DeleteCidrOpts, DeleteForgetPeerOpts,
+    EnableDisablePeerOpts, HostsOpts, NetworkOpts, RenameCidrOpts, RenamePeerOpts, Timestring,
 };
 use std::{env, path::PathBuf};
 
 use innernet_server::{
-    add_cidr, add_peer, delete_cidr, delete_peer, enable_or_disable_peer,
+    add_cidr, add_delegation, add_peer, delete_cidr, delete_delegation, delete_peer,
+    enable_or_disable_peer,
     initialize::{self, InitializeOpts},
     rename_cidr, rename_peer, serve, uninstall, ServerConfig,
 };
@@ -114,6 +115,26 @@ enum Command {
         args: RenamePeerOpts,
     },
 
+    /// Delegate a prefix of a peer's CIDR to it, routed to it as if it were that many more
+    /// peers with its key.
+    AddDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: AddDeleteDelegationOpts,
+    },
+
+    /// Withdraw a prefix delegated to a peer, freeing it for reuse.
+    ///
+    /// Clients that have seen the delegation accept it for another peer only after
+    /// `innernet forget-peer` has been run on them.
+    DeleteDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: AddDeleteDelegationOpts,
+    },
+
     /// Add a new CIDR to an existing network.
     AddCidr {
         interface: Interface,
@@ -185,6 +206,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::DeletePeer { interface, args } => {
             delete_peer(&interface, &conf, opts.network, args)?
+        },
+        Command::AddDelegation { interface, args } => {
+            add_delegation(&interface, &conf, opts.network, args)?
+        },
+        Command::DeleteDelegation { interface, args } => {
+            delete_delegation(&interface, &conf, opts.network, args)?
         },
         Command::AddCidr { interface, args } => add_cidr(&interface, &conf, args)?,
         Command::RenameCidr { interface, args } => rename_cidr(&interface, &conf, args)?,

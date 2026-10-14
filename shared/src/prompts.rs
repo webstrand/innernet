@@ -1,13 +1,15 @@
 use crate::{
-    interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
-    AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts,
-    EnableDisablePeerOpts, Endpoint, Error, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts,
-    Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
+    check_delegation, interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts,
+    AddDeleteAssociationOpts, AddDeleteDelegationOpts, AddPeerOpts, Association, Cidr,
+    CidrContents, CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint,
+    Error, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts,
+    RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use innernet_publicip::Preference;
+use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use std::{
     collections::BTreeMap,
@@ -319,7 +321,9 @@ pub fn gather_new_peer_info(
     let mut available_ip = None;
     let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
     for ip in candidate_ips {
-        if !peers.iter().any(|peer| peer.ip == ip) {
+        let is_taken =
+            |peer: &Peer| peer.ip == ip || peer.delegations.iter().any(|d| d.contains(&ip));
+        if !peers.iter().any(is_taken) {
             available_ip = Some(ip);
             break;
         }
@@ -511,6 +515,119 @@ pub fn delete_or_forget_peer<'a>(
             ))?
         {
             Some(peer)
+        } else {
+            None
+        },
+    )
+}
+
+/// Bring up a prompt to delegate a prefix to a peer, checked as the server would. `peers` must
+/// be all the peers of the network, disabled ones included. Returns the peer and the prefix.
+pub fn add_delegation(
+    peers: &[Peer],
+    cidrs: &[Cidr],
+    args: &AddDeleteDelegationOpts,
+) -> Result<Option<(Peer, IpNet)>, Error> {
+    let eligible_peers = peers
+        .iter()
+        .filter(|p| p.name.as_deref() != Some("innernet-server"))
+        .collect::<Vec<_>>();
+    let peer = if let Some(name) = &args.name {
+        eligible_peers
+            .into_iter()
+            .find(|p| p.name.as_ref() == Some(name))
+            .ok_or_else(|| anyhow!("Peer '{}' does not exist", name))?
+    } else {
+        let peer_selection: Vec<_> = eligible_peers
+            .iter()
+            .map(|peer| format!("{} ({})", peer.display_name(), peer.ip))
+            .collect();
+        let (index, _) = select("Peer to delegate to", &peer_selection)?;
+        eligible_peers[index]
+    };
+    let cidr = cidrs
+        .iter()
+        .find(|cidr| cidr.id == peer.cidr_id)
+        .ok_or_else(|| anyhow!("Peer '{}' has no CIDR", peer.display_name()))?;
+
+    let prefix = if let Some(prefix) = args.prefix {
+        prefix
+    } else {
+        input(
+            &format!("Prefix of {} to delegate", cidr.cidr),
+            Prefill::None,
+        )?
+    };
+    check_delegation(&prefix, peer, &cidr.cidr, peers)?;
+
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Delegate {} to peer {} ({})?",
+                prefix,
+                peer.display_name().yellow(),
+                peer.ip
+            ))?
+        {
+            Some((peer.clone(), prefix))
+        } else {
+            None
+        },
+    )
+}
+
+/// Bring up a prompt to withdraw a prefix delegated to a peer. Returns the peer and the prefix.
+pub fn delete_delegation(
+    peers: &[Peer],
+    args: &AddDeleteDelegationOpts,
+) -> Result<Option<(Peer, IpNet)>, Error> {
+    let peer = if let Some(name) = &args.name {
+        peers
+            .iter()
+            .find(|p| p.name.as_ref() == Some(name))
+            .ok_or_else(|| anyhow!("Peer '{}' does not exist", name))?
+    } else {
+        let delegating_peers = peers
+            .iter()
+            .filter(|p| !p.delegations.is_empty())
+            .collect::<Vec<_>>();
+        if delegating_peers.is_empty() {
+            bail!("No peers have delegations.");
+        }
+        let peer_selection: Vec<_> = delegating_peers
+            .iter()
+            .map(|peer| format!("{} ({})", peer.display_name(), peer.ip))
+            .collect();
+        let (index, _) = select("Peer to withdraw a delegation from", &peer_selection)?;
+        delegating_peers[index]
+    };
+
+    let prefix = if let Some(prefix) = args.prefix {
+        if !peer.delegations.contains(&prefix) {
+            bail!(
+                "{} isn't delegated to peer '{}'",
+                prefix,
+                peer.display_name()
+            );
+        }
+        prefix
+    } else {
+        if peer.delegations.is_empty() {
+            bail!("Peer '{}' has no delegations.", peer.display_name());
+        }
+        *select("Delegation to withdraw", &peer.delegations)?.1
+    };
+
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Withdraw {} from peer {} ({})?",
+                prefix,
+                peer.display_name().yellow(),
+                peer.ip
+            ))?
+        {
+            Some((peer.clone(), prefix))
         } else {
             None
         },
