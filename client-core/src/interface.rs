@@ -130,7 +130,7 @@ fn update_keypair(
         "Registering keypair with server (at {}).",
         config.server.internal_endpoint
     );
-    RestClient::new(&config.server).http_form::<_, ()>(
+    RestClient::new(&config)?.http_form::<_, ()>(
         "POST",
         "/user/redeem",
         RedeemContents {
@@ -209,7 +209,7 @@ pub fn fetch(
         interface.as_str_lossy().yellow()
     );
     let mut store = DataStore::open_or_create(data_dir, interface, &config)?;
-    let rest_client = RestClient::new(&config.server);
+    let rest_client = RestClient::new(&config)?;
     let mut state = match rest_client.http::<State>("GET", "/user/state") {
         Ok(state) => Some(state),
         Err(e) if e.is_transport_error() => {

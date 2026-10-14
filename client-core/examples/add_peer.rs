@@ -21,7 +21,7 @@ fn main() -> Result<(), Error> {
 
     let interface: InterfaceName = interface.parse()?;
     let interface_config = InterfaceConfig::from_interface(config_dir, &interface)?;
-    let rest_client = RestClient::new(&interface_config.server);
+    let rest_client = RestClient::new(&interface_config)?;
     let cidrs = rest_client.get_cidrs()?;
     let peers = rest_client.get_peers()?;
 

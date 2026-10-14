@@ -32,7 +32,7 @@ pub fn create_peer(
 ) -> Result<(Peer, PeerInvitation), CreatePeerError> {
     let interface_config = InterfaceConfig::from_interface(config_dir, interface)
         .map_err(CreatePeerError::InterfaceConfigAccess)?;
-    let rest_client = RestClient::new(&interface_config.server);
+    let rest_client = RestClient::new(&interface_config)?;
 
     let keypair = KeyPair::generate();
     let peer_contents = new_peer_info.into_peer_contents(&keypair);

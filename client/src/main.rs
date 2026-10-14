@@ -491,10 +491,9 @@ fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Er
 }
 
 fn add_cidr(interface: &InterfaceName, opts: &Opts, sub_opts: AddCidrOpts) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     log::info!("Fetching CIDRs");
-    let rest_client = RestClient::new(&server);
+    let rest_client = RestClient::new(&config)?;
     let cidrs: Vec<Cidr> = rest_client.get_cidrs()?;
 
     if let Some(cidr_request) = prompts::add_cidr(&cidrs, &sub_opts)? {
@@ -524,9 +523,8 @@ fn rename_cidr(
     opts: &Opts,
     sub_opts: RenameCidrOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
@@ -554,10 +552,9 @@ fn delete_cidr(
     opts: &Opts,
     sub_opts: DeleteCidrOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     println!("Fetching eligible CIDRs");
-    let rest_client = RestClient::new(&server);
+    let rest_client = RestClient::new(&config)?;
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
 
@@ -589,9 +586,8 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
 }
 
 fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching CIDRs");
     let cidrs = rest_client.get_cidrs()?;
@@ -620,9 +616,8 @@ fn rename_peer(
     opts: &Opts,
     sub_opts: RenamePeerOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching peers");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
@@ -645,9 +640,8 @@ fn enable_or_disable_peer(
     sub_opts: EnableDisablePeerOpts,
     enable: bool,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching peers.");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
@@ -672,7 +666,7 @@ fn delete_peer(
     if !get_server_capabilities(&config)?.permanent_peer_delete {
         bail!("The innernet server is too old to support permanently deleting peers.");
     }
-    let rest_client = RestClient::new(&config.server);
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching peers.");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
@@ -739,9 +733,8 @@ fn add_association(
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
@@ -781,9 +774,8 @@ fn delete_association(
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
@@ -802,9 +794,8 @@ fn delete_association(
 }
 
 fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
@@ -881,7 +872,7 @@ fn override_endpoint(
             EndpointContents::Set(endpoint) => Some(endpoint.clone()),
             EndpointContents::Unset => None,
         };
-        RestClient::new(&config.server).http_form::<_, ()>("PUT", "/user/endpoint", contents)?;
+        RestClient::new(&config)?.http_form::<_, ()>("PUT", "/user/endpoint", contents)?;
         config.interface.external_endpoint = endpoint;
         config.save(&opts.config_dir, interface)?;
         log::info!(
@@ -987,7 +978,7 @@ fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, E
 }
 
 fn get_server_capabilities(config: &InterfaceConfig) -> Result<ServerCapabilities, Error> {
-    let rest_client = RestClient::new(&config.server);
+    let rest_client = RestClient::new(config)?;
     let maybe_info: Result<ServerCapabilities, RestError> =
         rest_client.http("GET", "/user/capabilities");
     match maybe_info {
