@@ -89,7 +89,7 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
     let _me = DatabasePeer::create(
         conn,
         PeerContents {
-            name: SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?,
+            name: Some(SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?),
             ip: db_init_data.our_ip,
             cidr_id: server_cidr.id,
             public_key: db_init_data.public_key_base64,

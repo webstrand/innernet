@@ -160,12 +160,16 @@ pub fn update_hosts_file(
     let mut hosts_builder = HostsBuilder::new(format!("innernet {interface}"));
     for peer in peers {
         let peer = peer.as_ref();
-        match peer_hostname(interface, opts.host_suffix.as_deref(), &peer.contents.name) {
+        // A peer without a name has no hosts entry.
+        let Some(name) = &peer.contents.name else {
+            continue;
+        };
+        match peer_hostname(interface, opts.host_suffix.as_deref(), name) {
             Some(peer_hostname) => hosts_builder.add_hostname(peer.contents.ip, peer_hostname),
             None => log::warn!(
                 "omitting peer {} from the hosts file, since without a host suffix its name is \
                  not a single-label domain.",
-                peer.contents.name
+                name
             ),
         }
     }

@@ -266,7 +266,7 @@ mod tests {
         let old_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
 
         let change = PeerContents {
-            name: "new-peer-name".parse().unwrap(),
+            name: Some("new-peer-name".parse().unwrap()),
             ..old_peer.contents.clone()
         };
 
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
-        assert_eq!(&*new_peer.name, "new-peer-name");
+        assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
         Ok(())
     }
 
@@ -319,7 +319,10 @@ mod tests {
 
         let whole_body = hyper::body::aggregate(res).await?;
         let peers: Vec<Peer> = serde_json::from_reader(whole_body.reader())?;
-        let peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+        let peer_names = peers
+            .iter()
+            .map(|p| p.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
         // An admin peer should see all the peers.
         assert_eq!(
             &[
@@ -472,6 +475,26 @@ mod tests {
             test::user_peer_contents("user1", test::USER1_PEER_IP)?,
         )?;
         assert_eq!(new_peer.ip.to_string(), test::USER1_PEER_IP);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nameless_peers() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let db = server.db();
+        let conn = db.lock();
+
+        // Any number of peers can be without a name.
+        for id in [test::USER1_PEER_ID, test::USER2_PEER_ID] {
+            let mut peer = DatabasePeer::get(&conn, id)?;
+            let contents = PeerContents {
+                name: None,
+                ..peer.contents.clone()
+            };
+            peer.update(&conn, contents)?;
+            assert_eq!(DatabasePeer::get(&conn, id)?.name, None);
+        }
 
         Ok(())
     }

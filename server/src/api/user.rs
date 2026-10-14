@@ -199,7 +199,10 @@ mod tests {
 
         let whole_body = hyper::body::aggregate(res).await?;
         let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-        let mut peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+        let mut peer_names = peers
+            .iter()
+            .map(|p| p.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
         peer_names.sort_unstable();
         // Developers should see only peers in infra CIDR and developer CIDR.
         assert_eq!(
@@ -321,7 +324,10 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
             let whole_body = hyper::body::aggregate(res).await?;
             let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-            let mut peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+            let mut peer_names = peers
+                .iter()
+                .map(|p| p.name.as_deref().unwrap())
+                .collect::<Vec<_>>();
             peer_names.sort_unstable();
             // Developers should see only peers in infra CIDR and developer CIDR.
             assert_eq!(

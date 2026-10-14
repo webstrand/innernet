@@ -627,15 +627,8 @@ fn rename_peer(
     log::info!("Fetching peers");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
 
-    if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
+    if let Some((peer_request, id)) = prompts::rename_peer(&peers, &sub_opts)? {
         log::info!("Renaming peer...");
-
-        let id = peers
-            .iter()
-            .filter(|p| p.name == old_name)
-            .map(|p| p.id)
-            .next()
-            .ok_or_else(|| anyhow!("Peer not found."))?;
 
         rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), peer_request)?;
         log::info!("Peer renamed.");
@@ -707,7 +700,7 @@ fn delete_peer(
 
                 innernet forget-peer {interface} --name {name}
             ",
-            name = peer.name.to_string().yellow(),
+            name = peer.display_name().yellow(),
             ip = peer.ip,
         );
     } else {
@@ -730,7 +723,7 @@ fn forget_peer(
         data_store.forget_peer(&peer.public_key)?;
         println!(
             "Peer {} ({}) forgotten. The interface is updated on the next `innernet fetch {}`.",
-            peer.name.to_string().yellow(),
+            peer.display_name().yellow(),
             peer.ip,
             interface
         );
@@ -1176,7 +1169,7 @@ fn print_peer(
                 "◯".dimmed()
             },
             peer.ip.to_string().yellow().bold(),
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             if is_you { "you, " } else { "" },
             public_key.dimmed(),
         );
@@ -1185,7 +1178,7 @@ fn print_peer(
             pad,
             "{}: {} ({})",
             "peer".yellow().bold(),
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             public_key.yellow(),
         );
         println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);

@@ -76,7 +76,7 @@ impl DataStore {
                 log::warn!(
                     "{}: ignoring stored peer {} at {} ({:?}).",
                     path.display(),
-                    peer.name,
+                    peer.display_name(),
                     peer.ip,
                     status
                 );
@@ -178,7 +178,7 @@ impl DataStore {
                     "PINNING ERROR: New peer has same IP ({}) but different public key than \
                      previously seen peer {}.",
                     candidate.ip,
-                    existing_peer.name,
+                    existing_peer.display_name(),
                 )
             },
             PinStatus::ConflictingIp => {
@@ -187,7 +187,7 @@ impl DataStore {
                     "PINNING ERROR: New peer has same public key but different IP ({}) than \
                      previously seen peer {} ({}).",
                     candidate.ip,
-                    existing_peer.name,
+                    existing_peer.display_name(),
                     existing_peer.ip,
                 )
             },
@@ -361,7 +361,7 @@ mod tests {
         vec![Peer {
             id: 0,
             contents: PeerContents {
-                name: "blah".parse().unwrap(),
+                name: Some("blah".parse().unwrap()),
                 ip: "10.0.0.1".parse().unwrap(),
                 cidr_id: 1,
                 public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
@@ -463,7 +463,7 @@ mod tests {
 
         // Other changes to a pinned peer are applied in place, and new peers are added.
         let mut updated = BASE_PEERS.clone();
-        updated[0].contents.name = "renamed".parse().unwrap();
+        updated[0].contents.name = Some("renamed".parse().unwrap());
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
         new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();

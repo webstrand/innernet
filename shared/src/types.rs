@@ -580,7 +580,9 @@ pub struct HostsOpts {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerContents {
-    pub name: Hostname,
+    /// The name of the peer. A peer without a name, or whose name is invalid, has `None`.
+    #[serde(default, deserialize_with = "deserialize_peer_name")]
+    pub name: Option<Hostname>,
     pub ip: IpAddr,
     pub cidr_id: i64,
     #[serde(deserialize_with = "deserialize_public_key")]
@@ -593,6 +595,30 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+}
+
+impl PeerContents {
+    /// The name of the peer for display, or "[unnamed]" if it has none.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("[unnamed]")
+    }
+}
+
+/// Deserializes a peer name, so that an invalid name becomes `None` rather than failing the
+/// deserialization of the peer, and of every peer alongside it.
+fn deserialize_peer_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Hostname>, D::Error> {
+    let Some(name) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match Hostname::try_from(name) {
+        Ok(name) => Ok(Some(name)),
+        Err(e) => {
+            log::warn!("treating peer as unnamed: {e}");
+            Ok(None)
+        },
+    }
 }
 
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
@@ -634,7 +660,7 @@ impl DerefMut for Peer {
 
 impl Display for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.name, self.public_key)
+        write!(f, "{} ({})", self.display_name(), self.public_key)
     }
 }
 
@@ -1009,7 +1035,7 @@ mod tests {
         let peer = Peer {
             id: 1,
             contents: PeerContents {
-                name: "peer1".parse().unwrap(),
+                name: Some("peer1".parse().unwrap()),
                 ip,
                 cidr_id: 1,
                 public_key: PUBKEY.to_owned(),
@@ -1044,7 +1070,7 @@ mod tests {
         let peer = Peer {
             id: 1,
             contents: PeerContents {
-                name: "peer1".parse().unwrap(),
+                name: Some("peer1".parse().unwrap()),
                 ip,
                 cidr_id: 1,
                 public_key: PUBKEY.to_owned(),
@@ -1079,7 +1105,7 @@ mod tests {
         let peer = Peer {
             id: 1,
             contents: PeerContents {
-                name: "peer1".parse().unwrap(),
+                name: Some("peer1".parse().unwrap()),
                 ip,
                 cidr_id: 1,
                 public_key: PUBKEY.to_owned(),
@@ -1124,7 +1150,7 @@ mod tests {
         let peer = Peer {
             id: 1,
             contents: PeerContents {
-                name: "peer1".parse().unwrap(),
+                name: Some("peer1".parse().unwrap()),
                 ip: "10.0.0.1".parse().unwrap(),
                 cidr_id: 1,
                 public_key: PUBKEY.to_owned(),
@@ -1179,5 +1205,24 @@ mod tests {
         assert_eq!(deserialize(PUBKEY.trim_end_matches('=')).unwrap(), PUBKEY);
         assert!(deserialize("abc").is_err());
         assert!(deserialize("").is_err());
+    }
+
+    #[test]
+    fn test_deserialize_peer_name() {
+        #[derive(Deserialize)]
+        struct Named {
+            #[serde(default, deserialize_with = "deserialize_peer_name")]
+            name: Option<Hostname>,
+        }
+        let deserialize = |toml| toml::from_str::<Named>(toml).unwrap().name;
+
+        assert_eq!(
+            deserialize(r#"name = "peer-1""#),
+            Some("peer-1".parse().unwrap())
+        );
+        // A missing or invalid name makes the peer unnamed, rather than failing.
+        assert_eq!(deserialize(""), None);
+        assert_eq!(deserialize(r#"name = "Peer""#), None);
+        assert_eq!(deserialize(r#"name = "peer\n10.0.0.1 example.com""#), None);
     }
 }

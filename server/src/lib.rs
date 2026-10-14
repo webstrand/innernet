@@ -242,11 +242,8 @@ pub fn rename_peer(
         .map(|dp| dp.inner)
         .collect::<Vec<_>>();
 
-    if let Some((peer_request, old_name)) = innernet_shared::prompts::rename_peer(&peers, &opts)? {
-        let mut db_peer = DatabasePeer::list(&conn)?
-            .into_iter()
-            .find(|p| p.name == old_name)
-            .ok_or_else(|| anyhow!("Peer not found."))?;
+    if let Some((peer_request, id)) = innernet_shared::prompts::rename_peer(&peers, &opts)? {
+        let mut db_peer = DatabasePeer::get(&conn, id)?;
         db_peer.update(&conn, peer_request)?;
     } else {
         println!("exited without creating peer.");
@@ -336,7 +333,7 @@ pub fn delete_peer(
 
                 innernet forget-peer {interface} --name {name}
             ",
-            name = peer.name.to_string().yellow(),
+            name = peer.display_name().yellow(),
             ip = peer.ip,
         );
     } else {

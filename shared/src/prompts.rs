@@ -1,8 +1,8 @@
 use crate::{
     interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
     AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts,
-    EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt, ListenPortOpts,
-    OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
+    EnableDisablePeerOpts, Endpoint, Error, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts,
+    Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -277,7 +277,7 @@ pub fn print_invitation_info(peer: &Peer, target_file_name: &str) {
          Peer invitation file written to {}\n\
          Please send it to them securely (eg. via magic-wormhole) \
          to bootstrap them onto the network.",
-        peer.name.bold(),
+        peer.display_name().bold(),
         target_file_name.bold()
     );
 }
@@ -380,19 +380,19 @@ pub fn gather_new_peer_info(
     }
 }
 
-/// Bring up a prompt to rename an existing peer. Returns the peer request.
+/// Bring up a prompt to rename an existing peer. Returns the peer request and the ID of the peer.
 pub fn rename_peer(
     peers: &[Peer],
     args: &RenamePeerOpts,
-) -> Result<Option<(PeerContents, Hostname)>, Error> {
+) -> Result<Option<(PeerContents, i64)>, Error> {
     let eligible_peers = peers
         .iter()
-        .filter(|p| &*p.name != "innernet-server")
+        .filter(|p| p.name.as_deref() != Some("innernet-server"))
         .collect::<Vec<_>>();
     let old_peer = if let Some(name) = &args.name {
         eligible_peers
             .into_iter()
-            .find(|p| &p.name == name)
+            .find(|p| p.name.as_ref() == Some(name))
             .ok_or_else(|| anyhow!("Peer '{}' does not exist", name))?
             .clone()
     } else {
@@ -400,20 +400,21 @@ pub fn rename_peer(
             "Peer to rename",
             &eligible_peers
                 .iter()
-                .map(|ep| ep.name.clone())
+                .map(|ep| format!("{} ({})", ep.display_name(), ep.ip))
                 .collect::<Vec<_>>(),
         )?;
         eligible_peers[peer_index].clone()
     };
-    let old_name = old_peer.name.clone();
+    let old_name = old_peer.display_name().to_string();
     let new_name = if let Some(name) = &args.new_name {
         name.clone()
     } else {
         input("New Name", Prefill::None)?
     };
 
+    let id = old_peer.id;
     let mut new_peer = old_peer;
-    new_peer.contents.name = new_name.clone();
+    new_peer.contents.name = Some(new_name.clone());
 
     Ok(
         if args.yes
@@ -423,7 +424,7 @@ pub fn rename_peer(
                 new_name.yellow()
             ))?
         {
-            Some((new_peer.contents, old_name))
+            Some((new_peer.contents, id))
         } else {
             None
         },
@@ -445,12 +446,12 @@ pub fn enable_or_disable_peer(
     let peer = if let Some(name) = &args.name {
         enabled_peers
             .into_iter()
-            .find(|p| &p.name == name)
+            .find(|p| p.name.as_ref() == Some(name))
             .ok_or_else(|| anyhow!("Peer '{}' does not exist", name))?
     } else {
         let peer_selection: Vec<_> = enabled_peers
             .iter()
-            .map(|peer| format!("{} ({})", peer.name, peer.ip))
+            .map(|peer| format!("{} ({})", peer.display_name(), peer.ip))
             .collect();
         let (index, _) = select(
             &format!("Peer to {}able", if enable { "en" } else { "dis" }),
@@ -464,7 +465,7 @@ pub fn enable_or_disable_peer(
             || confirm(&format!(
                 "{}able peer {}?",
                 if enable { "En" } else { "Dis" },
-                peer.name.yellow()
+                peer.display_name().yellow()
             ))?
         {
             Some(peer.clone())
@@ -483,7 +484,7 @@ pub fn delete_or_forget_peer<'a>(
     let peer = if let Some(name) = &args.name {
         peers
             .iter()
-            .find(|p| &p.name == name)
+            .find(|p| p.name.as_ref() == Some(name))
             .ok_or_else(|| anyhow!("No eligible peer named '{}'", name))?
     } else {
         if peers.is_empty() {
@@ -493,7 +494,7 @@ pub fn delete_or_forget_peer<'a>(
             .iter()
             .map(|peer| {
                 let disabled = if peer.is_disabled { " [disabled]" } else { "" };
-                format!("{} ({}){}", peer.name, peer.ip, disabled)
+                format!("{} ({}){}", peer.display_name(), peer.ip, disabled)
             })
             .collect();
         let (index, _) = select(&format!("Peer to {action}"), &peer_selection)?;
@@ -505,7 +506,7 @@ pub fn delete_or_forget_peer<'a>(
             || confirm(&format!(
                 "Permanently {} peer {} ({})?",
                 action,
-                peer.name.yellow(),
+                peer.display_name().yellow(),
                 peer.ip
             ))?
         {
@@ -616,15 +617,18 @@ pub fn override_peer_endpoint_prompt(
 ) -> Result<Option<(Peer, Option<Endpoint>)>, Error> {
     let eligible_peers = peers
         .iter()
-        .filter(|p| &*p.name != "innernet-server")
+        .filter(|p| p.name.as_deref() != Some("innernet-server"))
         // If we're unsetting, filter eligible_peers to just be peers that have
         // an override already set.
         .filter(|p| !args.unset || peer_endpoint_overrides.contains_key(&p.ip))
         .collect::<Vec<_>>();
 
     let peer = if let Some(name) = &args.name {
-        let Some(peer) = eligible_peers.into_iter().find(|p| &p.name == name) else {
-            return if args.unset && peers.iter().find(|p| &p.name == name).is_some() {
+        let Some(peer) = eligible_peers
+            .into_iter()
+            .find(|p| p.name.as_ref() == Some(name))
+        else {
+            return if args.unset && peers.iter().any(|p| p.name.as_ref() == Some(name)) {
                 log::info!("Peer '{name}' does not have an override set");
                 Ok(None)
             } else {
@@ -647,7 +651,7 @@ pub fn override_peer_endpoint_prompt(
             message,
             &eligible_peers
                 .iter()
-                .map(|ep| ep.name.clone())
+                .map(|ep| format!("{} ({})", ep.display_name(), ep.ip))
                 .collect::<Vec<_>>(),
         )?;
         eligible_peers[peer_index].clone()
@@ -664,14 +668,14 @@ pub fn override_peer_endpoint_prompt(
     let confirm_msg = if let Some(endpoint) = &endpoint {
         &format!(
             "Override endpoint for peer {} ({}) to {}?",
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             peer.ip,
             endpoint,
         )
     } else {
         &format!(
             "Unset endpoint override for peer {} ({})?",
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             peer.ip,
         )
     };

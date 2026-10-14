@@ -227,7 +227,7 @@ pub fn fetch(
             log::warn!(
                 "{}: dropping peer {}: {}",
                 interface.as_str_lossy().yellow(),
-                peer.name,
+                peer.display_name(),
                 e
             );
         }
@@ -333,15 +333,15 @@ fn print_peer_diff(store: &DataStore, diff: &PeerDiff) {
     };
 
     // Grab the peer name from either the new data, or the historical data (if the peer is removed).
-    let peer_hostname = match diff.new {
-        Some(peer) => Some(peer.name.clone()),
+    let peer_name = match diff.new {
+        Some(peer) => Some(peer.display_name()),
         None => store
             .peers()
             .iter()
             .find(|p| p.public_key == public_key)
-            .map(|p| p.name.clone()),
-    };
-    let peer_name = peer_hostname.as_deref().unwrap_or("[unknown]");
+            .map(|p| p.display_name()),
+    }
+    .unwrap_or("[unknown]");
 
     if change_action == ChangeAction::Modified
         && diff

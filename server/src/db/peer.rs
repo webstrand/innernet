@@ -1,6 +1,6 @@
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_shared::{Hostname, IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use innernet_shared::{IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
 use rusqlite::{params, types::Type, Connection};
 use std::{
     net::IpAddr,
@@ -10,7 +10,7 @@ use std::{
 
 pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       id              INTEGER PRIMARY KEY,
-      name            TEXT NOT NULL UNIQUE,         /* The canonical name for the peer in canonical hostname(7) format. */
+      name            TEXT UNIQUE,                  /* The canonical name for the peer, or NULL if it has none.         */
       ip              TEXT NOT NULL UNIQUE,         /* The WireGuard-internal IP address assigned to the peer.          */
       public_key      TEXT NOT NULL UNIQUE,         /* The WireGuard public key of the peer.                            */
       endpoint        TEXT,                         /* The optional external endpoint ([ip]:[port]) of the peer.        */
@@ -82,11 +82,6 @@ impl DatabasePeer {
         } = &contents;
         log::info!("creating peer {:?}", contents);
 
-        if !Self::is_valid_name(name) {
-            log::warn!("peer name is invalid, must conform to hostname(7) requirements.");
-            return Err(ServerError::InvalidQuery);
-        }
-
         let cidr = DatabaseCidr::get(conn, *cidr_id)?;
         if !cidr.cidr.contains(ip) {
             log::warn!("tried to add peer with IP outside of parent CIDR range.");
@@ -114,7 +109,7 @@ impl DatabasePeer {
                 COLUMNS[1..].join(", ")
             ),
             params![
-                &**name,
+                name.as_deref(),
                 ip.to_string(),
                 cidr_id,
                 &public_key,
@@ -130,17 +125,8 @@ impl DatabasePeer {
         Ok(Peer { id, contents }.into())
     }
 
-    fn is_valid_name(name: &str) -> bool {
-        Hostname::is_valid(name)
-    }
-
     /// Update self with new contents, validating them and updating the backend in the process.
     pub fn update(&mut self, conn: &Connection, contents: PeerContents) -> Result<(), ServerError> {
-        if !Self::is_valid_name(&contents.name) {
-            log::warn!("peer name is invalid, must conform to hostname(7) requirements.");
-            return Err(ServerError::InvalidQuery);
-        }
-
         // We will only allow updates of certain fields at this point, disregarding any requests
         // for changes of IP address, public key, or parent CIDR, for security reasons.
         //
@@ -166,7 +152,7 @@ impl DatabasePeer {
             WHERE id = ?1",
             params![
                 self.id,
-                &*new_contents.name,
+                new_contents.name.as_deref(),
                 new_contents
                     .endpoint
                     .as_ref()
@@ -235,8 +221,9 @@ impl DatabasePeer {
     fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
         let id = row.get(0)?;
         let name = row
-            .get::<_, String>(1)?
-            .parse()
+            .get::<_, Option<String>>(1)?
+            .map(|name| name.parse())
+            .transpose()
             .map_err(|_| rusqlite::Error::InvalidColumnType(1, "hostname".into(), Type::Text))?;
         let ip: IpAddr = row
             .get::<_, String>(2)?
