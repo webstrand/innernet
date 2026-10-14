@@ -1,12 +1,13 @@
 use anyhow::{bail, Error};
 use innernet_shared::{
-    chmod, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname, IoErrorContext,
-    Peer, PeerContents, State, WrappedIoError,
+    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname, IoErrorContext, Peer,
+    PeerContents, State, WrappedIoError,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use wireguard_control::{InterfaceName, Key};
@@ -30,20 +31,16 @@ enum Contents {
 impl DataStore {
     fn open_with_path<P: AsRef<Path>>(path: P, create: bool) -> Result<Self, WrappedIoError> {
         let path = path.as_ref();
-        let is_existing_file = path.exists();
 
+        // The mode applies only if the file is created, in the same call that creates it.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
+            .mode(0o600)
             .open(path)
             .with_path(path)?;
-
-        if is_existing_file {
-            innernet_shared::warn_on_dangerous_mode(path).with_path(path)?;
-        } else {
-            chmod(&file, 0o600).with_path(path)?;
-        }
+        innernet_shared::warn_on_dangerous_mode(path).with_path(path)?;
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
@@ -340,6 +337,17 @@ mod tests {
         updated.push(new_peer);
         store.update_peers(&updated).unwrap();
         assert_eq!(store.peers(), &updated[..]);
+    }
+
+    #[test]
+    fn test_created_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+        DataStore::open_with_path(&path, true).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0);
     }
 
     #[test]
