@@ -212,6 +212,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_peer_to_cidr_with_children() -> Result<(), Error> {
+        let server = test::Server::new()?;
+
+        let old_peers = DatabasePeer::list(&server.db().lock())?;
+
+        // The admin adds a peer to the root CIDR, at an IP that no child CIDR covers.
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::5:0:0:1"
+        } else {
+            "10.80.2.1"
+        };
+        let peer = test::peer_contents("developer3", ip, test::ROOT_CIDR_ID, false)?;
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // The number of peer entries in the database should not change.
+        let new_peers = DatabasePeer::list(&server.db().lock())?;
+        assert_eq!(old_peers.len(), new_peers.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_add_peer_from_non_admin() -> Result<(), Error> {
         let server = test::Server::new()?;
 
