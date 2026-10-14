@@ -133,6 +133,40 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet, src: IpAddr) -> Result<
     }
 }
 
+/// The addresses on the interface.
+pub fn get_addrs(interface: &InterfaceName) -> Result<Vec<IpAddr>, io::Error> {
+    let index = if_nametoindex(interface)?;
+    let addr_responses = netlink_request_rtnl(
+        RouteNetlinkMessage::GetAddress(AddressMessage::default()),
+        Some(NLM_F_DUMP | NLM_F_REQUEST),
+    )?;
+    let addrs = addr_responses
+        .into_iter()
+        .filter_map(|response| match response {
+            NetlinkMessage {
+                payload: NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr)),
+                ..
+            } if addr.header.index == index => Some(addr.attributes),
+            _ => None,
+        })
+        .flat_map(|nlas| {
+            // An IPv4 address' own address is its local one, which only differs on
+            // point-to-point links.
+            let local = nlas.iter().find_map(|nla| match nla {
+                address::AddressAttribute::Local(addr) => Some(*addr),
+                _ => None,
+            });
+            local.or_else(|| {
+                nlas.iter().find_map(|nla| match nla {
+                    address::AddressAttribute::Address(addr) => Some(*addr),
+                    _ => None,
+                })
+            })
+        })
+        .collect();
+    Ok(addrs)
+}
+
 fn get_links() -> Result<Vec<String>, io::Error> {
     let link_responses = netlink_request_rtnl(
         RouteNetlinkMessage::GetLink(LinkMessage::default()),

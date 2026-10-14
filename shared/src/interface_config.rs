@@ -75,6 +75,14 @@ pub struct InterfaceInfo {
     /// Kept locally so that the peer never signs an endpoint it learned from the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_endpoint: Option<Endpoint>,
+
+    /// More addresses of this peer, each within one of its delegations, to put on the interface
+    /// besides `address`, which remains its default source address. Supported on Linux only.
+    /// innernet adds those missing when bringing the interface up and on each fetch, but never
+    /// removes any: one removed from here, or withdrawn, stays on the interface until it is
+    /// brought down or the address is removed by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_addresses: Vec<IpAddr>,
 }
 
 impl InterfaceInfo {
@@ -85,6 +93,7 @@ impl InterfaceInfo {
             address,
             listen_port: None,
             external_endpoint: None,
+            extra_addresses: vec![],
         }
     }
 }
@@ -346,6 +355,28 @@ mod tests {
         assert!(
             error.to_string().contains("not a peer's public key"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn test_extra_addresses() {
+        let config = config("");
+        assert!(config.interface.extra_addresses.is_empty());
+        assert!(!config.as_toml().contains("extra-addresses"));
+
+        let config: InterfaceConfig = toml::from_str(&config.as_toml().replace(
+            "[interface]\n",
+            "[interface]\nextra-addresses = [\"10.0.0.40\", \"fd00::40\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            config.interface.extra_addresses,
+            ["10.0.0.40", "fd00::40"].map(|a| a.parse::<IpAddr>().unwrap())
+        );
+        let reloaded: InterfaceConfig = toml::from_str(&config.as_toml()).unwrap();
+        assert_eq!(
+            reloaded.interface.extra_addresses,
+            config.interface.extra_addresses
         );
     }
 }

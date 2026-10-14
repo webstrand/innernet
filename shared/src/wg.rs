@@ -112,6 +112,9 @@ pub use super::netlink::set_addr;
 #[cfg(target_os = "linux")]
 pub use super::netlink::set_up;
 
+#[cfg(target_os = "linux")]
+pub use super::netlink::get_addrs;
+
 pub fn up(
     interface: &InterfaceName,
     private_key: &str,

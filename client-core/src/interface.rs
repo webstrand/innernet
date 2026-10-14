@@ -15,9 +15,11 @@ use innernet_shared::{
     wg::{self, DeviceExt as _},
     Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
+#[cfg(target_os = "linux")]
+use ipnet::IpNet;
 use std::{
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -311,6 +313,10 @@ pub fn fetch(
     }
     let interface_updated_time = Instant::now();
 
+    let own_peer = peers
+        .iter()
+        .find(|p| p.public_key == own_public_key.to_base64());
+    add_extra_addresses(interface, &config.interface.extra_addresses, own_peer);
     let listen_port = device.listen_port.unwrap_or(51820);
     if state.is_some() {
         // Fails before anything is sent if the private key doesn't match the interface.
@@ -473,6 +479,65 @@ fn apply_announcements(
             peer.contents.endpoint = endpoint;
             peer.contents.candidates = candidates;
             peer.contents.announcement = Some(selected.clone());
+        }
+    }
+}
+
+/// The extra addresses that lie within one of the delegations of `own_peer`, this peer as
+/// fetched, warning about the others.
+fn valid_extra_addresses(extra_addresses: &[IpAddr], own_peer: Option<&Peer>) -> Vec<IpAddr> {
+    let delegations = own_peer.map_or(&[][..], |peer| &peer.delegations[..]);
+    extra_addresses
+        .iter()
+        .copied()
+        .filter(|address| {
+            let is_delegated = delegations.iter().any(|d| d.contains(address));
+            if !is_delegated {
+                log::warn!(
+                    "extra address {address} is not within any of this peer's delegations; not \
+                     adding it to the interface."
+                );
+            }
+            is_delegated
+        })
+        .collect()
+}
+
+/// Adds those of the extra addresses that are delegated to this peer and missing from the
+/// interface. Addresses are never removed, since some may not have been added by innernet.
+fn add_extra_addresses(
+    interface: &InterfaceName,
+    extra_addresses: &[IpAddr],
+    own_peer: Option<&Peer>,
+) {
+    if extra_addresses.is_empty() {
+        return;
+    }
+    let extra_addresses = valid_extra_addresses(extra_addresses, own_peer);
+    #[cfg(not(target_os = "linux"))]
+    if !extra_addresses.is_empty() {
+        log::warn!(
+            "extra addresses are only supported on Linux; not adding them to {}.",
+            interface
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let present = match wg::get_addrs(interface) {
+            Ok(present) => present,
+            Err(e) => {
+                log::warn!("failed to list the interface's addresses: {e}; not adding extra ones.");
+                return;
+            },
+        };
+        for address in extra_addresses {
+            if present.contains(&address) {
+                continue;
+            }
+            match wg::set_addr(interface, IpNet::from(address)) {
+                Ok(()) => log::info!("added extra address {address} to the interface."),
+                Err(e) => log::warn!("failed to add extra address {address}: {e}."),
+            }
         }
     }
 }
@@ -729,5 +794,36 @@ mod tests {
         let peer = f.fetch(Some(forged));
         assert_eq!(peer.announcement, None);
         assert_eq!(peer.endpoint, f.peer.endpoint);
+    }
+
+    fn peer_with_delegations(delegations: &[&str]) -> Peer {
+        let mut peer = Fixture::new().peer;
+        peer.contents.delegations = delegations.iter().map(|d| d.parse().unwrap()).collect();
+        peer
+    }
+
+    fn addrs(addrs: &[&str]) -> Vec<IpAddr> {
+        addrs.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn test_valid_extra_addresses() {
+        let peer = peer_with_delegations(&["10.0.0.32/28", "10.0.0.7/32", "fd00::1:0/112"]);
+        let extra = addrs(&[
+            "10.0.0.33",
+            "10.0.0.47",
+            "10.0.0.48",
+            "10.0.0.7",
+            "10.0.0.2",
+            "fd00::1:5",
+            "fd00::2:5",
+        ]);
+        assert_eq!(
+            valid_extra_addresses(&extra, Some(&peer)),
+            addrs(&["10.0.0.33", "10.0.0.47", "10.0.0.7", "fd00::1:5"])
+        );
+        assert!(valid_extra_addresses(&extra, None).is_empty());
+        let peer = peer_with_delegations(&[]);
+        assert!(valid_extra_addresses(&extra, Some(&peer)).is_empty());
     }
 }
