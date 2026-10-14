@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use wireguard_control::{InterfaceName, KeyPair};
@@ -98,6 +99,7 @@ impl InterfaceConfig {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(mode)
             .open(path)
             .with_path(path)?;
 
@@ -122,16 +124,17 @@ impl InterfaceConfig {
         toml::to_string(self).unwrap()
     }
 
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Ok(toml::from_str(
-            &std::fs::read_to_string(&path).with_path(path)?,
-        )?)
+    pub fn from_file(file: &mut File) -> Result<Self, Error> {
+        let mut toml = String::new();
+        file.read_to_string(&mut toml)?;
+        Ok(toml::from_str(&toml)?)
     }
 
     pub fn from_interface(config_dir: &Path, interface: &InterfaceName) -> Result<Self, Error> {
         let path = Self::build_config_file_path(config_dir, interface)?;
-        crate::warn_on_dangerous_mode(&path).with_path(&path)?;
-        Self::from_file(path)
+        let mut file = File::open(&path).with_path(&path)?;
+        crate::warn_on_dangerous_mode(&file, &path).with_path(&path)?;
+        Self::from_file(&mut file)
     }
 
     pub fn get_path(config_dir: &Path, interface: &InterfaceName) -> PathBuf {
@@ -187,6 +190,7 @@ impl PeerInvitation {
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(path)?;
 
         writedoc!(

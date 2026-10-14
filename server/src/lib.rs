@@ -19,10 +19,11 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::TryInto,
     env,
-    fs::File,
+    fs::{File, OpenOptions},
     io::prelude::*,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::Deref,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -93,7 +94,13 @@ pub struct ConfigFile {
 
 impl ConfigFile {
     pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
-        let mut invitation_file = File::create(&path).with_path(&path)?;
+        let mut invitation_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_path(&path)?;
         innernet_shared::chmod(&invitation_file, 0o600)?;
         invitation_file
             .write_all(toml::to_string(self).unwrap().as_bytes())
@@ -103,7 +110,7 @@ impl ConfigFile {
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let path = path.as_ref();
-        let file = File::open(path).with_path(path)?;
+        let mut file = File::open(path).with_path(path)?;
         if innernet_shared::chmod(&file, 0o600)? {
             println!(
                 "{} updated permissions for {} to 0600.",
@@ -111,9 +118,9 @@ impl ConfigFile {
                 path.display()
             );
         }
-        Ok(toml::from_str(
-            &std::fs::read_to_string(path).with_path(path)?,
-        )?)
+        let mut toml = String::new();
+        file.read_to_string(&mut toml).with_path(path)?;
+        Ok(toml::from_str(&toml)?)
     }
 }
 

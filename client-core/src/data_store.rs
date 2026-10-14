@@ -40,7 +40,7 @@ impl DataStore {
             .mode(0o600)
             .open(path)
             .with_path(path)?;
-        innernet_shared::warn_on_dangerous_mode(path).with_path(path)?;
+        innernet_shared::warn_on_dangerous_mode(&file, path).with_path(path)?;
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
