@@ -1,8 +1,6 @@
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_shared::{IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
-use once_cell::sync::Lazy;
-use regex::Regex;
+use innernet_shared::{Hostname, IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
 use rusqlite::{params, types::Type, Connection};
 use std::{
     net::IpAddr,
@@ -41,10 +39,6 @@ pub static COLUMNS: &[&str] = &[
     "invite_expires",
     "candidates",
 ];
-
-/// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
-/// Note that the full length also must be maximum 63 characters, which this regex does not check.
-static PEER_NAME_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([a-z0-9]-?)*[a-z0-9]$").unwrap());
 
 #[derive(Debug)]
 pub struct DatabasePeer {
@@ -137,7 +131,7 @@ impl DatabasePeer {
     }
 
     fn is_valid_name(name: &str) -> bool {
-        name.len() < 64 && PEER_NAME_REGEX.is_match(name)
+        Hostname::is_valid(name)
     }
 
     /// Update self with new contents, validating them and updating the backend in the process.
