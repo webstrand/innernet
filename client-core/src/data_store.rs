@@ -1,7 +1,7 @@
 use anyhow::{bail, Error};
 use innernet_shared::{
-    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, IoErrorContext, Peer, State,
-    WrappedIoError,
+    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, IoErrorContext, Peer, PeerContents,
+    State, WrappedIoError,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
-use wireguard_control::InterfaceName;
+use wireguard_control::{InterfaceName, InvalidKey, Key};
 
 /// File-backed storage of [`Peer`]s and [`Cidr`]s.
 ///
@@ -105,11 +105,32 @@ impl DataStore {
         create: bool,
     ) -> Result<Self, WrappedIoError> {
         ensure_dirs_exist(&[data_dir])?;
-        Self::open_with_path(
-            Self::get_path(data_dir, interface),
-            config.interface.address,
-            create,
-        )
+        let path = Self::get_path(data_dir, interface);
+        let introduced = introduced_peers(config)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid key in config"))
+            .with_path(&path)?;
+        let mut store = Self::open_with_path(&path, config.interface.address, create)?;
+        store.introduce(introduced);
+        Ok(store)
+    }
+
+    /// Adds each peer of `introduced` that the data store does not hold yet, so that its
+    /// (IP, PublicKey) tuple is pinned before the first fetch. A peer that the data store already
+    /// holds keeps its record, and a peer that conflicts with a pin is not added.
+    fn introduce(&mut self, introduced: Vec<Peer>) {
+        for peer in introduced {
+            match self.peers.check(&peer) {
+                PinStatus::New => {
+                    self.peers.insert(peer);
+                },
+                PinStatus::Unchanged => {},
+                status @ (PinStatus::ConflictingKey | PinStatus::ConflictingIp) => log::warn!(
+                    "the data store conflicts with the interface config at {} ({:?}).",
+                    peer.ip,
+                    status
+                ),
+            }
+        }
     }
 
     /// Open the data store residing at "`data_dir`/`interface`.json", whose peers must lie within
@@ -259,6 +280,49 @@ impl DataStore {
             .write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
         Ok(())
     }
+}
+
+/// The ID of the record of the coordinator from the interface config. Server IDs are positive, so
+/// the ID never collides with the ID of a fetched peer.
+const INTRODUCED_COORDINATOR_ID: i64 = -1;
+/// The ID of the record of this client from the interface config.
+const INTRODUCED_SELF_ID: i64 = -2;
+
+/// The coordinator and this client, as the interface config that the invitation produced
+/// introduces them. Each record is without a name and a CIDR, and the first fetch replaces it with
+/// the record of the server.
+fn introduced_peers(config: &InterfaceConfig) -> Result<Vec<Peer>, InvalidKey> {
+    let introduced = |id, ip, public_key, endpoint| Peer {
+        id,
+        contents: PeerContents {
+            name: None,
+            ip,
+            cidr_id: -1,
+            public_key,
+            endpoint,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        },
+    };
+    let private_key = Key::from_base64(&config.interface.private_key)?;
+    Ok(vec![
+        introduced(
+            INTRODUCED_COORDINATOR_ID,
+            config.server.internal_endpoint.ip(),
+            Key::from_base64(&config.server.public_key)?.to_base64(),
+            Some(config.server.external_endpoint.clone()),
+        ),
+        introduced(
+            INTRODUCED_SELF_ID,
+            config.interface.address.addr(),
+            private_key.get_public().to_base64(),
+            None,
+        ),
+    ])
 }
 
 /// How a peer relates to the (IP, PublicKey) pins of the peers of a [`PeersIndex`].
@@ -612,5 +676,32 @@ mod tests {
         // Should work, since peer is unmodified.
         assert!(store.update_peers(&[]).is_empty());
         assert_eq!(store.peers(), &disabled(&BASE_PEERS)[..]);
+    }
+
+    #[test]
+    fn test_introduce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+        let mut introduced = BASE_PEERS[0].clone();
+        introduced.id = INTRODUCED_COORDINATOR_ID;
+        introduced.contents.name = None;
+
+        // A fresh data store pins the introduced peer before the first fetch.
+        let mut store = DataStore::open_with_path(&path, *NETWORK, true).unwrap();
+        store.introduce(vec![introduced.clone()]);
+        assert_eq!(store.peers(), &[introduced.clone()]);
+
+        let mut conflicting = BASE_PEERS.clone();
+        conflicting[0].contents.public_key =
+            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        assert_eq!(store.update_peers(&conflicting).len(), 1);
+
+        // The fetched record of the introduced peer replaces the introduced record, which a later
+        // introduction leaves in place.
+        let mut store = DataStore::open_with_path(&path, *NETWORK, true).unwrap();
+        store.introduce(vec![introduced.clone()]);
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        store.introduce(vec![introduced]);
+        assert_eq!(store.peers(), &*BASE_PEERS);
     }
 }
