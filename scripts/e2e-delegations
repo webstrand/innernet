@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# End-to-end test of delegations, run unprivileged in network namespaces.
+#
+# Usage: scripts/e2e-delegations [--keep]
+#
+# Topology, inside a private user, mount and network namespace:
+#
+#   198.18.0.0/24 "internet" (bridge in the outer namespace)
+#     srv     198.18.0.1   innernet-server
+#     a       198.18.0.2   peer
+#     b       198.18.0.3   peer delegated 10.66.1.32/28
+#       ctr   10.66.1.33   container behind b, on an L3 netkit pair
+#     c       198.18.0.4   peer the delegation is reassigned to
+#
+# Requires: unshare, ip (with netkit), wg, curl, sqlite3, python3 (3.11+), and the kernel
+# WireGuard and netkit modules.
+set -euo pipefail
+
+if [ -z "${E2E_INSIDE:-}" ]; then
+    top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    cargo build --offline --bins --manifest-path "$top/Cargo.toml" >&2
+    exec unshare --user --map-root-user --mount --net \
+        env E2E_INSIDE=1 E2E_BIN="$top/target/debug" "$0" "$@"
+fi
+
+keep=0
+[ "${1:-}" = --keep ] && keep=1
+
+mount -t tmpfs tmpfs /run
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/innernet-e2e.XXXXXX")
+pids=()
+cleanup() {
+    local status=$?
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    if [ "$status" -ne 0 ]; then
+        echo "--- server log" >&2
+        tail -n 30 "$work/srv.log" >&2 || true
+    fi
+    if [ "$keep" -eq 1 ] || [ "$status" -ne 0 ]; then
+        echo "work directory kept: $work" >&2
+    else
+        rm -rf "$work"
+    fi
+}
+trap cleanup EXIT
+
+step() { printf '\n=== %s\n' "$*"; }
+pass() { printf 'ok: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+ns() { local name=$1; shift; ip netns exec "$name" "$@"; }
+
+server() { ns srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" "$@"; }
+client() {
+    local peer=$1; shift
+    ns "$peer" "$E2E_BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" "$@"
+}
+# Fetches as a peer, keeping its output in $work/<peer>.fetch.log for later assertions.
+fetch() {
+    local peer=$1; shift
+    client "$peer" fetch e2e --no-write-hosts "$@" >"$work/$peer.fetch.log" 2>&1 ||
+        { cat "$work/$peer.fetch.log" >&2; fail "fetch as $peer"; }
+}
+
+db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
+
+expect_log() {
+    grep -qF -- "$2" "$work/$1.fetch.log" ||
+        { cat "$work/$1.fetch.log" >&2; fail "$1's fetch didn't log '$2'"; }
+    pass "$1's fetch logged '$2'"
+}
+
+# Prints the allowed IPs of the peer with a key on a namespace's interface, sorted.
+allowed_ips() { # <namespace> <public key>
+    ns "$1" wg show e2e allowed-ips | awk -v key="$2" '$1 == key { $1 = ""; print }' |
+        tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+}
+
+expect_routed() { # <namespace> <peer name> <public key> <prefix>
+    case " $(allowed_ips "$1" "$3")" in *" $4 "*) ;;
+        *) fail "$1 doesn't route $4 to $2: $(allowed_ips "$1" "$3")" ;; esac
+    pass "$1 routes $4 to $2"
+}
+
+expect_not_routed() { # <namespace> <peer name> <public key> <prefix>
+    case " $(allowed_ips "$1" "$3")" in *" $4 "*)
+        fail "$1 routes $4 to $2: $(allowed_ips "$1" "$3")" ;; esac
+    pass "$1 doesn't route $4 to $2"
+}
+
+# Prints a peer's withdrawn delegations from its data store, as "<public key> <prefix>" lines.
+withdrawn() {
+    python3 -I - "$work/$1/data/e2e.json" <<'EOF'
+import json, sys
+for w in json.load(open(sys.argv[1])).get("withdrawn_delegations", []):
+    print(w["public_key"], w["prefix"])
+EOF
+}
+
+# Prints the frame errors of a namespace's interface, which WireGuard counts for packets from
+# outside the sending peer's allowed IPs.
+frame_errors() {
+    ns "$1" ip -j -s -s link show e2e |
+        python3 -I -c 'import json, sys; print(json.load(sys.stdin)[0]["stats64"]["rx"]["frame_errors"])'
+}
+
+# Prints a field of an invitation.
+invitation() { # <invitation> <table> <key>
+    python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$@"
+}
+
+# Requests the API in plain HTTP from a namespace, printing the status.
+expect_plain() { # <namespace> <method> <path> <expected status>
+    local status
+    status=$(ns "$1" curl -sS -o /dev/null -w '%{http_code}' -X "$2" \
+        -H "X-Innernet-Server-Key: $server_key" "http://$api$3") || true
+    [ "$status" = "$4" ] || fail "plain $2 $3 from $1 got '$status', expected $4"
+    pass "plain $2 $3 from $1 got $4"
+}
+
+step "network"
+ip link set lo up
+ip link add br0 type bridge
+ip link set br0 up
+address=1
+for name in srv a b c; do
+    ip netns add "$name"
+    ns "$name" ip link set lo up
+    ip link add "v-$name" type veth peer name eth0 netns "$name"
+    ip link set "v-$name" master br0 up
+    ns "$name" ip addr add "198.18.0.$address/24" dev eth0
+    ns "$name" ip link set eth0 up
+    address=$((address + 1))
+done
+
+step "server"
+mkdir -p "$work/srv"
+server new --network-name e2e --network-cidr 10.66.0.0/16 \
+    --external-endpoint 198.18.0.1:51820 --listen-port 51820 >/dev/null
+server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
+for peer in a b c; do
+    server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin false \
+        --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
+done
+server serve e2e --no-write-hosts >"$work/srv.log" 2>&1 &
+pids+=($!)
+sleep 1
+server_key=$(invitation "$work/a.toml" server public-key)
+api=$(invitation "$work/a.toml" server internal-endpoint)
+
+step "install peers"
+for peer in a b c; do
+    mkdir -p "$work/$peer"
+    client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 --delete-invite \
+        --no-write-hosts >"$work/$peer.install.log" 2>&1 ||
+        { cat "$work/$peer.install.log" >&2; fail "install $peer"; }
+done
+pass "a, b and c installed"
+
+ip_of() { db "SELECT ip FROM peers WHERE name = '$1'"; }
+key_of() { db "SELECT public_key FROM peers WHERE name = '$1'"; }
+a_ip=$(ip_of a)
+b_ip=$(ip_of b)
+c_ip=$(ip_of c)
+b_key=$(key_of b)
+c_key=$(key_of c)
+prefix=10.66.1.32/28
+ctr_ip=10.66.1.33
+
+step "b's interface has its own address alone, and the network's source"
+ns b ip -4 -o addr show dev e2e | grep -q " inet $b_ip/32 " ||
+    fail "b's interface doesn't have $b_ip/32: $(ns b ip -4 -o addr show dev e2e)"
+pass "b's interface has $b_ip/32"
+ns b ip -4 route show dev e2e | grep -q "^10.66.0.0/16 .*src $b_ip" ||
+    fail "b doesn't route the network from $b_ip: $(ns b ip -4 route show dev e2e)"
+pass "b routes 10.66.0.0/16 from $b_ip"
+
+step "delegate $prefix to b"
+server add-delegation e2e --name b --prefix "$prefix" --yes >/dev/null
+db "SELECT prefix FROM delegations WHERE peer_id = (SELECT id FROM peers WHERE name = 'b')" |
+    grep -qx "$prefix" || fail "the delegation isn't stored"
+pass "the delegation is stored"
+expect_routed srv b "$b_key" "$prefix"
+fetch a
+expect_routed a b "$b_key" "$prefix"
+expect_routed a b "$b_key" "$b_ip/32"
+
+step "a container behind b"
+ns b sysctl -qw net.ipv4.ip_forward=1
+ip netns add ctr
+ns ctr ip link set lo up
+ns b ip link add nk0 type netkit mode l3 peer name nk1 netns ctr
+ns b ip link set nk0 up
+ns b ip route add "$ctr_ip/32" dev nk0
+# Loose reverse path filtering would accept spoofed sources routed to the network anyway.
+ns b sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.nk0.rp_filter=0
+ns ctr ip addr add "$ctr_ip/32" dev nk1
+ns ctr ip link set nk1 up
+ns ctr ip route add default dev nk1
+ns a ping -c3 -W2 "$ctr_ip" >/dev/null || fail "a can't ping the container"
+pass "a pings the container"
+ns ctr ping -c3 -W2 "$a_ip" >/dev/null || fail "the container can't ping a"
+pass "the container pings a"
+
+# A listener on a that prints the source of a TCP connection, or of each UDP datagram it
+# receives within 3 s.
+listen() { # <tcp|udp> <port>
+    ns a timeout 10 python3 -I - "$a_ip" "$@" <<'EOF'
+import socket, sys
+ip, kind, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if kind == "tcp":
+    s = socket.create_server((ip, port))
+    conn, peer = s.accept()
+    print(peer[0])
+else:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((ip, port))
+    s.settimeout(3)
+    try:
+        while True:
+            print(s.recvfrom(100)[1][0], flush=True)
+    except socket.timeout:
+        pass
+EOF
+}
+# Sends from the container, over TCP or UDP from each given source address.
+send() { # <tcp|udp> <port> <source>...
+    ns ctr python3 -I - "$a_ip" "$@" <<'EOF'
+import socket, sys
+ip, kind, port, sources = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
+for source in sources:
+    if kind == "tcp":
+        socket.create_connection((ip, port), timeout=5, source_address=(source, 0)).close()
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((source, 0))
+        s.sendto(b"hello", (ip, port))
+EOF
+}
+
+listen tcp 7000 >"$work/tcp.log" &
+sleep 1
+send tcp 7000 "$ctr_ip" || fail "the container can't connect to a"
+wait $!
+[ "$(cat "$work/tcp.log")" = "$ctr_ip" ] ||
+    fail "the container's connection arrived from $(cat "$work/tcp.log"), expected $ctr_ip"
+pass "the container's connection arrives at a from $ctr_ip"
+
+step "a drops what b forwards from outside its delegation"
+ns ctr ip addr add 10.66.1.99/32 dev nk1
+errors=$(frame_errors a)
+listen udp 7001 >"$work/udp.log" &
+sleep 1
+send udp 7001 10.66.1.99 "$ctr_ip"
+wait $!
+grep -qx "$ctr_ip" "$work/udp.log" || fail "a didn't receive the datagram from $ctr_ip"
+pass "a received the datagram from $ctr_ip"
+! grep -qx 10.66.1.99 "$work/udp.log" || fail "a received the datagram from 10.66.1.99"
+pass "a didn't receive the datagram from 10.66.1.99"
+[ "$(frame_errors a)" -gt "$errors" ] || fail "a's WireGuard didn't count a dropped packet"
+pass "a's WireGuard dropped the packet from outside b's allowed IPs"
+ns ctr ip addr del 10.66.1.99/32 dev nk1
+
+step "extra addresses"
+python3 -I - "$work/b/conf/e2e.conf" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+text = text.replace("[interface]\n", '[interface]\nextra-addresses = ["10.66.1.40", "10.66.1.200"]\n', 1)
+open(path, "w").write(text)
+EOF
+fetch b
+expect_log b "extra address 10.66.1.200 is not within any of this peer's delegations"
+ns b ip -4 -o addr show dev e2e | grep -q " inet 10.66.1.40/32 " ||
+    fail "b's interface doesn't have 10.66.1.40/32: $(ns b ip -4 -o addr show dev e2e)"
+pass "b's interface has 10.66.1.40/32"
+! ns b ip -4 -o addr show dev e2e | grep -q " inet 10.66.1.200/" ||
+    fail "b's interface has 10.66.1.200"
+pass "b's interface doesn't have 10.66.1.200"
+ns b ip -4 route get "$a_ip" | grep -q "src $b_ip " ||
+    fail "b doesn't reach a from its own address: $(ns b ip -4 route get "$a_ip")"
+pass "b still reaches a from $b_ip"
+ns a ping -c3 -W2 10.66.1.40 >/dev/null || fail "a can't ping b's extra address"
+pass "a pings b's extra address"
+
+step "only b's own address is b to the server"
+# Let b use plain HTTP, so that its own address alone is accepted.
+db "UPDATE peers SET requires_tls = 0 WHERE name = 'b'"
+expect_plain b GET /v1/user/state 200
+expect_plain ctr GET /v1/user/state 401
+db "UPDATE peers SET requires_tls = 1 WHERE name = 'b'"
+
+step "the server moves b's delegation to c"
+db "UPDATE delegations SET peer_id = (SELECT id FROM peers WHERE name = 'c')
+    WHERE prefix = '$prefix'"
+fetch a
+expect_log a "dropping delegation $prefix of peer c: PINNING ERROR: Delegation overlaps $prefix, previously seen delegated to peer b."
+expect_not_routed a c "$c_key" "$prefix"
+expect_not_routed a b "$b_key" "$prefix"
+expect_routed a c "$c_key" "$c_ip/32"
+db "UPDATE delegations SET peer_id = (SELECT id FROM peers WHERE name = 'b')
+    WHERE prefix = '$prefix'"
+fetch a
+expect_routed a b "$b_key" "$prefix"
+
+step "withdraw b's delegation"
+server delete-delegation e2e --name b --prefix "$prefix" --yes >/dev/null
+expect_not_routed srv b "$b_key" "$prefix"
+fetch a
+expect_not_routed a b "$b_key" "$prefix"
+expect_routed a b "$b_key" "$b_ip/32"
+withdrawn a | grep -qx "$b_key $prefix" || fail "a doesn't keep $prefix pinned to b: $(withdrawn a)"
+pass "a keeps $prefix pinned to b"
+
+step "reassign it to c"
+server add-delegation e2e --name c --prefix "$prefix" --yes >/dev/null
+fetch a
+expect_log a "dropping delegation $prefix of peer c: PINNING ERROR: Delegation overlaps $prefix, previously seen delegated to peer b."
+expect_not_routed a c "$c_key" "$prefix"
+client a forget-delegation e2e --prefix "$prefix" --yes >"$work/a.forget.log" 2>&1 ||
+    { cat "$work/a.forget.log" >&2; fail "forget-delegation as a"; }
+[ -z "$(withdrawn a)" ] || fail "a still has withdrawn delegations: $(withdrawn a)"
+pass "a forgot $prefix"
+fetch a
+expect_routed a c "$c_key" "$prefix"
+expect_not_routed a b "$b_key" "$prefix"
+
+step "all passed"
