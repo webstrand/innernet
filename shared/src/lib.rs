@@ -190,8 +190,8 @@ pub fn update_hosts_file(
 ///
 /// With a suffix, which the operator chooses, the hostname is the peer name followed by the
 /// suffix. Without a suffix, the hostname is the peer name alone, which
-/// [`innernet_domain::is_canonical_domain_label`] must accept, so that it does not read as an
-/// address.
+/// [`innernet_domain::is_canonical_domain`] must accept, so that it does not end in a number. A
+/// dotted peer name without a suffix names an arbitrary domain, such as "www.example.com".
 fn peer_hostname(
     interface: &InterfaceName,
     host_suffix: Option<&str>,
@@ -199,7 +199,7 @@ fn peer_hostname(
 ) -> Option<String> {
     match host_suffix {
         None => Some(format!("{name}.{interface}.wg")),
-        Some("") => innernet_domain::is_canonical_domain_label(name).then(|| name.to_string()),
+        Some("") => innernet_domain::is_canonical_domain(name).then(|| name.to_string()),
         Some(suffix) => Some(format!("{name}.{suffix}")),
     }
 }
@@ -213,16 +213,20 @@ mod tests {
         let interface: InterfaceName = "wg0".parse().unwrap();
         let hostname = |suffix, name| peer_hostname(&interface, suffix, name);
 
-        // A name that a suffix follows may be a number.
+        // A name that a suffix follows may contain dots and end in a number.
         assert_eq!(hostname(None, "08").as_deref(), Some("08.wg0.wg"));
         assert_eq!(
-            hostname(Some("evilnet"), "08").as_deref(),
-            Some("08.evilnet")
+            hostname(Some("evilnet"), "a.08").as_deref(),
+            Some("a.08.evilnet")
         );
 
-        // Without a suffix, the name must not be a number.
+        // Without a suffix, the name may contain dots but must not end in a number.
         assert_eq!(hostname(Some(""), "peer-1").as_deref(), Some("peer-1"));
+        assert_eq!(
+            hostname(Some(""), "www.example.com").as_deref(),
+            Some("www.example.com")
+        );
         assert_eq!(hostname(Some(""), "08"), None);
-        assert_eq!(hostname(Some(""), "0x7f000001"), None);
+        assert_eq!(hostname(Some(""), "a.0x7f000001"), None);
     }
 }

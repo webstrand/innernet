@@ -911,10 +911,10 @@ impl From<Timestring> for Duration {
 pub struct Hostname(String);
 
 impl Hostname {
-    /// Whether `name` is a single canonical label, which may be a number, since a suffix usually
-    /// follows it in the hosts file.
+    /// Whether `name` is a canonical relative domain, which may contain dots and may be a number,
+    /// since a suffix usually follows it in the hosts file.
     pub fn is_valid(name: &str) -> bool {
-        innernet_domain::is_canonical_label(name)
+        innernet_domain::is_canonical_relative_domain(name)
     }
 }
 
@@ -925,7 +925,7 @@ impl FromStr for Hostname {
         if Self::is_valid(name) {
             Ok(Self(name.to_string()))
         } else {
-            Err("invalid hostname string (only lowercase alphanumeric with dashes)")
+            Err("invalid hostname string (only lowercase alphanumeric with dashes and dots)")
         }
     }
 }
@@ -1155,11 +1155,10 @@ mod tests {
         let deserialize = |name| Hostname::deserialize(StrDeserializer::<Error>::new(name));
 
         assert_eq!(*deserialize("peer-1").unwrap(), *"peer-1");
-        // A suffix usually follows a peer name, so it may be a number.
+        // A suffix usually follows a peer name, so it may contain dots and be a number.
         assert_eq!(*deserialize("08").unwrap(), *"08");
-        assert_eq!("08".parse::<Hostname>(), Ok(deserialize("08").unwrap()));
-        assert!(deserialize("a.b").is_err());
-        assert!("a.b".parse::<Hostname>().is_err());
+        assert_eq!(*deserialize("a.b").unwrap(), *"a.b");
+        assert_eq!("a.08".parse::<Hostname>(), Ok(deserialize("a.08").unwrap()));
         assert!(deserialize("").is_err());
         assert!(deserialize("Peer").is_err());
         assert!(deserialize("peer\n10.0.0.1 example.com").is_err());
