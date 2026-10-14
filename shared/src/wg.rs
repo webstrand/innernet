@@ -70,6 +70,33 @@ pub fn set_addr(interface: &InterfaceName, addr: IpNet) -> Result<(), io::Error>
     cmd("ifconfig", &[&interface.to_string(), af, &addr.to_string()]).map(|_output| ())
 }
 
+/// Add a route in the OS's routing table to get traffic flowing through this interface, with
+/// `src` as the address of this host on it. Returns an error if the process doesn't exit
+/// successfully, otherwise returns true if the route was changed, false if the route already
+/// exists.
+#[cfg(target_os = "openbsd")]
+pub fn add_route(interface: &InterfaceName, cidr: IpNet, src: IpAddr) -> Result<bool, io::Error> {
+    let output = cmd(
+        "route",
+        &[
+            "-n",
+            "add",
+            if matches!(cidr, IpNet::V4(_)) {
+                "-inet"
+            } else {
+                "-inet6"
+            },
+            &cidr.to_string(),
+            "-iface",
+            &src.to_string(),
+            "-ifp",
+            &interface.to_string(),
+        ],
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(!stderr.contains("File exists"))
+}
+
 #[cfg(target_os = "openbsd")]
 pub fn set_up(interface: &InterfaceName, mtu: u32) -> Result<(), io::Error> {
     cmd(
@@ -115,12 +142,12 @@ pub fn up(
     device
         .set_private_key(wireguard_control::Key::from_base64(private_key).unwrap())
         .apply(interface, network.backend)?;
-    set_addr(interface, address)?;
+    // The address is assigned alone, and the network routed with it as the source, so that it
+    // remains the default source address however many more addresses are put on the interface.
+    set_addr(interface, IpNet::from(address.addr()))?;
     set_up(interface, network.mtu.unwrap_or(1280))?;
     if !network.no_routing {
-        // On OpenBSD, `ifconfig` handles this for us
-        #[cfg(not(target_os = "openbsd"))]
-        add_route(interface, address)?;
+        add_route(interface, address.trunc(), address.addr())?;
     }
     Ok(())
 }
@@ -148,11 +175,12 @@ pub fn down(interface: &InterfaceName, backend: Backend) -> Result<(), Error> {
         .with_str(interface.as_str_lossy())?)
 }
 
-/// Add a route in the OS's routing table to get traffic flowing through this interface.
-/// Returns an error if the process doesn't exit successfully, otherwise returns
-/// true if the route was changed, false if the route already exists.
+/// Add a route in the OS's routing table to get traffic flowing through this interface, with
+/// `src` as the address of this host on it. Returns an error if the process doesn't exit
+/// successfully, otherwise returns true if the route was changed, false if the route already
+/// exists.
 #[cfg(target_os = "macos")]
-pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Error> {
+pub fn add_route(interface: &InterfaceName, cidr: IpNet, src: IpAddr) -> Result<bool, io::Error> {
     let real_interface = wireguard_control::backends::userspace::resolve_tun(interface)?;
     let output = cmd(
         "route",
@@ -167,6 +195,8 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
             &cidr.to_string(),
             "-interface",
             &real_interface,
+            "-ifa",
+            &src.to_string(),
         ],
     )?;
     let stderr = String::from_utf8_lossy(&output.stderr);

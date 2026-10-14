@@ -58,12 +58,19 @@ pub fn set_addr(interface: &InterfaceName, addr: IpNet) -> Result<(), io::Error>
             ))],
         ),
     };
+    // WireGuard interfaces don't do duplicate address detection anyway, but without this an
+    // IPv6 address stays tentative until it's skipped asynchronously, and is refused meanwhile
+    // as a route's source address.
+    let flags = match addr {
+        IpNet::V4(_) => address::AddressHeaderFlags::empty(),
+        IpNet::V6(_) => address::AddressHeaderFlags::Nodad,
+    };
     let header = AddressHeader {
         index,
         family,
         prefix_len: addr.prefix_len(),
+        flags,
         scope: address::AddressScope::Universe,
-        ..Default::default()
     };
 
     let mut message = AddressMessage::default();
@@ -77,7 +84,9 @@ pub fn set_addr(interface: &InterfaceName, addr: IpNet) -> Result<(), io::Error>
     Ok(())
 }
 
-pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Error> {
+/// Adds a route to `cidr` through the interface, sourced from `src` unless a socket is bound
+/// to another address. Returns true if the route was added, false if one already existed.
+pub fn add_route(interface: &InterfaceName, cidr: IpNet, src: IpAddr) -> Result<bool, io::Error> {
     let if_index = if_nametoindex(interface)?;
     let (address_family, dst) = match cidr {
         IpNet::V4(network) => (
@@ -89,6 +98,10 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
             route::RouteAttribute::Destination(route::RouteAddress::Inet6(network.network())),
         ),
     };
+    let prefsrc = route::RouteAttribute::PrefSource(match src {
+        IpAddr::V4(addr) => route::RouteAddress::Inet(addr),
+        IpAddr::V6(addr) => route::RouteAddress::Inet6(addr),
+    });
     let header = RouteHeader {
         table: RouteHeader::RT_TABLE_MAIN,
         protocol: route::RouteProtocol::Boot,
@@ -100,11 +113,16 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
     };
     let mut message = RouteMessage::default();
     message.header = header;
-    message.attributes = vec![dst, route::RouteAttribute::Oif(if_index)];
+    message.attributes = vec![dst, prefsrc, route::RouteAttribute::Oif(if_index)];
 
     match netlink_request_rtnl(RouteNetlinkMessage::NewRoute(message), None) {
         Ok(_) => {
-            log::debug!("added route {} to interface {}", cidr, interface);
+            log::debug!(
+                "added route {} to interface {} with source {}",
+                cidr,
+                interface,
+                src
+            );
             Ok(true)
         },
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
