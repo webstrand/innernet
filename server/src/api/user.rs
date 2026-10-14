@@ -442,7 +442,7 @@ mod tests {
 
         // Step 2: Ensure that redemption works.
         let body = RedeemContents {
-            public_key: "YBVIgpfLbi/knrMCTEb0L6eVy0daiZnJJQkxBK9s+2I=".into(),
+            public_key: wireguard_control::KeyPair::generate().public.to_base64(),
         };
         let res = server
             .form_request(
@@ -504,7 +504,7 @@ mod tests {
 
         // Step 2: Ensure that redemption works.
         let body = RedeemContents {
-            public_key: "YBVIgpfLbi/knrMCTEb0L6eVy0daiZnJJQkxBK9s+2I=".into(),
+            public_key: wireguard_control::KeyPair::generate().public.to_base64(),
         };
         let res = server
             .form_request(
@@ -515,6 +515,70 @@ mod tests {
             )
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Unused IPs in the user and admin CIDRs.
+    fn new_user_and_admin_ips() -> (&'static str, &'static str) {
+        if cfg!(feature = "v6-test") {
+            ("fd00:1337::3:0:0:3", "fd00:1337::1:0:0:2")
+        } else {
+            ("10.80.128.3", "10.80.1.2")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redeem_requires_tls_for_admins() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (user_ip, admin_ip) = new_user_and_admin_ips();
+        for (name, ip, is_admin) in [("new-user", user_ip, false), ("new-admin", admin_ip, true)] {
+            let cidr_id = if is_admin {
+                test::ADMIN_CIDR_ID
+            } else {
+                test::USER_CIDR_ID
+            };
+            let mut contents = test::peer_contents(name, ip, cidr_id, is_admin)?;
+            contents.is_redeemed = false;
+            let id = DatabasePeer::create(&server.db().lock(), contents)?.id;
+
+            let body = RedeemContents {
+                public_key: wireguard_control::KeyPair::generate().public.to_base64(),
+            };
+            let res = server
+                .plain_form_request(ip, "POST", "/v1/user/redeem", &body)
+                .await;
+            if is_admin {
+                // Admin invitations can only be redeemed by a client that uses TLS.
+                assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+                let res = server
+                    .form_request(ip, "POST", "/v1/user/redeem", &body)
+                    .await;
+                assert_eq!(res.status(), StatusCode::NO_CONTENT);
+            } else {
+                assert_eq!(res.status(), StatusCode::NO_CONTENT);
+                assert!(!DatabasePeer::get(&server.db().lock(), id)?.requires_tls);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_redeem_with_invalid_key() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (ip, _) = new_user_and_admin_ips();
+        let mut contents = test::user_peer_contents("new-user", ip)?;
+        contents.is_redeemed = false;
+        DatabasePeer::create(&server.db().lock(), contents)?;
+
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let body = RedeemContents {
+            public_key: wireguard_control::Key(low_order).to_base64(),
+        };
+        let res = server
+            .form_request(ip, "POST", "/v1/user/redeem", &body)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         Ok(())
     }
 

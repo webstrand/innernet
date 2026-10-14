@@ -12,8 +12,9 @@ const INVITE_EXPIRATION_VERSION: usize = 1;
 const ENDPOINT_CANDIDATES_VERSION: usize = 2;
 const NULLABLE_PEER_NAME_VERSION: usize = 3;
 const ANNOUNCEMENT_VERSION: usize = 4;
+const REQUIRES_TLS_VERSION: usize = 5;
 
-pub const CURRENT_VERSION: usize = ANNOUNCEMENT_VERSION;
+pub const CURRENT_VERSION: usize = REQUIRES_TLS_VERSION;
 
 pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     let old_version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -63,6 +64,13 @@ pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> 
 
     if old_version < ANNOUNCEMENT_VERSION {
         conn.execute("ALTER TABLE peers ADD COLUMN announcement TEXT", params![])?;
+    }
+
+    if old_version < REQUIRES_TLS_VERSION {
+        conn.execute(
+            "ALTER TABLE peers ADD COLUMN requires_tls INTEGER DEFAULT 0 NOT NULL",
+            params![],
+        )?;
     }
 
     if old_version != CURRENT_VERSION {

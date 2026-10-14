@@ -188,12 +188,37 @@ impl Server {
         self.conf.config_path(&self.interface)
     }
 
+    /// Sends a request as a client connecting over TLS would, authenticated by the key of the
+    /// peer at `ip_str`, or as `plain_request` does if there is no peer there.
     pub async fn raw_request(&self, ip_str: &str, req: Request<Body>) -> Response<Body> {
+        let ip = ip_str.parse().unwrap();
+        let client_key = DatabasePeer::get_from_ip(&self.db.lock(), ip)
+            .ok()
+            .map(|peer| Key::from_base64(&peer.public_key).unwrap());
+        self.raw_request_as(ip_str, client_key, req).await
+    }
+
+    /// Sends a request as a client connecting in plain HTTP would, identified by its IP.
+    pub async fn plain_request(&self, ip_str: &str, verb: &str, path: &str) -> Response<Body> {
+        let req = self
+            .base_request_builder(verb, path)
+            .body(Body::empty())
+            .unwrap();
+        self.raw_request_as(ip_str, None, req).await
+    }
+
+    pub async fn raw_request_as(
+        &self,
+        ip_str: &str,
+        client_key: Option<Key>,
+        req: Request<Body>,
+    ) -> Response<Body> {
         let port = 54321u16;
         crate::hyper_service(
             req,
             self.context(),
             SocketAddr::new(ip_str.parse().unwrap(), port),
+            client_key,
         )
         .await
         .unwrap()
@@ -219,6 +244,15 @@ impl Server {
         self.raw_request(ip_str, req).await
     }
 
+    fn form_request_builder<F: Serialize>(&self, verb: &str, path: &str, form: F) -> Request<Body> {
+        let json = serde_json::to_string(&form).unwrap();
+        self.base_request_builder(verb, path)
+            .header("Content-Type", "application/json")
+            .header("Content-Length", json.len().to_string())
+            .body(Body::from(json))
+            .unwrap()
+    }
+
     pub async fn form_request<F: Serialize>(
         &self,
         ip_str: &str,
@@ -226,14 +260,19 @@ impl Server {
         path: &str,
         form: F,
     ) -> Response<Body> {
-        let json = serde_json::to_string(&form).unwrap();
-        let req = self
-            .base_request_builder(verb, path)
-            .header("Content-Type", "application/json")
-            .header("Content-Length", json.len().to_string())
-            .body(Body::from(json))
-            .unwrap();
+        let req = self.form_request_builder(verb, path, form);
         self.raw_request(ip_str, req).await
+    }
+
+    pub async fn plain_form_request<F: Serialize>(
+        &self,
+        ip_str: &str,
+        verb: &str,
+        path: &str,
+        form: F,
+    ) -> Response<Body> {
+        let req = self.form_request_builder(verb, path, form);
+        self.raw_request_as(ip_str, None, req).await
     }
 }
 

@@ -17,6 +17,18 @@ pub enum ServerError {
     #[error("endpoint gone")]
     Gone,
 
+    #[error(
+        "this peer has connected over TLS before, so it must always do so; upgrade innernet \
+         to connect"
+    )]
+    TlsRequired,
+
+    #[error(
+        "only peers that have connected over TLS can be made admins; upgrade innernet on the \
+         peer and run 'innernet fetch' first"
+    )]
+    PromotionRequiresTls,
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -40,7 +52,8 @@ impl From<&ServerError> for StatusCode {
     fn from(error: &ServerError) -> StatusCode {
         use ServerError::*;
         match error {
-            Unauthorized => StatusCode::UNAUTHORIZED,
+            Unauthorized | TlsRequired => StatusCode::UNAUTHORIZED,
+            PromotionRequiresTls => StatusCode::UNPROCESSABLE_ENTITY,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
@@ -62,8 +75,11 @@ impl TryFrom<ServerError> for Response<Body> {
     type Error = http::Error;
 
     fn try_from(e: ServerError) -> Result<Self, Self::Error> {
-        Response::builder()
-            .status(StatusCode::from(&e))
-            .body(Body::empty())
+        // Explain the errors that an outdated client can't make sense of on its own.
+        let body = match e {
+            ServerError::TlsRequired | ServerError::PromotionRequiresTls => e.to_string().into(),
+            _ => Body::empty(),
+        };
+        Response::builder().status(StatusCode::from(&e)).body(body)
     }
 }

@@ -1,7 +1,7 @@
 use super::DatabaseCidr;
 use crate::ServerError;
 use innernet_shared::{
-    announcement::SignedAnnouncement, IpNetExt, Peer, PeerContents,
+    announcement::SignedAnnouncement, xeddsa, IpNetExt, Peer, PeerContents,
     PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use rusqlite::{params, types::Type, Connection};
@@ -10,6 +10,7 @@ use std::{
     ops::{Deref, DerefMut},
     time::{Duration, SystemTime},
 };
+use wireguard_control::Key;
 
 pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       id              INTEGER PRIMARY KEY,
@@ -24,6 +25,7 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       invite_expires  INTEGER,                      /* The UNIX time that an invited peer can no longer redeem.         */
       candidates      TEXT,                         /* A list of additional endpoints that peers can use to connect.    */
       announcement    TEXT,                         /* The peer's latest signed endpoint announcement (JSON).           */
+      requires_tls    INTEGER DEFAULT 0 NOT NULL,   /* Must the peer authenticate over TLS rather than by its IP?       */
       FOREIGN KEY (cidr_id)
          REFERENCES cidrs (id)
             ON UPDATE RESTRICT
@@ -43,17 +45,16 @@ pub static COLUMNS: &[&str] = &[
     "invite_expires",
     "candidates",
     "announcement",
+    "requires_tls",
 ];
 
 #[derive(Debug)]
 pub struct DatabasePeer {
     pub inner: Peer,
-}
-
-impl From<Peer> for DatabasePeer {
-    fn from(inner: Peer) -> Self {
-        Self { inner }
-    }
+    /// Whether the peer must authenticate over TLS with its key, and is refused when it
+    /// connects in plain HTTP, authenticated only by its source IP. Set for good once the
+    /// peer has connected over TLS, and from creation for admins.
+    pub requires_tls: bool,
 }
 
 impl Deref for DatabasePeer {
@@ -93,6 +94,11 @@ impl DatabasePeer {
         } = &contents;
         log::info!("creating peer {:?}", contents);
 
+        if !Self::is_valid_public_key(public_key) {
+            log::warn!("peer public key is invalid.");
+            return Err(ServerError::InvalidQuery);
+        }
+
         let cidr = DatabaseCidr::get(conn, *cidr_id)?;
         if !cidr.cidr.contains(ip) {
             log::warn!("tried to add peer with IP outside of parent CIDR range.");
@@ -114,9 +120,13 @@ impl DatabasePeer {
 
         let candidates = serde_json::to_string(candidates)?;
 
+        // Admins only ever come into existence on a client that connects over TLS, so that
+        // nothing else on their machine can act with their rights.
+        let requires_tls = *is_admin;
+
         conn.execute(
             &format!(
-                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
                 COLUMNS[1..].join(", ")
             ),
             params![
@@ -130,10 +140,20 @@ impl DatabasePeer {
                 is_redeemed,
                 invite_expires,
                 candidates,
+                requires_tls,
             ],
         )?;
         let id = conn.last_insert_rowid();
-        Ok(Peer { id, contents }.into())
+        Ok(Self {
+            inner: Peer { id, contents },
+            requires_tls,
+        })
+    }
+
+    /// Peers are looked up by the key they authenticate with over TLS, encoded canonically.
+    fn is_valid_public_key(public_key: &str) -> bool {
+        Key::from_base64(public_key)
+            .is_ok_and(|key| xeddsa::is_valid_public_key(&key) && key.to_base64() == public_key)
     }
 
     /// Update self with new contents, validating them and updating the backend in the process.
@@ -143,6 +163,13 @@ impl DatabasePeer {
         //
         // In the future, we may allow re-assignments of peers to new CIDRs, but it's easiest to
         // disregard that case for now to prevent possible attacks.
+        if contents.is_admin && !self.is_admin && !self.requires_tls {
+            log::warn!(
+                "refusing to make {} an admin before it connects over TLS.",
+                **self
+            );
+            return Err(ServerError::PromotionRequiresTls);
+        }
         let new_contents = PeerContents {
             name: contents.name,
             endpoint: contents.endpoint,
@@ -199,6 +226,16 @@ impl DatabasePeer {
         Ok(())
     }
 
+    /// Requires the peer to authenticate over TLS from now on.
+    pub fn set_requires_tls(&mut self, conn: &Connection) -> Result<(), ServerError> {
+        conn.execute(
+            "UPDATE peers SET requires_tls = 1 WHERE id = ?1",
+            params![self.id],
+        )?;
+        self.requires_tls = true;
+        Ok(())
+    }
+
     pub fn disable(conn: &Connection, id: i64) -> Result<(), ServerError> {
         match conn.execute(
             "UPDATE peers SET is_disabled = 1 WHERE id = ?1",
@@ -235,6 +272,11 @@ impl DatabasePeer {
 
         if matches!(self.invite_expires, Some(time) if time < SystemTime::now()) {
             return Err(ServerError::Unauthorized);
+        }
+
+        if !Self::is_valid_public_key(pubkey) {
+            log::warn!("refusing to redeem {} with an invalid public key.", **self);
+            return Err(ServerError::InvalidQuery);
         }
 
         match conn.execute(
@@ -291,9 +333,11 @@ impl DatabasePeer {
             None
         };
 
+        let requires_tls = row.get(12)?;
+
         let persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
 
-        Ok(Peer {
+        let inner = Peer {
             id,
             contents: PeerContents {
                 name,
@@ -310,8 +354,11 @@ impl DatabasePeer {
                 announcement,
                 observed_endpoint: None,
             },
-        }
-        .into())
+        };
+        Ok(Self {
+            inner,
+            requires_tls,
+        })
     }
 
     pub fn get(conn: &Connection, id: i64) -> Result<Self, ServerError> {
@@ -332,6 +379,20 @@ impl DatabasePeer {
         )?;
 
         Ok(result)
+    }
+
+    pub fn get_from_public_key(
+        conn: &Connection,
+        public_key: &Key,
+    ) -> Result<Self, rusqlite::Error> {
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM peers WHERE public_key = ?1",
+                COLUMNS.join(", ")
+            ),
+            params![public_key.to_base64()],
+            Self::from_row,
+        )
     }
 
     pub fn get_all_allowed_peers(&self, conn: &Connection) -> Result<Vec<Self>, ServerError> {
