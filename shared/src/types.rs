@@ -7,7 +7,7 @@ use clap::{
 use ipnet::{IpNet, PrefixLenError};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{
     fmt::{self, Display, Formatter},
     io,
@@ -574,6 +574,7 @@ pub struct PeerContents {
     pub name: Hostname,
     pub ip: IpAddr,
     pub cidr_id: i64,
+    #[serde(deserialize_with = "deserialize_public_key")]
     pub public_key: String,
     pub endpoint: Option<Endpoint>,
     pub persistent_keepalive_interval: Option<u16>,
@@ -583,6 +584,15 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+}
+
+/// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
+/// canonical base64 encoding, so that public keys can be compared as strings.
+fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let public_key = String::deserialize(deserializer)?;
+    Key::from_base64(&public_key)
+        .map(|key| key.to_base64())
+        .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1144,5 +1154,21 @@ mod tests {
         assert!(deserialize("Peer").is_err());
         assert!(deserialize("peer\n10.0.0.1 example.com").is_err());
         assert!(deserialize(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_public_key() {
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        let deserialize = |public_key| {
+            deserialize_public_key(de::value::StrDeserializer::<de::value::Error>::new(
+                public_key,
+            ))
+        };
+
+        assert_eq!(deserialize(PUBKEY).unwrap(), PUBKEY);
+        // An unpadded encoding of the same key is normalized to the canonical encoding.
+        assert_eq!(deserialize(PUBKEY.trim_end_matches('=')).unwrap(), PUBKEY);
+        assert!(deserialize("abc").is_err());
+        assert!(deserialize("").is_err());
     }
 }

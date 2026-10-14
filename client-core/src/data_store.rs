@@ -309,7 +309,7 @@ mod tests {
                 name: "blah".parse().unwrap(),
                 ip: "10.0.0.1".parse().unwrap(),
                 cidr_id: 1,
-                public_key: "abc".to_string(),
+                public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
                 endpoint: None,
                 is_admin: false,
                 is_disabled: false,
@@ -382,7 +382,8 @@ mod tests {
         assert_eq!(store.peers(), &*BASE_PEERS);
 
         let mut modified = BASE_PEERS.clone();
-        modified[0].contents.public_key = "foo".to_string();
+        modified[0].contents.public_key =
+            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
 
         // Should NOT work, since the IP is pinned to another public key. The pinned peer is
         // disabled, since it is absent from the update.
@@ -410,7 +411,7 @@ mod tests {
         updated[0].contents.name = "renamed".parse().unwrap();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         updated.push(new_peer);
         assert!(store.update_peers(&updated).is_empty());
         assert_eq!(store.peers(), &updated[..]);
@@ -427,7 +428,7 @@ mod tests {
         let mut outside = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "1.1.1.1".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         outside.push(new_peer);
         let dropped = store.update_peers(&outside);
         assert_eq!(dropped.len(), 1);
@@ -446,9 +447,9 @@ mod tests {
         let mut same_ip = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
-        new_peer.contents.public_key = "ghi".to_string();
+        new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
         assert_eq!(dropped.len(), 1);
@@ -459,7 +460,7 @@ mod tests {
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.3".parse().unwrap();
-        new_peer.contents.public_key = "jkl".to_string();
+        new_peer.contents.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
         new_peer.contents.ip = "10.0.0.4".parse().unwrap();
         same_public_key.push(new_peer);
