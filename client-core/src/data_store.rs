@@ -58,11 +58,17 @@ impl DataStore {
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
-        let Contents::V1 { peers, cidrs } =
-            serde_json::from_str(&json).unwrap_or_else(|_| Contents::V1 {
+        let Contents::V1 { peers, cidrs } = match serde_json::from_str(&json) {
+            Ok(contents) => contents,
+            // Only an empty file, which fails at its very start, is a new data store.
+            Err(e) if e.is_eof() && e.line() == 1 && e.column() == 0 => Contents::V1 {
                 peers: vec![],
                 cidrs: vec![],
-            });
+            },
+            // Any other file that fails to parse is an error, since starting over would discard
+            // its pins.
+            Err(e) => return Err(io::Error::from(e)).with_path(path),
+        };
 
         // A data store written before public keys were pinned to their IP can hold a later record
         // of a peer at another IP. The earliest record of each peer is kept.
@@ -481,6 +487,23 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
         let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
         assert_eq!(store.peers(), &*BASE_PEERS);
+    }
+
+    #[test]
+    fn test_invalid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+
+        // An empty file is a new data store.
+        File::create(&path).unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
+        assert!(store.peers().is_empty());
+
+        // A file that fails to parse is refused rather than replaced, even if it is only whitespace.
+        std::fs::write(&path, r#"{"version": "1", "peers": [{"#).unwrap();
+        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
+        std::fs::write(&path, "\n").unwrap();
+        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
     }
 
     #[test]
