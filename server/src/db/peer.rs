@@ -105,6 +105,16 @@ impl DatabasePeer {
             return Err(ServerError::InvalidQuery);
         }
 
+        let child_cidrs = conn.query_row(
+            "SELECT COUNT(*) FROM cidrs WHERE parent = ?1",
+            params![cidr_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if child_cidrs > 0 {
+            log::warn!("tried to add peer to a CIDR that has child CIDRs.");
+            return Err(ServerError::InvalidQuery);
+        }
+
         if !cidr.cidr.is_assignable(ip) {
             println!(
                 "Peer IP {} is not unicast assignable in CIDR {}",
