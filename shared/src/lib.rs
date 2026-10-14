@@ -17,6 +17,7 @@ pub mod interface_config;
 mod netlink;
 pub mod peer;
 pub mod prompts;
+pub mod tls;
 pub mod types;
 pub mod wg;
 pub mod xeddsa;
