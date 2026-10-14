@@ -33,7 +33,7 @@ impl<'a> NatTraverse<'a> {
             .iter()
             .filter_map(|diff| diff.new)
             // Don't attempt NAT traversal for peers with an overridden endpoint.
-            .filter(|peer| !interface_config.peer_endpoint_overrides().contains_key(&peer.ip))
+            .filter(|peer| interface_config.endpoint_override_for_peer(peer).is_none())
             .cloned()
             .collect();
 

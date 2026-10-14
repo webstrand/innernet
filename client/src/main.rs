@@ -910,8 +910,9 @@ fn override_peer_endpoint(
     )? {
         if let Some(endpoint) = endpoint_opt {
             log::info!(
-                "overriding endpoint for peer IP {} with endpoint {}",
-                peer.ip,
+                "overriding endpoint for peer {} ({}) with endpoint {}",
+                peer.display_name(),
+                peer.public_key,
                 endpoint
             );
 
@@ -924,7 +925,11 @@ fn override_peer_endpoint(
                 endpoint,
             )?;
         } else {
-            log::info!("unsetting endpoint override for peer IP {}", peer.ip);
+            log::info!(
+                "unsetting endpoint override for peer {} ({})",
+                peer.display_name(),
+                peer.public_key
+            );
 
             innernet_client_core::unset_endpoint_override_for_peer(
                 &opts.config_dir,
@@ -1078,8 +1083,8 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
         } else {
             for peer_state in peer_states {
                 let endpoint_has_local_override = interface_config
-                    .peer_endpoint_overrides()
-                    .contains_key(&peer_state.peer.contents.ip);
+                    .endpoint_override_for_peer(peer_state.peer)
+                    .is_some();
                 print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
             }
         }
@@ -1109,8 +1114,8 @@ fn print_tree(
 
     for peer in peers.iter().filter(|p| p.peer.cidr_id == cidr.id) {
         let endpoint_has_local_override = interface_config
-            .peer_endpoint_overrides()
-            .contains_key(&peer.peer.contents.ip);
+            .endpoint_override_for_peer(peer.peer)
+            .is_some();
         print_peer(peer, true, level, verbose, endpoint_has_local_override);
     }
 }

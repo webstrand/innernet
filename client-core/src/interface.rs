@@ -259,15 +259,18 @@ pub fn fetch(
     }
 
     // The interface is configured from the enabled peers of the data store, with the local peer
-    // endpoint overrides applied.
-    for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
-        log::debug!(
-            "overriding peer IP {} with endpoint {}",
-            peer_ip,
-            endpoint_override
-        );
-    }
+    // endpoint overrides applied. An override follows the public key of its peer.
     let peers = store.peers();
+    for peer in peers {
+        if let Some(endpoint_override) = config.endpoint_override_for_peer(peer) {
+            log::debug!(
+                "overriding peer {} ({}) with endpoint {}",
+                peer.display_name(),
+                peer.public_key,
+                endpoint_override
+            );
+        }
+    }
 
     let modifications = device.diff(peers, config.peer_endpoint_overrides());
 

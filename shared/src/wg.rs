@@ -185,12 +185,12 @@ pub use super::netlink::add_route;
 
 pub trait DeviceExt {
     /// Diff the output of a wgctrl device with a list of peers, of which the disabled peers are
-    /// removed from the device. The endpoint of a peer whose IP is in `endpoint_overrides` is
-    /// replaced with its override.
+    /// removed from the device. The endpoint of a peer whose public key is in `endpoint_overrides`
+    /// is replaced with its override.
     fn diff<'a>(
         &'a self,
         peers: &'a [Peer],
-        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+        endpoint_overrides: &BTreeMap<String, Endpoint>,
     ) -> Vec<PeerDiff<'a>>;
 
     // /// Get a peer by their public key, a helper function.
@@ -201,7 +201,7 @@ impl DeviceExt for Device {
     fn diff<'a>(
         &'a self,
         peers: &'a [Peer],
-        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+        endpoint_overrides: &BTreeMap<String, Endpoint>,
     ) -> Vec<PeerDiff<'a>> {
         let interface_public_key = self
             .public_key
@@ -218,7 +218,8 @@ impl DeviceExt for Device {
                 let existing_peer = existing_peers
                     .iter()
                     .find(|p| p.config.public_key.to_base64() == peer.public_key);
-                PeerDiff::new(existing_peer, Some(peer), endpoint_overrides.get(&peer.ip)).unwrap()
+                let endpoint_override = endpoint_overrides.get(&peer.public_key);
+                PeerDiff::new(existing_peer, Some(peer), endpoint_override).unwrap()
             }
         });
 
@@ -337,8 +338,8 @@ mod tests {
         let device = device_with_peer(ip);
         let peers = [peer(ip)];
 
-        // The override of the peer's IP is used as its endpoint.
-        let overrides = BTreeMap::from([(ip, "2.2.2.2:2222".parse().unwrap())]);
+        // The override of the peer's public key is used as its endpoint.
+        let overrides = BTreeMap::from([(PUBKEY.to_owned(), "2.2.2.2:2222".parse().unwrap())]);
         let diffs = device.diff(&peers, &overrides);
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].changes().contains(&crate::PeerChange::Endpoint {

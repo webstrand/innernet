@@ -53,7 +53,7 @@ pub fn set_endpoint_override_for_peer(
     peer: &Peer,
     endpoint: Endpoint,
 ) -> Result<(), Error> {
-    config.set_endpoint_override_for_peer(peer.ip, endpoint.clone());
+    config.set_endpoint_override_for_peer(peer, endpoint.clone());
     config.save(config_dir, interface)?;
 
     if interface_is_up(network_backend, interface) {
@@ -74,7 +74,7 @@ pub fn unset_endpoint_override_for_peer(
     config: &mut interface::InterfaceConfig,
     peer: &Peer,
 ) -> Result<(), Error> {
-    config.unset_endpoint_override_for_peer(peer.ip);
+    config.unset_endpoint_override_for_peer(peer);
     config.save(config_dir, interface)?;
 
     Ok(())
