@@ -105,12 +105,26 @@ impl DataStore {
         };
 
         for new_peer in new_peers.iter() {
-            if let Some(existing_peer) = peers.iter_mut().find(|p| p.ip == new_peer.ip) {
-                if existing_peer.public_key != new_peer.public_key {
+            for existing_peer in peers.iter() {
+                if existing_peer.ip == new_peer.ip
+                    && existing_peer.public_key != new_peer.public_key
+                {
                     bail!("PINNING ERROR: New peer has same IP but different public key.");
-                } else {
-                    *existing_peer = new_peer.clone();
                 }
+                if existing_peer.public_key == new_peer.public_key
+                    && existing_peer.ip != new_peer.ip
+                {
+                    bail!("PINNING ERROR: New peer has same public key but different IP.");
+                }
+            }
+        }
+
+        for new_peer in new_peers.iter() {
+            if let Some(existing_peer) = peers
+                .iter_mut()
+                .find(|p| p.public_key == new_peer.public_key)
+            {
+                *existing_peer = new_peer.clone();
             } else {
                 peers.push(new_peer.clone());
             }
@@ -225,6 +239,30 @@ mod tests {
 
         // Should NOT work, since peer is unmodified.
         assert!(store.update_peers(&modified).is_err());
+    }
+
+    #[test]
+    fn test_pinning_public_key_to_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+
+        // The same public key reported at another IP is refused.
+        let mut moved = BASE_PEERS.clone();
+        moved[0].contents.ip = "10.0.0.2".parse().unwrap();
+        assert!(store.update_peers(&moved).is_err());
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // Other changes to a pinned peer are applied in place, and new peers are added.
+        let mut updated = BASE_PEERS.clone();
+        updated[0].contents.name = "renamed".parse().unwrap();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
+        new_peer.contents.public_key = "def".to_string();
+        updated.push(new_peer);
+        store.update_peers(&updated).unwrap();
+        assert_eq!(store.peers(), &updated[..]);
     }
 
     #[test]
