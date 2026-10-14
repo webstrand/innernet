@@ -7,7 +7,7 @@ use clap::{
 use ipnet::{IpNet, PrefixLenError};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{
     fmt::{self, Display, Formatter},
     io,
@@ -574,6 +574,7 @@ pub struct PeerContents {
     pub name: Hostname,
     pub ip: IpAddr,
     pub cidr_id: i64,
+    #[serde(deserialize_with = "deserialize_public_key")]
     pub public_key: String,
     pub endpoint: Option<Endpoint>,
     pub persistent_keepalive_interval: Option<u16>,
@@ -583,6 +584,63 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+}
+
+/// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
+/// canonical base64 encoding, so that public keys can be compared as strings.
+fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let public_key = String::deserialize(deserializer)?;
+    Key::from_base64(&public_key)
+        .map(|key| key.to_base64())
+        .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
+}
+
+/// What can be read of a peer that failed to deserialize, to identify it.
+#[derive(Deserialize)]
+struct PeerIdentity {
+    ip: Option<String>,
+    public_key: Option<String>,
+}
+
+/// A peer of a list, which may fail to deserialize without failing the list.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MaybePeer {
+    Valid(Peer),
+    Invalid(PeerIdentity),
+    Unrecognized(de::IgnoredAny),
+}
+
+/// The peers of `peers` that deserialized, and the canonical public keys of those that didn't but
+/// whose public key is valid, each of which is dropped with a warning.
+fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<Peer>, Vec<String>) {
+    let mut valid = vec![];
+    let mut invalid_keys = vec![];
+    for peer in peers {
+        match peer {
+            MaybePeer::Valid(peer) => valid.push(peer),
+            MaybePeer::Invalid(PeerIdentity { ip, public_key }) => {
+                log::warn!(
+                    "ignoring an invalid peer at IP {} with public key {}.",
+                    ip.as_deref().unwrap_or("[unknown]"),
+                    public_key.as_deref().unwrap_or("[unknown]"),
+                );
+                if let Some(key) = public_key.and_then(|key| Key::from_base64(&key).ok()) {
+                    invalid_keys.push(key.to_base64());
+                }
+            },
+            MaybePeer::Unrecognized(_) => log::warn!("ignoring an invalid peer."),
+        }
+    }
+    (valid, invalid_keys)
+}
+
+/// Deserializes a list of peers, dropping with a warning each peer that fails to deserialize, such
+/// as one with an invalid public key, so that one invalid peer doesn't cost the others.
+pub fn deserialize_valid_peers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Peer>, D::Error> {
+    Ok(split_valid_peers(Vec::<MaybePeer>::deserialize(deserializer)?).0)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -815,7 +873,7 @@ impl From<PeerDiff<'_>> for PeerConfigBuilder {
 
 /// This model is sent as a response to the /state endpoint, and is meant
 /// to include all the data a client needs to update its WireGuard interface.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct State {
     /// This list will be only the peers visible to the user requesting this
     /// information, not including disabled peers or peers from other CIDRs
@@ -825,6 +883,31 @@ pub struct State {
     /// At the moment, this is all CIDRs, regardless of whether the peer is
     /// eligible to communicate with them or not.
     pub cidrs: Vec<Cidr>,
+
+    /// The public keys of the peers that failed to deserialize, which the server nonetheless
+    /// reported. It is never sent.
+    #[serde(skip)]
+    pub invalid_peer_keys: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for State {
+    /// Deserializes a state, dropping with a warning each peer that fails to deserialize, but
+    /// keeping its public key in `invalid_peer_keys` if the key is valid.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            peers: Vec<MaybePeer>,
+            cidrs: Vec<Cidr>,
+        }
+
+        let Fields { peers, cidrs } = Fields::deserialize(deserializer)?;
+        let (peers, invalid_peer_keys) = split_valid_peers(peers);
+        Ok(Self {
+            peers,
+            cidrs,
+            invalid_peer_keys,
+        })
+    }
 }
 
 /// This model is sent as a response to the /capabilities endpoint.
@@ -1117,5 +1200,21 @@ mod tests {
             old: None,
             new: Some("2.2.2.2:2222".parse().unwrap()),
         }));
+    }
+
+    #[test]
+    fn test_deserialize_public_key() {
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        let deserialize = |public_key| {
+            deserialize_public_key(de::value::StrDeserializer::<de::value::Error>::new(
+                public_key,
+            ))
+        };
+
+        assert_eq!(deserialize(PUBKEY).unwrap(), PUBKEY);
+        // An unpadded encoding of the same key is normalized to the canonical encoding.
+        assert_eq!(deserialize(PUBKEY.trim_end_matches('=')).unwrap(), PUBKEY);
+        assert!(deserialize("abc").is_err());
+        assert!(deserialize("").is_err());
     }
 }

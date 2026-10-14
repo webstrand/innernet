@@ -1,7 +1,7 @@
 use anyhow::{bail, Error};
 use innernet_shared::{
-    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname, IoErrorContext, Peer,
-    PeerContents, State, WrappedIoError,
+    deserialize_valid_peers, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname,
+    IoErrorContext, Peer, PeerContents, State, WrappedIoError,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,11 @@ pub struct DataStore {
 #[serde(tag = "version")]
 enum Contents {
     #[serde(rename = "1")]
-    V1 { peers: Vec<Peer>, cidrs: Vec<Cidr> },
+    V1 {
+        #[serde(deserialize_with = "deserialize_valid_peers")]
+        peers: Vec<Peer>,
+        cidrs: Vec<Cidr>,
+    },
 }
 
 impl DataStore {
@@ -176,7 +180,7 @@ impl DataStore {
     /// Pinning prevents a compromised server from impersonating an existing peer, but not from
     /// adding a new peer under its control.
     pub fn update<'a>(&mut self, state: &'a State) -> Result<Vec<(&'a Peer, Error)>, Error> {
-        let dropped = self.update_peers(&state.peers);
+        let dropped = self.update_reported_peers(&state.peers, &state.invalid_peer_keys);
         self.set_cidrs(state.cidrs.clone());
         self.write()?;
 
@@ -216,7 +220,18 @@ impl DataStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<(&'a Peer, Error)> {
+        self.update_reported_peers(new_peers, &[])
+    }
+
+    /// Merges `new_peers` into the data store, dropping each that is invalid. `invalid_peer_keys`
+    /// are the public keys of the peers that the server reported but that failed to deserialize.
+    fn update_reported_peers<'a>(
+        &mut self,
+        new_peers: &'a [Peer],
+        invalid_peer_keys: &[String],
+    ) -> Vec<(&'a Peer, Error)> {
         let mut accepted = PeersIndex::default();
         let mut dropped = vec![];
         for new_peer in new_peers.iter() {
@@ -232,9 +247,9 @@ impl DataStore {
         // doesn't report is disabled. A dropped peer was reported, so the stored peer with its
         // public key keeps its record unchanged.
         for existing_peer in self.peers.peers.iter_mut() {
-            if !new_peers
-                .iter()
-                .any(|p| p.public_key == existing_peer.public_key)
+            let public_key = &existing_peer.public_key;
+            if !new_peers.iter().any(|p| &p.public_key == public_key)
+                && !invalid_peer_keys.contains(public_key)
             {
                 existing_peer.contents.is_disabled = true;
             }
@@ -296,8 +311,8 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<[Peer; 2], Error> {
             candidates: vec![],
         },
     };
-    // The server's key is compared as the string that the server reports, as the config holds it.
-    let server_key = config.server.public_key.clone();
+    // Public keys are compared in their canonical encoding, as a state's are deserialized.
+    let server_key = Key::from_base64(&config.server.public_key)?.to_base64();
     let own_key = Key::from_base64(&config.interface.private_key)?
         .get_public()
         .to_base64();
@@ -387,7 +402,7 @@ mod tests {
                 name: "blah".parse().unwrap(),
                 ip: "10.0.0.1".parse().unwrap(),
                 cidr_id: 1,
-                public_key: "abc".to_string(),
+                public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
                 endpoint: None,
                 is_admin: false,
                 is_disabled: false,
@@ -423,6 +438,7 @@ mod tests {
             .update(&State {
                 peers: BASE_PEERS.to_owned(),
                 cidrs: BASE_CIDRS.to_owned(),
+                invalid_peer_keys: vec![],
             })
             .unwrap();
     }
@@ -460,7 +476,8 @@ mod tests {
         assert_eq!(store.peers(), &*BASE_PEERS);
 
         let mut modified = BASE_PEERS.clone();
-        modified[0].contents.public_key = "foo".to_string();
+        modified[0].contents.public_key =
+            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
 
         // Should NOT work, since the IP is pinned to another public key. The pinned peer is
         // disabled, since it is absent from the update.
@@ -489,7 +506,7 @@ mod tests {
         updated[0].contents.name = "renamed".parse().unwrap();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         updated.push(new_peer);
         assert!(store.update_peers(&updated).is_empty());
         assert_eq!(store.peers(), &updated[..]);
@@ -534,7 +551,7 @@ mod tests {
         let mut outside = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "1.1.1.1".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         outside.push(new_peer);
         let dropped = store.update_peers(&outside);
         assert_eq!(dropped.len(), 1);
@@ -543,6 +560,7 @@ mod tests {
 
         // A stored peer outside the network is ignored when the data store is opened.
         let path = dir.path().join("outside.json");
+        outside[1].contents.public_key = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=".to_string();
         let contents = Contents::V1 {
             peers: outside.clone(),
             cidrs: vec![],
@@ -550,6 +568,60 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
         let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
         assert_eq!(store.peers(), &*BASE_PEERS);
+    }
+
+    #[test]
+    fn test_invalid_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+
+        // A peer with an invalid public key is dropped, and the other peers are kept, both from a
+        // stored data store and from a state.
+        let mut invalid = BASE_PEERS[0].clone();
+        invalid.contents.ip = "10.0.0.2".parse().unwrap();
+        invalid.contents.public_key = "abc".to_string();
+        let peers = [BASE_PEERS[0].clone(), invalid];
+        let contents = Contents::V1 {
+            peers: peers.to_vec(),
+            cidrs: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        let state = State {
+            peers: peers.to_vec(),
+            cidrs: vec![],
+            invalid_peer_keys: vec![],
+        };
+        let state: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(state.peers, *BASE_PEERS);
+        assert!(state.invalid_peer_keys.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_reported_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+
+        // A reported peer that fails to deserialize, but whose public key is valid, was still
+        // reported, so the stored peer with that key keeps its record rather than being disabled.
+        let mut entry = serde_json::to_value(&BASE_PEERS[0]).unwrap();
+        entry["ip"] = "not an IP".into();
+        let state: State =
+            serde_json::from_value(serde_json::json!({ "peers": [entry], "cidrs": [] })).unwrap();
+        assert!(state.peers.is_empty());
+        assert_eq!(state.invalid_peer_keys, [BASE_PEERS[0].public_key.clone()]);
+        assert!(store.update(&state).unwrap().is_empty());
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // A peer that isn't reported at all is disabled.
+        let state: State =
+            serde_json::from_value(serde_json::json!({ "peers": [], "cidrs": [] })).unwrap();
+        store.update(&state).unwrap();
+        assert_eq!(store.peers(), &disabled(&BASE_PEERS)[..]);
     }
 
     #[test]
@@ -563,9 +635,9 @@ mod tests {
         let mut same_ip = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "def".to_string();
+        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
-        new_peer.contents.public_key = "ghi".to_string();
+        new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
         assert_eq!(dropped.len(), 1);
@@ -576,7 +648,7 @@ mod tests {
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.3".parse().unwrap();
-        new_peer.contents.public_key = "jkl".to_string();
+        new_peer.contents.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
         new_peer.contents.ip = "10.0.0.4".parse().unwrap();
         same_public_key.push(new_peer);

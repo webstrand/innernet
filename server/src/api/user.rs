@@ -71,7 +71,11 @@ mod handlers {
             .map(|p| p.inner)
             .collect();
         inject_endpoints(&session, &mut peers);
-        json_response(State { peers, cidrs })
+        json_response(State {
+            peers,
+            cidrs,
+            invalid_peer_keys: vec![],
+        })
     }
 
     pub async fn capabilities() -> Result<Response<Body>, ServerError> {
