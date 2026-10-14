@@ -749,6 +749,12 @@ fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
         .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
 }
 
+/// The body of `POST /admin/peers/delegations/{id}`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DelegationContents {
+    pub prefix: IpNet,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Peer {
     pub id: i64,
@@ -1007,6 +1013,10 @@ pub struct ServerCapabilities {
     /// Whether the server supports `PUT /user/announcement`.
     #[serde(default)]
     pub signed_announcements: bool,
+    /// Whether the server supports `POST /admin/peers/delegations/{id}` and
+    /// `DELETE /admin/peers/delegations/{id}/{prefix}`.
+    #[serde(default)]
+    pub delegations: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

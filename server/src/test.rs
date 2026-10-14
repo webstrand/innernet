@@ -33,6 +33,9 @@ mod v4 {
     pub const USER1_PEER_IP: &str = "10.80.128.2";
     pub const USER2_PEER_IP: &str = "10.80.129.2";
     pub const EXPERIMENT_SUBCIDR_PEER_IP: &str = "10.81.0.1";
+    /// A prefix of the developer CIDR that no peer is at, and an address in it.
+    pub const DELEGATION: &str = "10.80.64.32/28";
+    pub const DELEGATED_IP: &str = "10.80.64.33";
 }
 #[cfg(not(feature = "v6-test"))]
 pub use v4::*;
@@ -56,6 +59,9 @@ mod v6 {
     pub const USER1_PEER_IP: &str = "fd00:1337::3:0:0:1";
     pub const USER2_PEER_IP: &str = "fd00:1337::3:0:0:2";
     pub const EXPERIMENT_SUBCIDR_PEER_IP: &str = "fd00:1337::4:0:0:1";
+    /// A prefix of the developer CIDR that no peer is at, and an address in it.
+    pub const DELEGATION: &str = "fd00:1337::2:0:3:0/112";
+    pub const DELEGATED_IP: &str = "fd00:1337::2:0:3:1";
 }
 #[cfg(feature = "v6-test")]
 pub use v6::*;
@@ -224,7 +230,7 @@ impl Server {
         .unwrap()
     }
 
-    fn base_request_builder(&self, verb: &str, path: &str) -> http::request::Builder {
+    pub fn base_request_builder(&self, verb: &str, path: &str) -> http::request::Builder {
         let path = if cfg!(feature = "v6-test") {
             format!("http://[{WG_MANAGE_PEER_IP}]{path}")
         } else {

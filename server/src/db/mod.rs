@@ -13,8 +13,9 @@ const ENDPOINT_CANDIDATES_VERSION: usize = 2;
 const NULLABLE_PEER_NAME_VERSION: usize = 3;
 const ANNOUNCEMENT_VERSION: usize = 4;
 const REQUIRES_TLS_VERSION: usize = 5;
+const DELEGATIONS_VERSION: usize = 6;
 
-pub const CURRENT_VERSION: usize = REQUIRES_TLS_VERSION;
+pub const CURRENT_VERSION: usize = DELEGATIONS_VERSION;
 
 pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     let old_version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -73,6 +74,10 @@ pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> 
         )?;
     }
 
+    if old_version < DELEGATIONS_VERSION {
+        conn.execute(peer::CREATE_DELEGATIONS_TABLE_SQL, params![])?;
+    }
+
     if old_version != CURRENT_VERSION {
         conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
         log::info!(
@@ -88,6 +93,8 @@ pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test;
+    use anyhow::Error;
 
     #[test]
     fn test_migrate_nullable_peer_name() -> Result<(), rusqlite::Error> {
@@ -113,6 +120,31 @@ mod tests {
         assert_eq!(name, "peer1");
         conn.execute(insert_nameless, params![])?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_migrate_to_delegations() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let conn = server.db.lock();
+
+        // A database from before delegations.
+        conn.execute("DROP TABLE delegations", params![])?;
+        conn.pragma_update(None, "user_version", REQUIRES_TLS_VERSION)?;
+        assert!(DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID).is_err());
+
+        auto_migrate(&conn)?;
+        let version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        assert_eq!(version, CURRENT_VERSION);
+
+        let mut peer = DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?;
+        assert!(peer.delegations.is_empty());
+        peer.add_delegation(&conn, test::DELEGATION.parse()?)?;
+        let peer = DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(peer.delegations, [test::DELEGATION.parse()?]);
+
+        // Migrating again changes nothing.
+        auto_migrate(&conn)?;
         Ok(())
     }
 }

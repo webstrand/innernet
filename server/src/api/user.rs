@@ -87,6 +87,7 @@ mod handlers {
             unspecified_ip_in_override_endpoint: true,
             permanent_peer_delete: true,
             signed_announcements: true,
+            delegations: true,
         };
 
         json_response(capabilities)
@@ -277,6 +278,47 @@ mod tests {
             &peer_names[..]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delegations_visible_with_peer() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let prefix: ipnet::IpNet = test::DELEGATION.parse()?;
+        {
+            let conn = server.db.lock();
+            DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?.add_delegation(&conn, prefix)?;
+        }
+
+        // Whoever sees the peer sees its delegations; its own address is unchanged.
+        for ip in [test::DEVELOPER1_PEER_IP, test::DEVELOPER2_PEER_IP] {
+            let res = server.request(ip, "GET", "/v1/user/state").await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let whole_body = hyper::body::aggregate(res).await?;
+            let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
+            let developer_1 = peers
+                .iter()
+                .find(|p| p.id == test::DEVELOPER1_PEER_ID)
+                .unwrap();
+            assert_eq!(developer_1.delegations, vec![prefix]);
+            assert_eq!(developer_1.ip.to_string(), test::DEVELOPER1_PEER_IP);
+            // Peers without delegations are sent as before.
+            let developer_2 = peers
+                .iter()
+                .find(|p| p.id == test::DEVELOPER2_PEER_ID)
+                .unwrap();
+            let json = serde_json::to_value(developer_2)?;
+            assert!(json.get("delegations").is_none());
+        }
+
+        // Others see neither.
+        let res = server
+            .request(test::USER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let whole_body = hyper::body::aggregate(res).await?;
+        let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
+        assert!(peers.iter().all(|p| p.delegations.is_empty()));
+        assert!(!peers.iter().any(|p| p.id == test::DEVELOPER1_PEER_ID));
         Ok(())
     }
 

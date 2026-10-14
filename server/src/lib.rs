@@ -9,7 +9,7 @@ use innernet_shared::{
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
     prompts, tls, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
     DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface,
-    IoErrorContext, NetworkOpts, PeerContents, RenameCidrOpts, RenamePeerOpts,
+    IoErrorContext, NetworkOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
     INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
@@ -184,6 +184,27 @@ fn open_database_connection(
     conn.pragma_update(None, "foreign_keys", 1)?;
     db::auto_migrate(&conn)?;
     Ok(conn)
+}
+
+/// Replaces a peer's allowed IPs on the interface after its delegations changed. Disabled peers
+/// aren't on the interface, and are left off it.
+pub(crate) fn update_allowed_ips(
+    peer: &Peer,
+    interface: &InterfaceName,
+    backend: Backend,
+) -> Result<(), ServerError> {
+    if peer.is_disabled {
+        return Ok(());
+    }
+    let public_key = Key::from_base64(&peer.public_key).map_err(|_| ServerError::WireGuard)?;
+    DeviceUpdate::new()
+        .add_peer(
+            PeerConfigBuilder::new(&public_key)
+                .replace_allowed_ips()
+                .add_allowed_ips(&peer.allowed_ips()),
+        )
+        .apply(interface, backend)
+        .map_err(|_| ServerError::WireGuard)
 }
 
 pub fn add_peer(
@@ -769,8 +790,9 @@ fn get_session(
         }
         .map_err(not_found_is_unauthorized)?;
 
-        // WireGuard only delivers the peer's traffic from its own IP, so anything else means
-        // the connection didn't come through the tunnel.
+        // WireGuard only delivers the peer's traffic from its own IP and its delegations, so
+        // anything else means the connection didn't come through the tunnel. Its delegations
+        // are routed to whatever is behind the peer, so only its own IP is the peer itself.
         if peer.ip != addr {
             log::warn!("refusing {} connecting from {addr}.", *peer);
             return Err(ServerError::Unauthorized);
@@ -905,6 +927,48 @@ mod tests {
             .request(test::USER1_PEER_IP, "GET", "/v1/admin/peers")
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delegated_ips_are_not_the_peer() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let developer1_key = {
+            let conn = server.db.lock();
+            let mut peer = DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?;
+            peer.add_delegation(&conn, test::DELEGATION.parse()?)?;
+            Key::from_base64(&peer.public_key)?
+        };
+        let request = || {
+            server
+                .base_request_builder("GET", "/v1/user/state")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Anything behind the peer sends from its delegations, so the peer's key over TLS
+        // doesn't make a request from there the peer's...
+        let res = server
+            .raw_request_as(test::DELEGATED_IP, Some(developer1_key.clone()), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!requires_tls(&server, test::DEVELOPER1_PEER_ID).await);
+
+        // ...nor does the address alone, in plain HTTP.
+        let res = server
+            .plain_request(test::DELEGATED_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // The peer itself is still recognized at its own IP, both ways.
+        let res = server
+            .plain_request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = server
+            .raw_request_as(test::DEVELOPER1_PEER_IP, Some(developer1_key), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
         Ok(())
     }
 

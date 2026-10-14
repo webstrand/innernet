@@ -1,9 +1,10 @@
 use super::DatabaseCidr;
 use crate::ServerError;
 use innernet_shared::{
-    announcement::SignedAnnouncement, xeddsa, IpNetExt, Peer, PeerContents,
+    announcement::SignedAnnouncement, check_delegation, xeddsa, IpNetExt, Peer, PeerContents,
     PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
+use ipnet::IpNet;
 use rusqlite::{params, types::Type, Connection};
 use std::{
     net::IpAddr,
@@ -32,6 +33,18 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
             ON DELETE RESTRICT
     )";
 
+/// Prefixes delegated to peers, routed to them besides their own IP. Each row is what the IPs of
+/// that many peers would be, and is deleted along with its peer.
+pub static CREATE_DELEGATIONS_TABLE_SQL: &str = "CREATE TABLE delegations (
+      id              INTEGER PRIMARY KEY,
+      peer_id         INTEGER NOT NULL,             /* The ID of the peer the prefix is delegated to.                   */
+      prefix          TEXT NOT NULL UNIQUE,         /* The aligned prefix, within the peer's CIDR (e.g. 10.42.1.32/28). */
+      FOREIGN KEY (peer_id)
+         REFERENCES peers (id)
+            ON UPDATE RESTRICT
+            ON DELETE CASCADE
+    )";
+
 pub static COLUMNS: &[&str] = &[
     "id",
     "name",
@@ -47,6 +60,20 @@ pub static COLUMNS: &[&str] = &[
     "announcement",
     "requires_tls",
 ];
+
+/// Selects a peer's delegations, space-separated, after its `COLUMNS`.
+static DELEGATIONS_COLUMN: &str =
+    "(SELECT group_concat(prefix, ' ') FROM delegations WHERE delegations.peer_id = peers.id)";
+
+/// The columns selected for a peer, from the `peers` table.
+fn select_columns() -> String {
+    COLUMNS
+        .iter()
+        .map(|col| format!("peers.{col}"))
+        .chain([DELEGATIONS_COLUMN.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[derive(Debug)]
 pub struct DatabasePeer {
@@ -73,7 +100,8 @@ impl DerefMut for DatabasePeer {
 
 impl DatabasePeer {
     pub fn create(conn: &Connection, contents: PeerContents) -> Result<Self, ServerError> {
-        // Announcements can only be made by the peer itself, through `set_announcement`.
+        // Announcements can only be made by the peer itself, through `set_announcement`, and
+        // delegations are added through `add_delegation`.
         let contents = PeerContents {
             announcement: None,
             observed_endpoint: None,
@@ -121,6 +149,14 @@ impl DatabasePeer {
                 "Peer IP {} is not unicast assignable in CIDR {}",
                 ip, cidr.cidr
             );
+            return Err(ServerError::InvalidQuery);
+        }
+
+        if let Some(delegation) = Self::list_delegations(conn)?
+            .into_iter()
+            .find(|delegation| delegation.contains(ip))
+        {
+            log::warn!("tried to add peer with IP inside delegation {delegation}.");
             return Err(ServerError::InvalidQuery);
         }
 
@@ -247,6 +283,62 @@ impl DatabasePeer {
         Ok(())
     }
 
+    /// Delegates `prefix` to the peer, after checking that it is what the IPs of that many new
+    /// peers in its CIDR could be.
+    pub fn add_delegation(&mut self, conn: &Connection, prefix: IpNet) -> Result<(), ServerError> {
+        let cidr = DatabaseCidr::get(conn, self.cidr_id)?;
+        let peers = Self::list(conn)?
+            .into_iter()
+            .map(|peer| peer.inner)
+            .collect::<Vec<_>>();
+        if let Err(e) = check_delegation(&prefix, &self.inner, &cidr.cidr, &peers) {
+            log::warn!("refusing to delegate to {}: {e}.", **self);
+            return Err(ServerError::InvalidQuery);
+        }
+
+        conn.execute(
+            "INSERT INTO delegations (peer_id, prefix) VALUES (?1, ?2)",
+            params![self.id, prefix.to_string()],
+        )?;
+        self.contents.delegations.push(prefix);
+        self.contents.delegations.sort_unstable();
+        Ok(())
+    }
+
+    /// Withdraws a prefix delegated to the peer, freeing it for reuse.
+    ///
+    /// Clients pin each delegation to the peer's public key like its IP, so clients that have
+    /// seen it refuse it elsewhere until they have forgotten the peer.
+    pub fn remove_delegation(
+        &mut self,
+        conn: &Connection,
+        prefix: IpNet,
+    ) -> Result<(), ServerError> {
+        match conn.execute(
+            "DELETE FROM delegations WHERE peer_id = ?1 AND prefix = ?2",
+            params![self.id, prefix.to_string()],
+        )? {
+            0 => Err(ServerError::NotFound),
+            _ => {
+                self.contents.delegations.retain(|d| *d != prefix);
+                Ok(())
+            },
+        }
+    }
+
+    /// All the prefixes delegated to any peer.
+    fn list_delegations(conn: &Connection) -> Result<Vec<IpNet>, ServerError> {
+        let mut stmt = conn.prepare_cached("SELECT prefix FROM delegations")?;
+        let prefixes = stmt
+            .query_map(params![], |row| {
+                row.get::<_, String>(0)?
+                    .parse()
+                    .map_err(|_| delegations_error(0))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(prefixes)
+    }
+
     pub fn disable(conn: &Connection, id: i64) -> Result<(), ServerError> {
         match conn.execute(
             "UPDATE peers SET is_disabled = 1 WHERE id = ?1",
@@ -257,10 +349,11 @@ impl DatabasePeer {
         }
     }
 
-    /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
+    /// Permanently deletes a disabled peer, freeing its name, IP and delegations for reuse.
     ///
     /// Clients pin each peer's (IP, public key) pair, so clients that have seen this peer
     /// refuse a new peer at the same IP until `innernet forget-peer` has been run on them.
+    /// The same goes for its delegations, which are deleted along with it.
     pub fn delete(conn: &Connection, id: i64) -> Result<(), ServerError> {
         match conn.execute(
             "DELETE FROM peers WHERE id = ?1 AND is_disabled = 1",
@@ -346,6 +439,14 @@ impl DatabasePeer {
 
         let requires_tls = row.get(12)?;
 
+        let mut delegations = row
+            .get::<_, Option<String>>(13)?
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|prefix| prefix.parse().map_err(|_| delegations_error(13)))
+            .collect::<Result<Vec<IpNet>, _>>()?;
+        delegations.sort_unstable();
+
         let persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
 
         let inner = Peer {
@@ -364,7 +465,7 @@ impl DatabasePeer {
                 candidates,
                 announcement,
                 observed_endpoint: None,
-                delegations: vec![],
+                delegations,
             },
         };
         Ok(Self {
@@ -375,7 +476,7 @@ impl DatabasePeer {
 
     pub fn get(conn: &Connection, id: i64) -> Result<Self, ServerError> {
         let result = conn.query_row(
-            &format!("SELECT {} FROM peers WHERE id = ?1", COLUMNS.join(", ")),
+            &format!("SELECT {} FROM peers WHERE id = ?1", select_columns()),
             params![id],
             Self::from_row,
         )?;
@@ -385,7 +486,7 @@ impl DatabasePeer {
 
     pub fn get_from_ip(conn: &Connection, ip: IpAddr) -> Result<Self, rusqlite::Error> {
         let result = conn.query_row(
-            &format!("SELECT {} FROM peers WHERE ip = ?1", COLUMNS.join(", ")),
+            &format!("SELECT {} FROM peers WHERE ip = ?1", select_columns()),
             params![ip.to_string()],
             Self::from_row,
         )?;
@@ -400,7 +501,7 @@ impl DatabasePeer {
         conn.query_row(
             &format!(
                 "SELECT {} FROM peers WHERE public_key = ?1",
-                COLUMNS.join(", ")
+                select_columns()
             ),
             params![public_key.to_base64()],
             Self::from_row,
@@ -439,7 +540,7 @@ impl DatabasePeer {
                 FROM peers
                 JOIN associated_subcidrs ON peers.cidr_id=associated_subcidrs.cidr_id
                 WHERE peers.is_disabled = 0 AND peers.is_redeemed = 1;",
-                COLUMNS.iter().map(|col| format!("peers.{col}")).collect::<Vec<_>>().join(", ")
+                select_columns()
             ),
         )?;
         let peers = stmt
@@ -449,7 +550,7 @@ impl DatabasePeer {
     }
 
     pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let mut stmt = conn.prepare_cached(&format!("SELECT {} FROM peers", COLUMNS.join(", ")))?;
+        let mut stmt = conn.prepare_cached(&format!("SELECT {} FROM peers", select_columns()))?;
         let peer_iter = stmt.query_map(params![], Self::from_row)?;
 
         Ok(peer_iter.collect::<Result<_, _>>()?)
@@ -458,13 +559,14 @@ impl DatabasePeer {
     pub fn list_enabled(conn: &Connection) -> Result<Vec<Self>, ServerError> {
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {} FROM peers WHERE peers.is_redeemed = 1 AND peers.is_disabled = 0",
-            COLUMNS.join(", ")
+            select_columns()
         ))?;
         let peer_iter = stmt.query_map(params![], Self::from_row)?;
 
         Ok(peer_iter.collect::<Result<_, _>>()?)
     }
 
+    /// Deletes expired invitations, along with any delegations made to them.
     pub fn delete_expired_invites(conn: &Connection) -> Result<usize, ServerError> {
         let unix_now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -477,4 +579,8 @@ impl DatabasePeer {
 
         Ok(deleted)
     }
+}
+
+fn delegations_error(column: usize) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(column, "delegations".into(), Type::Text)
 }
