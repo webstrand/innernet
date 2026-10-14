@@ -5,6 +5,7 @@ members = [
   "server",
   "client",
   "client-core",
+  "domain",
   "hostsfile",
   "shared",
   "publicip",
