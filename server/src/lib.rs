@@ -507,9 +507,10 @@ pub async fn serve(
         .map(|addr| SocketAddr::from((addr, config.listen_port)).into())
         .collect();
     let num_candidates = candidates.len();
+    let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
     let myself = peers
         .iter_mut()
-        .find(|peer| peer.ip == config.address)
+        .find(|peer| peer.public_key == public_key.to_base64())
         .expect("Couldn't find server peer in peer list.");
     myself.update(
         &conn,
@@ -524,7 +525,6 @@ pub async fn serve(
         num_candidates
     );
 
-    let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
     let db = Arc::new(Mutex::new(conn));
     let endpoints = spawn_endpoint_refresher(interface, network);
     spawn_expired_invite_sweeper(db.clone());
