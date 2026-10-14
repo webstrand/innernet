@@ -24,6 +24,7 @@ pub struct DataStore {
     /// The peers of the data store, indexed at runtime. The index is not persisted.
     peers: PeersIndex,
     cidrs: Vec<Cidr>,
+    withdrawn_delegations: Vec<WithdrawnDelegation>,
     /// The network of the interface, from its config. It is not persisted.
     network: IpNet,
 }
@@ -32,7 +33,81 @@ pub struct DataStore {
 #[serde(tag = "version")]
 enum Contents {
     #[serde(rename = "1")]
-    V1 { peers: Vec<Peer>, cidrs: Vec<Cidr> },
+    V1 {
+        peers: Vec<Peer>,
+        cidrs: Vec<Cidr>,
+        /// Prefixes once delegated to a peer and since withdrawn, still pinned to its key but no
+        /// longer routed to it. Absent from files written before delegations existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        withdrawn_delegations: Vec<WithdrawnDelegation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WithdrawnDelegation {
+    public_key: String,
+    prefix: IpNet,
+}
+
+/// A prefix pinned to the public key of the peer it was seen delegated to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationPin {
+    pub prefix: IpNet,
+    pub public_key: String,
+    /// Whether the server has withdrawn the delegation since, so that it is no longer routed.
+    pub withdrawn: bool,
+}
+
+/// A peer of a fetched state, or one of its delegations, that the data store refused.
+#[derive(Debug)]
+pub struct Refusal<'a> {
+    pub peer: &'a Peer,
+    /// The refused delegation, or `None` if the whole peer was dropped.
+    pub delegation: Option<IpNet>,
+    pub error: Error,
+}
+
+/// A prefix pinned to a public key: the IP of a peer, or a prefix delegated to it.
+struct Pin<'a> {
+    prefix: IpNet,
+    public_key: &'a str,
+    /// The name of the peer with the key, or the key if no peer has it.
+    name: &'a str,
+    is_delegation: bool,
+    /// Whether the pin is from the data store rather than from the state being merged.
+    previously_seen: bool,
+}
+
+impl Pin<'_> {
+    fn describe(&self) -> String {
+        let name = self.name;
+        match (self.is_delegation, self.previously_seen) {
+            (false, true) => format!(
+                "the IP ({}) of previously seen peer {name}",
+                self.prefix.addr()
+            ),
+            (false, false) => format!("the IP ({}) of peer {name}", self.prefix.addr()),
+            (true, true) => format!("{}, previously seen delegated to peer {name}", self.prefix),
+            (true, false) => format!("{}, delegated to peer {name}", self.prefix),
+        }
+    }
+}
+
+/// The IP of `peer` and its delegations, as pins.
+fn peer_pins(peer: &Peer, previously_seen: bool) -> impl Iterator<Item = Pin<'_>> {
+    std::iter::once((IpNet::from(peer.ip), false))
+        .chain(peer.delegations.iter().map(|prefix| (*prefix, true)))
+        .map(move |(prefix, is_delegation)| Pin {
+            prefix,
+            public_key: &peer.public_key,
+            name: peer.display_name(),
+            is_delegation,
+            previously_seen,
+        })
+}
+
+fn overlaps(a: &IpNet, b: &IpNet) -> bool {
+    a.contains(b) || b.contains(a)
 }
 
 impl DataStore {
@@ -55,12 +130,17 @@ impl DataStore {
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
-        let Contents::V1 { peers, cidrs } = match serde_json::from_str(&json) {
+        let Contents::V1 {
+            peers,
+            cidrs,
+            withdrawn_delegations,
+        } = match serde_json::from_str(&json) {
             Ok(contents) => contents,
             // Only an empty file, which fails at its very start, is a new data store.
             Err(e) if e.is_eof() && e.line() == 1 && e.column() == 0 => Contents::V1 {
                 peers: vec![],
                 cidrs: vec![],
+                withdrawn_delegations: vec![],
             },
             // Any other file that fails to parse is an error, since starting over would discard
             // its pins.
@@ -89,6 +169,7 @@ impl DataStore {
             file,
             peers: index,
             cidrs,
+            withdrawn_delegations,
             network: network.trunc(),
         })
     }
@@ -154,8 +235,8 @@ impl DataStore {
     }
 
     /// Merges the peers of `state` into the data store, replaces its CIDRs with those of `state`,
-    /// and writes it to disk. Returns the peers of `state` that were dropped, each with the reason
-    /// that it was dropped.
+    /// and writes it to disk. Returns the peers of `state` that were dropped and the delegations
+    /// that were removed from them, each with the reason that it was refused.
     ///
     /// A peer that the data store already holds is updated, a new peer is added, and a peer that
     /// is absent from `state` is disabled rather than deleted, so that its (IP, PublicKey) tuple
@@ -164,9 +245,15 @@ impl DataStore {
     /// `state`. A dropped peer is absent from the update, so a pinned peer that it conflicts with
     /// is disabled.
     ///
+    /// The prefixes delegated to a peer are pinned to its key likewise, and stay pinned once
+    /// withdrawn. A peer of `state` is also dropped if its IP lies within a prefix pinned to
+    /// another key. A delegation is removed from its peer if it lies outside the network of the
+    /// interface, or overlaps the IP or a delegation pinned to another key, or reported for
+    /// another key by an earlier peer of `state`.
+    ///
     /// Pinning prevents a compromised server from impersonating an existing peer, but not from
     /// adding a new peer under its control.
-    pub fn update<'a>(&mut self, state: &'a State) -> Result<Vec<(&'a Peer, Error)>, Error> {
+    pub fn update<'a>(&mut self, state: &'a State) -> Result<Vec<Refusal<'a>>, Error> {
         let dropped = self.update_peers(&state.peers);
         self.set_cidrs(state.cidrs.clone());
         self.write()?;
@@ -216,19 +303,116 @@ impl DataStore {
         if accepted.check(candidate) != PinStatus::New {
             bail!("IP or public key is shared with an earlier peer.");
         }
+        let ip = IpNet::from(candidate.ip);
+        if let Some(pin) = self
+            .overlapping_pin(candidate, &ip, accepted)
+            .filter(|pin| pin.is_delegation)
+        {
+            bail!(
+                "PINNING ERROR: New peer has IP {}, which overlaps {}.",
+                candidate.ip,
+                pin.describe()
+            );
+        }
 
         Ok(())
     }
 
-    fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<(&'a Peer, Error)> {
+    /// Validates that `prefix`, delegated to `candidate`, lies within the network of the interface
+    /// and overlaps no IP or delegation pinned to another key.
+    fn check_delegation(
+        &self,
+        candidate: &Peer,
+        prefix: &IpNet,
+        accepted: &PeersIndex,
+    ) -> Result<(), Error> {
+        if !self.network.contains(prefix) {
+            bail!("{prefix} is outside of the network {}.", self.network);
+        }
+        if let Some(pin) = self.overlapping_pin(candidate, prefix, accepted) {
+            bail!("PINNING ERROR: Delegation overlaps {}.", pin.describe());
+        }
+
+        Ok(())
+    }
+
+    /// The first pin that overlaps `prefix` and belongs to a key other than that of `candidate`.
+    /// Pins of the data store are searched before those of `accepted`, as the likelier
+    /// explanation.
+    fn overlapping_pin<'a>(
+        &'a self,
+        candidate: &Peer,
+        prefix: &IpNet,
+        accepted: &'a PeersIndex,
+    ) -> Option<Pin<'a>> {
+        let withdrawn = self.withdrawn_delegations.iter().map(|withdrawn| Pin {
+            prefix: withdrawn.prefix,
+            public_key: &withdrawn.public_key,
+            name: self
+                .peers
+                .get_by_public_key(&withdrawn.public_key)
+                .map_or(withdrawn.public_key.as_str(), |p| p.display_name()),
+            is_delegation: true,
+            previously_seen: true,
+        });
+        self.peers
+            .peers
+            .iter()
+            .flat_map(|peer| peer_pins(peer, true))
+            .chain(withdrawn)
+            .chain(
+                accepted
+                    .peers
+                    .iter()
+                    .flat_map(|peer| peer_pins(peer, false)),
+            )
+            .find(|pin| pin.public_key != candidate.public_key && overlaps(prefix, &pin.prefix))
+    }
+
+    fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<Refusal<'a>> {
         let mut accepted = PeersIndex::default();
-        let mut dropped = vec![];
+        let mut refused = vec![];
         for new_peer in new_peers.iter() {
-            match self.check(new_peer, &accepted) {
-                Ok(()) => {
-                    accepted.insert(new_peer.clone());
-                },
-                Err(e) => dropped.push((new_peer, e)),
+            if let Err(error) = self.check(new_peer, &accepted) {
+                refused.push(Refusal {
+                    peer: new_peer,
+                    delegation: None,
+                    error,
+                });
+                continue;
+            }
+            let mut peer = new_peer.clone();
+            peer.contents.delegations.retain(|prefix| {
+                match self.check_delegation(new_peer, prefix, &accepted) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        refused.push(Refusal {
+                            peer: new_peer,
+                            delegation: Some(*prefix),
+                            error,
+                        });
+                        false
+                    },
+                }
+            });
+            accepted.insert(peer);
+        }
+
+        // Withdrawn delegations stay pinned, but are no longer the peer's to route.
+        for new_peer in &accepted.peers {
+            let Some(existing_peer) = self.peers.get_by_public_key(&new_peer.public_key) else {
+                continue;
+            };
+            for prefix in &existing_peer.delegations {
+                let withdrawn = WithdrawnDelegation {
+                    public_key: new_peer.public_key.clone(),
+                    prefix: *prefix,
+                };
+                if !new_peer.delegations.contains(prefix)
+                    && !self.withdrawn_delegations.contains(&withdrawn)
+                {
+                    self.withdrawn_delegations.push(withdrawn);
+                }
             }
         }
 
@@ -241,20 +425,75 @@ impl DataStore {
             self.peers.insert(new_peer);
         }
 
-        dropped
+        // A prefix delegated again to the same peer is one of its current delegations again.
+        let peers = &self.peers;
+        self.withdrawn_delegations.retain(|withdrawn| {
+            !peers
+                .get_by_public_key(&withdrawn.public_key)
+                .is_some_and(|p| p.delegations.iter().any(|d| d.contains(&withdrawn.prefix)))
+        });
+
+        refused
     }
 
     /// Removes a peer from the store and persists the store to disk, un-pinning the peer's
-    /// (IP, PublicKey) tuple so that a new peer may be accepted at the same IP.
+    /// (IP, PublicKey) tuple and its delegations, withdrawn ones included, so that a new peer may
+    /// be accepted at the same IP or be delegated the same prefixes.
     ///
     /// If the peer still exists on the server, it is simply pinned again on the next fetch.
     pub fn forget_peer(&mut self, public_key: &str) -> Result<(), Error> {
         self.peers
             .remove(public_key)
             .ok_or_else(|| anyhow::anyhow!("peer not found in data store"))?;
+        self.withdrawn_delegations
+            .retain(|withdrawn| withdrawn.public_key != public_key);
         self.write()?;
 
         Ok(())
+    }
+
+    /// Every delegated prefix pinned in the store, current and withdrawn.
+    pub fn delegation_pins(&self) -> Vec<DelegationPin> {
+        let current = self.peers().iter().flat_map(|peer| {
+            peer.delegations.iter().map(|prefix| DelegationPin {
+                prefix: *prefix,
+                public_key: peer.public_key.clone(),
+                withdrawn: false,
+            })
+        });
+        let withdrawn = self
+            .withdrawn_delegations
+            .iter()
+            .map(|withdrawn| DelegationPin {
+                prefix: withdrawn.prefix,
+                public_key: withdrawn.public_key.clone(),
+                withdrawn: true,
+            });
+        current.chain(withdrawn).collect()
+    }
+
+    /// Un-pins a delegated prefix, whichever key it is pinned to, so that it may be accepted for
+    /// another peer, and persists the store to disk. Returns the pins removed.
+    ///
+    /// If the prefix is still delegated to the peer, it is simply pinned again on the next fetch.
+    pub fn forget_delegation(&mut self, prefix: &IpNet) -> Result<Vec<DelegationPin>, Error> {
+        let forgotten: Vec<_> = self
+            .delegation_pins()
+            .into_iter()
+            .filter(|pin| pin.prefix == *prefix)
+            .collect();
+        if forgotten.is_empty() {
+            bail!("{prefix} is not pinned as a delegation in the data store");
+        }
+
+        for peer in self.peers.peers.iter_mut() {
+            peer.contents.delegations.retain(|d| d != prefix);
+        }
+        self.withdrawn_delegations
+            .retain(|withdrawn| withdrawn.prefix != *prefix);
+        self.write()?;
+
+        Ok(forgotten)
     }
 
     pub fn peers(&self) -> &[Peer] {
@@ -273,6 +512,7 @@ impl DataStore {
         let contents = Contents::V1 {
             peers: self.peers.peers.clone(),
             cidrs: self.cidrs.clone(),
+            withdrawn_delegations: self.withdrawn_delegations.clone(),
         };
         self.file.rewind()?;
         self.file.set_len(0)?;
@@ -557,7 +797,7 @@ mod tests {
         outside.push(new_peer);
         let dropped = store.update_peers(&outside);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, &outside[1]);
+        assert_eq!(dropped[0].peer, &outside[1]);
         assert_eq!(store.peers(), &*BASE_PEERS);
     }
 
@@ -578,7 +818,7 @@ mod tests {
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, &same_ip[2]);
+        assert_eq!(dropped[0].peer, &same_ip[2]);
         assert_eq!(store.peers(), &same_ip[..2]);
 
         // Of two new peers with the same public key, the first is kept and the second dropped.
@@ -591,7 +831,7 @@ mod tests {
         same_public_key.push(new_peer);
         let dropped = store.update_peers(&same_public_key);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, &same_public_key[3]);
+        assert_eq!(dropped[0].peer, &same_public_key[3]);
         assert_eq!(store.peers(), &same_public_key[..3]);
     }
 
@@ -606,6 +846,7 @@ mod tests {
         let contents = Contents::V1 {
             peers: vec![BASE_PEERS[0].clone(), moved],
             cidrs: vec![],
+            withdrawn_delegations: vec![],
         };
         std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
         let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
@@ -709,5 +950,382 @@ mod tests {
         assert!(store.update_peers(&BASE_PEERS).is_empty());
         store.introduce(vec![introduced]);
         assert_eq!(store.peers(), &*BASE_PEERS);
+    }
+
+    /// A valid public key, distinct for each first letter of `label`.
+    fn key(label: &str) -> String {
+        Key([label.as_bytes()[0]; 32]).to_base64()
+    }
+
+    fn peer(name: &str, ip: &str, label: &str, delegations: &[&str]) -> Peer {
+        let mut peer = BASE_PEERS[0].clone();
+        peer.contents.name = Some(name.parse().unwrap());
+        peer.contents.ip = ip.parse().unwrap();
+        peer.contents.public_key = key(label);
+        peer.contents.delegations = delegations.iter().map(|d| d.parse().unwrap()).collect();
+        peer
+    }
+
+    /// A store that has seen peer1 (key "abc") delegated 10.0.0.32/28, and peer2 (key "def").
+    fn delegation_store(dir: &Path) -> DataStore {
+        let mut store =
+            DataStore::open_with_path(dir.join("peer_store.json"), *NETWORK, true).unwrap();
+        assert!(store
+            .update_peers(&[
+                peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28"]),
+                peer("peer2", "10.0.0.2", "def", &[]),
+            ])
+            .is_empty());
+        store.write().unwrap();
+        store
+    }
+
+    /// Asserts that `refused` holds a single refusal, of `delegation` of the peer `name` (or of
+    /// the peer itself if `None`), whose error contains `expected`.
+    fn assert_refused(refused: &[Refusal], name: &str, delegation: Option<&str>, expected: &str) {
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        let refusal = &refused[0];
+        assert_eq!(refusal.peer.display_name(), name);
+        assert_eq!(refusal.delegation, delegation.map(|d| d.parse().unwrap()));
+        let error = refusal.error.to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn test_moved_delegation_refused() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The prefix, or any overlapping one, delegated to another key is removed from it, and
+        // the peer kept.
+        for prefix in [
+            "10.0.0.32/28",
+            "10.0.0.40/29",
+            "10.0.0.32/27",
+            "10.0.0.33/32",
+        ] {
+            let mut store = delegation_store(dir.path());
+            let moved = [
+                peer("peer1", "10.0.0.1", "abc", &[]),
+                peer("peer2", "10.0.0.2", "def", &[prefix]),
+            ];
+            assert_refused(
+                &store.update_peers(&moved),
+                "peer2",
+                Some(prefix),
+                "PINNING ERROR: Delegation overlaps 10.0.0.32/28, previously seen delegated to \
+                 peer peer1.",
+            );
+            assert_eq!(store.peers()[1], peer("peer2", "10.0.0.2", "def", &[]));
+        }
+
+        // A new key at an address inside it is dropped.
+        let mut store = delegation_store(dir.path());
+        let inside = [
+            peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28"]),
+            peer("peer2", "10.0.0.2", "def", &[]),
+            peer("peer3", "10.0.0.34", "ghi", &[]),
+        ];
+        assert_refused(
+            &store.update_peers(&inside),
+            "peer3",
+            None,
+            "PINNING ERROR: New peer has IP 10.0.0.34, which overlaps 10.0.0.32/28, previously \
+             seen delegated to peer peer1.",
+        );
+        assert_eq!(store.peers(), &inside[..2]);
+
+        // Splitting it between delegations of the same key is accepted.
+        let split = [
+            peer(
+                "peer1",
+                "10.0.0.1",
+                "abc",
+                &["10.0.0.32/29", "10.0.0.40/29"],
+            ),
+            peer("peer2", "10.0.0.2", "def", &[]),
+        ];
+        assert!(store.update_peers(&split).is_empty());
+        assert_eq!(store.peers(), &split);
+    }
+
+    #[test]
+    fn test_delegation_over_pinned_ip_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+
+        for prefix in ["10.0.0.2/32", "10.0.0.0/30"] {
+            let peers = [
+                peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28", prefix]),
+                peer("peer2", "10.0.0.2", "def", &[]),
+            ];
+            assert_refused(
+                &store.update_peers(&peers),
+                "peer1",
+                Some(prefix),
+                "PINNING ERROR: Delegation overlaps the IP (10.0.0.2) of previously seen peer \
+                 peer2.",
+            );
+            assert_eq!(
+                store.peers()[0].delegations,
+                ["10.0.0.32/28".parse().unwrap()]
+            );
+        }
+
+        // Also once the peer at that IP is no longer reported.
+        let peers = [peer(
+            "peer1",
+            "10.0.0.1",
+            "abc",
+            &["10.0.0.32/28", "10.0.0.2/32"],
+        )];
+        assert_refused(
+            &store.update_peers(&peers),
+            "peer1",
+            Some("10.0.0.2/32"),
+            "the IP (10.0.0.2) of previously seen peer peer2",
+        );
+
+        // A delegation that covers the peer's own IP is the server's to refuse. Pins concern only
+        // other keys.
+        let own = [peer("peer1", "10.0.0.1", "abc", &["10.0.0.0/31"])];
+        assert!(store.update_peers(&own).is_empty());
+    }
+
+    #[test]
+    fn test_delegation_outside_network_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+
+        let peers = [
+            peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28", "10.1.0.0/24"]),
+            peer("peer2", "10.0.0.2", "def", &[]),
+        ];
+        assert_refused(
+            &store.update_peers(&peers),
+            "peer1",
+            Some("10.1.0.0/24"),
+            "outside of the network",
+        );
+    }
+
+    #[test]
+    fn test_overlap_within_fetched_peers_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+
+        // The later delegation is removed.
+        let peers = [
+            peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28"]),
+            peer("peer2", "10.0.0.2", "def", &[]),
+            peer("peer3", "10.0.0.3", "ghi", &["10.0.0.64/28"]),
+            peer("peer4", "10.0.0.4", "jkl", &["10.0.0.72/29"]),
+        ];
+        assert_refused(
+            &store.update_peers(&peers),
+            "peer4",
+            Some("10.0.0.72/29"),
+            "PINNING ERROR: Delegation overlaps 10.0.0.64/28, delegated to peer peer3.",
+        );
+
+        // A later peer inside an earlier delegation is dropped.
+        let peers = [
+            peer("peer3", "10.0.0.3", "ghi", &["10.0.0.64/28"]),
+            peer("peer5", "10.0.0.66", "mno", &[]),
+        ];
+        assert_refused(
+            &store.update_peers(&peers),
+            "peer5",
+            None,
+            "10.0.0.64/28, previously seen delegated to peer peer3",
+        );
+
+        // An earlier peer inside a later delegation removes the delegation.
+        let mut store = delegation_store(dir.path());
+        let peers = [
+            peer("peer6", "10.0.0.66", "pqr", &[]),
+            peer("peer3", "10.0.0.3", "ghi", &["10.0.0.64/28"]),
+        ];
+        assert_refused(
+            &store.update_peers(&peers),
+            "peer3",
+            Some("10.0.0.64/28"),
+            "the IP (10.0.0.66) of peer peer6",
+        );
+    }
+
+    #[test]
+    fn test_withdrawn_delegation_stays_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+
+        let withdrawn = [
+            peer("peer1", "10.0.0.1", "abc", &[]),
+            peer("peer2", "10.0.0.2", "def", &[]),
+        ];
+        store
+            .update(&State {
+                peers: withdrawn.to_vec(),
+                cidrs: BASE_CIDRS.to_owned(),
+            })
+            .unwrap();
+
+        // The stored peers, which configure the interface, no longer route it.
+        assert_eq!(store.peers(), &withdrawn);
+        assert_eq!(
+            store.delegation_pins(),
+            [DelegationPin {
+                prefix: "10.0.0.32/28".parse().unwrap(),
+                public_key: key("abc"),
+                withdrawn: true,
+            }]
+        );
+
+        // But it stays pinned, also once reloaded.
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let reassigned = [
+            peer("peer1", "10.0.0.1", "abc", &[]),
+            peer("peer2", "10.0.0.2", "def", &["10.0.0.32/28"]),
+        ];
+        assert_refused(
+            &store.update_peers(&reassigned),
+            "peer2",
+            Some("10.0.0.32/28"),
+            "PINNING ERROR: Delegation overlaps 10.0.0.32/28, previously seen delegated to peer \
+             peer1.",
+        );
+
+        // Delegated again to the same key, it is routed again and no longer withdrawn.
+        let redelegated = [
+            peer("peer1", "10.0.0.1", "abc", &["10.0.0.32/28"]),
+            peer("peer2", "10.0.0.2", "def", &[]),
+        ];
+        assert!(store.update_peers(&redelegated).is_empty());
+        assert_eq!(store.peers(), &redelegated);
+        assert_eq!(store.withdrawn_delegations, []);
+        assert!(!store.delegation_pins()[0].withdrawn);
+    }
+
+    #[test]
+    fn test_unreported_peer_keeps_delegations_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+
+        assert!(store
+            .update_peers(&[peer("peer2", "10.0.0.2", "def", &[])])
+            .is_empty());
+        assert!(store.peers()[0].is_disabled);
+        let reassigned = [peer("peer2", "10.0.0.2", "def", &["10.0.0.32/28"])];
+        assert_refused(
+            &store.update_peers(&reassigned),
+            "peer2",
+            Some("10.0.0.32/28"),
+            "previously seen delegated to peer peer1",
+        );
+    }
+
+    #[test]
+    fn test_forget_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+        assert!(store
+            .update_peers(&[
+                peer("peer1", "10.0.0.1", "abc", &["10.0.0.64/28"]),
+                peer("peer2", "10.0.0.2", "def", &[]),
+            ])
+            .is_empty());
+
+        let unknown = "10.0.0.32/29".parse().unwrap();
+        assert!(store.forget_delegation(&unknown).is_err());
+        let prefix = "10.0.0.32/28".parse().unwrap();
+        assert_eq!(
+            store.forget_delegation(&prefix).unwrap(),
+            [DelegationPin {
+                prefix,
+                public_key: key("abc"),
+                withdrawn: true,
+            }]
+        );
+        assert!(store.forget_delegation(&prefix).is_err());
+
+        // The forgotten state is persisted, and the prefix may go to another key, whereas the
+        // other delegation stays pinned.
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let reassigned = [
+            peer("peer1", "10.0.0.1", "abc", &["10.0.0.64/28"]),
+            peer(
+                "peer2",
+                "10.0.0.2",
+                "def",
+                &["10.0.0.32/28", "10.0.0.64/28"],
+            ),
+        ];
+        assert_refused(
+            &store.update_peers(&reassigned),
+            "peer2",
+            Some("10.0.0.64/28"),
+            "previously seen delegated to peer peer1",
+        );
+        assert_eq!(
+            store.peers()[1].delegations,
+            ["10.0.0.32/28".parse().unwrap()]
+        );
+
+        // A current delegation is forgotten too, and pinned again when next seen.
+        let prefix = "10.0.0.64/28".parse().unwrap();
+        assert!(!store.forget_delegation(&prefix).unwrap()[0].withdrawn);
+        assert_eq!(store.peers()[0].delegations, []);
+        assert!(store.update_peers(&reassigned[..1]).is_empty());
+        assert_eq!(store.peers()[0], reassigned[0]);
+        assert_eq!(store.withdrawn_delegations, []);
+    }
+
+    #[test]
+    fn test_forget_peer_forgets_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = delegation_store(dir.path());
+        assert!(store
+            .update_peers(&[
+                peer("peer1", "10.0.0.1", "abc", &["10.0.0.64/28"]),
+                peer("peer2", "10.0.0.2", "def", &[]),
+            ])
+            .is_empty());
+        assert_eq!(store.delegation_pins().len(), 2);
+
+        store.forget_peer(&key("abc")).unwrap();
+        assert_eq!(store.delegation_pins(), []);
+        let reassigned = [peer(
+            "peer2",
+            "10.0.0.2",
+            "def",
+            &["10.0.0.32/28", "10.0.0.64/28", "10.0.0.1/32"],
+        )];
+        assert!(store.update_peers(&reassigned).is_empty());
+    }
+
+    #[test]
+    fn test_loads_data_store_without_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+        setup_basic_store(dir.path());
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("delegations"), "{json}");
+        let mut store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // A withdrawn delegation is written, and read back.
+        let mut delegated = BASE_PEERS[0].clone();
+        delegated.contents.delegations = vec!["10.0.0.32/28".parse().unwrap()];
+        assert!(store.update_peers(&[delegated]).is_empty());
+        store
+            .update(&State {
+                peers: BASE_PEERS.to_owned(),
+                cidrs: BASE_CIDRS.to_owned(),
+            })
+            .unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
+        assert_eq!(store.delegation_pins().len(), 1);
+        assert!(store.delegation_pins()[0].withdrawn);
     }
 }

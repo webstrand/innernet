@@ -15,10 +15,10 @@ use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
     AddDeleteAssociationOpts, AddDeleteDelegationOpts, AddPeerOpts, Association,
     AssociationContents, Cidr, CidrTree, DelegationContents, DeleteCidrOpts, DeleteForgetPeerOpts,
-    EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
-    IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
-    WrappedIoError,
+    EnableDisablePeerOpts, Endpoint, EndpointContents, ForgetDelegationOpts, HostsOpts,
+    InstallOpts, Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts,
+    OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts,
+    ServerCapabilities, WrappedIoError,
 };
 use std::{
     fs::File,
@@ -235,10 +235,11 @@ enum Command {
         sub_opts: DeleteForgetPeerOpts,
     },
 
-    /// Forgets a deleted peer, so that its IP may be reused
+    /// Forgets a deleted peer, so that its IP and delegations may be reused
     ///
-    /// This client pins every peer's public key to its IP, and refuses a new peer at the
-    /// same IP. This is a local-only operation, and must be run on each client.
+    /// This client pins every peer's public key to its IP and delegations, and refuses a new
+    /// peer at the same IP or in the same delegations. This is a local-only operation, and
+    /// must be run on each client.
     ForgetPeer {
         interface: Interface,
 
@@ -262,12 +263,24 @@ enum Command {
     /// Withdraw a prefix delegated to a peer, freeing it for reuse
     ///
     /// Clients that have seen the delegation accept it for another peer only after
-    /// `innernet forget-peer` has been run on them.
+    /// `innernet forget-delegation` has been run on them.
     DeleteDelegation {
         interface: Interface,
 
         #[clap(flatten)]
         sub_opts: AddDeleteDelegationOpts,
+    },
+
+    /// Forgets a withdrawn delegation, so that it may be delegated to another peer
+    ///
+    /// This client pins every delegated prefix to the public key of the peer it was delegated
+    /// to, also once withdrawn, and refuses it for another peer. This is a local-only
+    /// operation, and must be run on each client.
+    ForgetDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: ForgetDelegationOpts,
     },
 
     /// Add an association between CIDRs
@@ -741,13 +754,52 @@ fn forget_peer(
     if let Some(peer) = prompts::delete_or_forget_peer(&peers[..], &sub_opts, "forget")? {
         data_store.forget_peer(&peer.public_key)?;
         println!(
-            "Peer {} ({}) forgotten. The interface is updated on the next `innernet fetch {}`.",
+            "Peer {} ({}) forgotten, with its delegations. The interface is updated on the next \
+             `innernet fetch {}`.",
             peer.display_name().yellow(),
             peer.ip,
             interface
         );
     } else {
         log::info!("exiting without forgetting peer.");
+    }
+
+    Ok(())
+}
+
+fn forget_delegation(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: ForgetDelegationOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let mut data_store = DataStore::open(&opts.data_dir, interface, &config)?;
+    let pins: Vec<_> = data_store
+        .delegation_pins()
+        .into_iter()
+        .map(|pin| {
+            let name = data_store
+                .peers()
+                .iter()
+                .find(|p| p.public_key == pin.public_key)
+                .map_or(pin.public_key.clone(), |p| p.display_name().to_string());
+            let withdrawn = if pin.withdrawn { ", withdrawn" } else { "" };
+            (
+                pin.prefix,
+                format!("{} (peer {}{})", pin.prefix, name, withdrawn),
+            )
+        })
+        .collect();
+
+    if let Some(prefix) = prompts::forget_delegation(&pins, &sub_opts)? {
+        data_store.forget_delegation(&prefix)?;
+        println!(
+            "Delegation {} forgotten. If it is still delegated, it is pinned again on the next \
+             `innernet fetch {}`.",
+            prefix, interface
+        );
+    } else {
+        log::info!("exiting without forgetting delegation.");
     }
 
     Ok(())
@@ -807,14 +859,24 @@ fn delete_delegation(
             &format!("/admin/peers/delegations/{}/{}", peer.id, prefix),
         )?;
 
+        // This client never sees the delegation again, so it is un-pinned here right away.
+        let mut data_store = DataStore::open(&opts.data_dir, interface, &config)?;
+        if data_store
+            .delegation_pins()
+            .iter()
+            .any(|pin| pin.prefix == prefix)
+        {
+            data_store.forget_delegation(&prefix)?;
+        }
+
         eprintdoc!(
             "
             {prefix} withdrawn from peer {name}. It can now be delegated again.
 
-            Clients that have seen it, this one included, pin it to {name}'s public key, and
-            refuse it for another peer until the following command has been run on each of them:
+            Other clients that have seen it pin it to {name}'s public key, and refuse it for
+            another peer until the following command has been run on each of them:
 
-                innernet forget-peer {interface} --name {name}
+                innernet forget-delegation {interface} --prefix {prefix}
             ",
             name = peer.display_name().yellow(),
         );
@@ -1432,6 +1494,10 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => delete_delegation(&interface, opts, sub_opts)?,
+        Command::ForgetDelegation {
+            interface,
+            sub_opts,
+        } => forget_delegation(&interface, opts, sub_opts)?,
         Command::AddAssociation {
             interface,
             sub_opts,

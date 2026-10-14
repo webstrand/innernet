@@ -459,6 +459,17 @@ pub struct AddDeleteDelegationOpts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ForgetDelegationOpts {
+    /// The delegated prefix to forget (eg. '10.42.1.32/28')
+    #[clap(long)]
+    pub prefix: Option<IpNet>,
+
+    /// Bypasses confirmation
+    #[clap(long, requires("prefix"))]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct AddCidrOpts {
     /// The CIDR name (eg. 'engineers')
     #[clap(long)]

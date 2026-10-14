@@ -127,7 +127,7 @@ enum Command {
     /// Withdraw a prefix delegated to a peer, freeing it for reuse.
     ///
     /// Clients that have seen the delegation accept it for another peer only after
-    /// `innernet forget-peer` has been run on them.
+    /// `innernet forget-delegation` has been run on them.
     DeleteDelegation {
         interface: Interface,
 

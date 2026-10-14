@@ -247,14 +247,23 @@ pub fn fetch(
             nat.max_clock_ahead.clone().into(),
         );
 
-        let dropped = store.update(state).context(interface.to_string())?;
-        for (peer, e) in dropped {
-            log::warn!(
-                "{}: dropping peer {}: {}",
-                interface.as_str_lossy().yellow(),
-                peer.display_name(),
-                e
-            );
+        let refused = store.update(state).context(interface.to_string())?;
+        for refusal in refused {
+            match refusal.delegation {
+                Some(prefix) => log::warn!(
+                    "{}: dropping delegation {} of peer {}: {}",
+                    interface.as_str_lossy().yellow(),
+                    prefix,
+                    refusal.peer.display_name(),
+                    refusal.error
+                ),
+                None => log::warn!(
+                    "{}: dropping peer {}: {}",
+                    interface.as_str_lossy().yellow(),
+                    refusal.peer.display_name(),
+                    refusal.error
+                ),
+            }
         }
     }
 

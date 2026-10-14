@@ -2,8 +2,8 @@ use crate::{
     check_delegation, interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts,
     AddDeleteAssociationOpts, AddDeleteDelegationOpts, AddPeerOpts, Association, Cidr,
     CidrContents, CidrTree, DeleteCidrOpts, DeleteForgetPeerOpts, EnableDisablePeerOpts, Endpoint,
-    Error, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts,
-    RenamePeerOpts,
+    Error, ForgetDelegationOpts, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, Peer,
+    PeerContents, RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -628,6 +628,34 @@ pub fn delete_delegation(
             ))?
         {
             Some((peer.clone(), prefix))
+        } else {
+            None
+        },
+    )
+}
+
+/// Selects a delegated prefix to forget, among `pins`, the prefixes pinned on a client with a
+/// description of each. Returns the prefix.
+pub fn forget_delegation(
+    pins: &[(IpNet, String)],
+    args: &ForgetDelegationOpts,
+) -> Result<Option<IpNet>, Error> {
+    let (prefix, description) = if let Some(prefix) = args.prefix {
+        pins.iter()
+            .find(|(pinned, _)| *pinned == prefix)
+            .ok_or_else(|| anyhow!("{} is not a pinned delegation", prefix))?
+    } else {
+        if pins.is_empty() {
+            bail!("No delegations are pinned.");
+        }
+        let selection: Vec<_> = pins.iter().map(|(_, description)| description).collect();
+        let (index, _) = select("Delegation to forget", &selection)?;
+        &pins[index]
+    };
+
+    Ok(
+        if args.yes || confirm(&format!("Forget delegation {description}?"))? {
+            Some(*prefix)
         } else {
             None
         },

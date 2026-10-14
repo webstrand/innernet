@@ -426,7 +426,7 @@ pub fn delete_delegation(
             Clients that have seen it pin it to {name}'s public key, and refuse it for
             another peer until the following command has been run on each of them:
 
-                innernet forget-peer {interface} --name {name}
+                innernet forget-delegation {interface} --prefix {prefix}
             ",
             name = peer.display_name().yellow(),
         );
