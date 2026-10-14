@@ -819,6 +819,7 @@ dependencies = [
  "dialoguer",
  "hostsfile",
  "indoc",
+ "innernet-domain",
  "innernet-publicip",
  "ipnet",
  "libc",

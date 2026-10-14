@@ -159,16 +159,14 @@ pub fn update_hosts_file(
     let mut hosts_builder = HostsBuilder::new(format!("innernet {interface}"));
     for peer in peers {
         let peer = peer.as_ref();
-        let peer_hostname = if let Some(suffix) = &opts.host_suffix {
-            if suffix.is_empty() {
-                peer.contents.name.to_string()
-            } else {
-                format!("{}.{}", peer.contents.name, suffix)
-            }
-        } else {
-            format!("{}.{}.wg", peer.contents.name, interface)
-        };
-        hosts_builder.add_hostname(peer.contents.ip, peer_hostname);
+        match peer_hostname(interface, opts.host_suffix.as_deref(), &peer.contents.name) {
+            Some(peer_hostname) => hosts_builder.add_hostname(peer.contents.ip, peer_hostname),
+            None => log::warn!(
+                "omitting peer {} from the hosts file, since without a host suffix its name is \
+                 not a single-label domain.",
+                peer.contents.name
+            ),
+        }
     }
     match hosts_builder
         .write_to(opts.hosts_path.as_path())
@@ -185,4 +183,45 @@ pub fn update_hosts_file(
     };
 
     Ok(())
+}
+
+/// The hostname of the peer `name` in the hosts file, or `None` if the peer must be omitted.
+///
+/// With a suffix, which the operator chooses, the hostname is the peer name followed by the
+/// suffix. Without a suffix, the hostname is the peer name alone, which
+/// [`innernet_domain::is_canonical_domain_label`] must accept, so that it does not read as an
+/// address.
+fn peer_hostname(
+    interface: &InterfaceName,
+    host_suffix: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    match host_suffix {
+        None => Some(format!("{name}.{interface}.wg")),
+        Some("") => innernet_domain::is_canonical_domain_label(name).then(|| name.to_string()),
+        Some(suffix) => Some(format!("{name}.{suffix}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_hostname() {
+        let interface: InterfaceName = "wg0".parse().unwrap();
+        let hostname = |suffix, name| peer_hostname(&interface, suffix, name);
+
+        // A name that a suffix follows may be a number.
+        assert_eq!(hostname(None, "08").as_deref(), Some("08.wg0.wg"));
+        assert_eq!(
+            hostname(Some("evilnet"), "08").as_deref(),
+            Some("08.evilnet")
+        );
+
+        // Without a suffix, the name must not be a number.
+        assert_eq!(hostname(Some(""), "peer-1").as_deref(), Some("peer-1"));
+        assert_eq!(hostname(Some(""), "08"), None);
+        assert_eq!(hostname(Some(""), "0x7f000001"), None);
+    }
 }

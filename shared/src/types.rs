@@ -880,7 +880,14 @@ impl From<Timestring> for Duration {
     }
 }
 
+/// The name of a peer. The hosts file names the peer by this name, followed by the host suffix
+/// unless the operator sets an empty one.
+///
+/// A parsed name, such as one from the command line, must match [`Hostname::is_valid`]. A
+/// deserialized name, such as one from the coordination server or the data store, must be a
+/// single canonical label. Either may be a number, since a suffix usually follows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Hostname(String);
 
 /// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
@@ -901,6 +908,18 @@ impl FromStr for Hostname {
             Ok(Self(name.to_string()))
         } else {
             Err("invalid hostname string (only alphanumeric with dashes)")
+        }
+    }
+}
+
+impl TryFrom<String> for Hostname {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if innernet_domain::is_canonical_label(&name) {
+            Ok(Self(name))
+        } else {
+            Err(format!("invalid hostname {name:?}"))
         }
     }
 }
@@ -1110,5 +1129,20 @@ mod tests {
             old: None,
             new: Some("2.2.2.2:2222".parse().unwrap()),
         }));
+    }
+
+    #[test]
+    fn test_deserialize_hostname() {
+        use serde::de::value::{Error, StrDeserializer};
+        let deserialize = |name| Hostname::deserialize(StrDeserializer::<Error>::new(name));
+
+        assert_eq!(*deserialize("peer-1").unwrap(), *"peer-1");
+        // A suffix usually follows a peer name, so it may be a number.
+        assert_eq!(*deserialize("08").unwrap(), *"08");
+        assert!(deserialize("").is_err());
+        assert!(deserialize("a.b").is_err());
+        assert!(deserialize("Peer").is_err());
+        assert!(deserialize("peer\n10.0.0.1 example.com").is_err());
+        assert!(deserialize(&"a".repeat(64)).is_err());
     }
 }
