@@ -633,6 +633,7 @@ mod tests {
                     candidates: vec!["203.0.113.66:2".parse().unwrap()],
                     announcement: None,
                     observed_endpoint: Some("198.51.100.7:40000".parse().unwrap()),
+                    delegations: vec![],
                 },
             };
             Self {

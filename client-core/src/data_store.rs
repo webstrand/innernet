@@ -308,6 +308,7 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<Vec<Peer>, InvalidKey> {
             candidates: vec![],
             announcement: None,
             observed_endpoint: None,
+            delegations: vec![],
         },
     };
     let private_key = Key::from_base64(&config.interface.private_key)?;
@@ -440,6 +441,7 @@ mod tests {
                 candidates: vec![],
                 announcement: None,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         }]
     });

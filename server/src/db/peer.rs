@@ -77,6 +77,7 @@ impl DatabasePeer {
         let contents = PeerContents {
             announcement: None,
             observed_endpoint: None,
+            delegations: vec![],
             ..contents
         };
         let PeerContents {
@@ -363,6 +364,7 @@ impl DatabasePeer {
                 candidates,
                 announcement,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         };
         Ok(Self {

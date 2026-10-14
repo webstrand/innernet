@@ -1,5 +1,5 @@
-use crate::{announcement::SignedAnnouncement, wg::PeerInfoExt, DEFAULT_HOSTS_PATH};
-use anyhow::{anyhow, Error};
+use crate::{announcement::SignedAnnouncement, wg::PeerInfoExt, IpNetExt, DEFAULT_HOSTS_PATH};
+use anyhow::{anyhow, bail, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
     Args,
@@ -655,6 +655,65 @@ pub struct PeerContents {
     /// recipients only use if the peer's announcement allows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_endpoint: Option<Endpoint>,
+    /// Aligned prefixes of the peer's CIDR routed to the peer besides `ip`, as if each of their
+    /// addresses were a peer with the same key. `ip` remains the peer's own address, the only
+    /// one by which it is known to the server and its name resolves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<IpNet>,
+}
+
+impl PeerContents {
+    /// The prefixes WireGuard routes to the peer: its own address, then its delegations.
+    pub fn allowed_ips(&self) -> Vec<AllowedIp> {
+        std::iter::once(IpNet::from(self.ip))
+            .chain(self.delegations.iter().copied())
+            .map(|net| AllowedIp {
+                address: net.network(),
+                cidr: net.prefix_len(),
+            })
+            .collect()
+    }
+}
+
+/// Checks that `prefix` can be delegated to `peer`, whose CIDR is `cidr`, given all the peers of
+/// the network, disabled and unredeemed ones included since they still hold their addresses.
+///
+/// A delegation must be what the addresses of that many peers in `cidr` would be: an aligned
+/// prefix of assignable addresses that no peer's address or other delegation overlaps.
+pub fn check_delegation(
+    prefix: &IpNet,
+    peer: &Peer,
+    cidr: &IpNet,
+    peers: &[Peer],
+) -> Result<(), Error> {
+    if prefix.trunc() != *prefix {
+        bail!(
+            "{prefix} is not aligned, its address must be {}",
+            prefix.trunc()
+        );
+    }
+    if !cidr.contains(prefix) {
+        bail!("{prefix} is outside {}'s CIDR {cidr}", peer.display_name());
+    }
+    if !cidr.is_assignable(&prefix.network()) || !cidr.is_assignable(&prefix.broadcast()) {
+        bail!("{prefix} includes the network or broadcast address of {cidr}");
+    }
+    let overlaps = |other: &IpNet| other.contains(prefix) || prefix.contains(other);
+    for other in peers {
+        if prefix.contains(&other.ip) {
+            bail!(
+                "{prefix} includes the address of peer {}",
+                other.display_name()
+            );
+        }
+        if let Some(delegation) = other.delegations.iter().find(|d| overlaps(d)) {
+            bail!(
+                "{prefix} overlaps {delegation}, delegated to peer {}",
+                other.display_name()
+            );
+        }
+    }
+    Ok(())
 }
 
 impl PeerContents {
@@ -842,17 +901,22 @@ impl<'a> PeerDiff<'a> {
         // diff.new is now guaranteed to be a Some(_) variant.
         let new = new.unwrap();
 
-        let new_allowed_ips = &[AllowedIp {
-            address: new.ip,
-            cidr: if new.ip.is_ipv4() { 32 } else { 128 },
-        }];
-        if old.is_none() || matches!(old, Some(old) if old.allowed_ips != new_allowed_ips) {
+        let new_allowed_ips = new.allowed_ips();
+        // The interface doesn't necessarily list allowed IPs in the order they were added.
+        let sorted = |ips: &[AllowedIp]| {
+            let mut ips = ips.to_vec();
+            ips.sort_by_key(|ip| (ip.address, ip.cidr));
+            ips
+        };
+        if old.is_none()
+            || matches!(old, Some(old) if sorted(&old.allowed_ips) != sorted(&new_allowed_ips))
+        {
             builder = builder
                 .replace_allowed_ips()
-                .add_allowed_ips(new_allowed_ips);
+                .add_allowed_ips(&new_allowed_ips);
             changes.push(PeerChange::AllowedIPs {
                 old: old.map(|o| o.allowed_ips.clone()).unwrap_or_default(),
-                new: new_allowed_ips.to_vec(),
+                new: new_allowed_ips,
             });
         }
 
@@ -1111,6 +1175,7 @@ mod tests {
                 candidates: vec![],
                 announcement: None,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         };
         let builder =
@@ -1148,6 +1213,7 @@ mod tests {
                 candidates: vec![],
                 announcement: None,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         };
         let builder =
@@ -1185,6 +1251,7 @@ mod tests {
                 candidates: vec![],
                 announcement: None,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         };
         let builder =
@@ -1232,6 +1299,7 @@ mod tests {
                 candidates: vec![],
                 announcement: None,
                 observed_endpoint: None,
+                delegations: vec![],
             },
         };
         let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();
@@ -1295,5 +1363,125 @@ mod tests {
         assert_eq!(deserialize(""), None);
         assert_eq!(deserialize(r#"name = "Peer""#), None);
         assert_eq!(deserialize(r#"name = "peer\n10.0.0.1 example.com""#), None);
+    }
+
+    fn peer_with(name: &str, ip: &str, delegations: &[&str]) -> Peer {
+        Peer {
+            id: 1,
+            contents: PeerContents {
+                name: Some(name.parse().unwrap()),
+                ip: ip.parse().unwrap(),
+                cidr_id: 1,
+                public_key: Key::generate_private().get_public().to_base64(),
+                endpoint: None,
+                persistent_keepalive_interval: None,
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
+                delegations: delegations.iter().map(|d| d.parse().unwrap()).collect(),
+            },
+        }
+    }
+
+    fn info_with_allowed_ips(peer: &Peer, allowed_ips: &[&str]) -> PeerInfo {
+        let allowed_ips: Vec<AllowedIp> =
+            allowed_ips.iter().map(|ip| ip.parse().unwrap()).collect();
+        let builder = PeerConfigBuilder::new(&Key::from_base64(&peer.public_key).unwrap())
+            .add_allowed_ips(&allowed_ips);
+        PeerInfo {
+            config: builder.into_peer_config(),
+            stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_allowed_ips_include_delegations() {
+        let peer = peer_with("peer1", "10.0.0.1", &["10.0.0.32/28", "10.0.0.7/32"]);
+        let config = PeerConfigBuilder::from(&peer).into_peer_config();
+        assert_eq!(
+            config.allowed_ips,
+            ["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"]
+                .map(|ip| ip.parse::<AllowedIp>().unwrap())
+        );
+
+        let peer = peer_with("peer1", "fd00::1", &["fd00::1:0/112"]);
+        let config = PeerConfigBuilder::from(&peer).into_peer_config();
+        assert_eq!(
+            config.allowed_ips,
+            ["fd00::1/128", "fd00::1:0/112"].map(|ip| ip.parse::<AllowedIp>().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_peer_diff_delegations() {
+        let peer = peer_with("peer1", "10.0.0.1", &["10.0.0.32/28", "10.0.0.7/32"]);
+
+        // The same allowed IPs, listed in another order, are no change.
+        let info = info_with_allowed_ips(&peer, &["10.0.0.7/32", "10.0.0.1/32", "10.0.0.32/28"]);
+        assert_eq!(PeerDiff::new(Some(&info), Some(&peer), None).unwrap(), None);
+
+        // A delegation added or withdrawn replaces the allowed IPs.
+        for allowed_ips in [
+            &["10.0.0.1/32", "10.0.0.32/28"][..],
+            &["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32", "10.0.0.64/28"],
+        ] {
+            let info = info_with_allowed_ips(&peer, allowed_ips);
+            let diff = PeerDiff::new(Some(&info), Some(&peer), None)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                diff.changes(),
+                [PeerChange::AllowedIPs { new, .. }] if *new == peer.allowed_ips()
+            ));
+            let config = PeerConfigBuilder::from(diff).into_peer_config();
+            assert_eq!(config.allowed_ips, peer.allowed_ips());
+        }
+    }
+
+    #[test]
+    fn test_check_delegation() {
+        let cidr: IpNet = "10.0.0.0/24".parse().unwrap();
+        let peers = [
+            peer_with("peer1", "10.0.0.1", &["10.0.0.32/28"]),
+            peer_with("peer2", "10.0.0.2", &[]),
+        ];
+        let check =
+            |prefix: &str| check_delegation(&prefix.parse().unwrap(), &peers[1], &cidr, &peers);
+
+        assert!(check("10.0.0.64/28").is_ok());
+        assert!(check("10.0.0.3/32").is_ok());
+        assert!(check("10.0.0.254/32").is_ok());
+        for (prefix, reason) in [
+            ("10.0.0.65/28", "not aligned"),
+            ("10.0.1.0/28", "outside"),
+            ("fd00::/120", "outside"),
+            ("10.0.0.0/23", "outside"),
+            ("10.0.0.0/32", "network or broadcast"),
+            ("10.0.0.240/28", "network or broadcast"),
+            ("10.0.0.0/24", "network or broadcast"),
+            ("10.0.0.2/32", "address of peer peer2"),
+            ("10.0.0.0/30", "network or broadcast"),
+            ("10.0.0.32/28", "overlaps 10.0.0.32/28"),
+            ("10.0.0.40/29", "overlaps 10.0.0.32/28"),
+            ("10.0.0.32/27", "overlaps 10.0.0.32/28"),
+            ("10.0.0.2/31", "address of peer peer2"),
+        ] {
+            let error = check(prefix).unwrap_err().to_string();
+            assert!(error.contains(reason), "{prefix}: {error}");
+        }
+
+        // In IPv6, only the network address is unassignable.
+        let cidr: IpNet = "fd00::/112".parse().unwrap();
+        let peers = [peer_with("peer1", "fd00::1", &[])];
+        let check =
+            |prefix: &str| check_delegation(&prefix.parse().unwrap(), &peers[0], &cidr, &peers);
+        assert!(check("fd00::ffff/128").is_ok());
+        assert!(check("fd00::ff00/120").is_ok());
+        assert!(check("fd00::/128").is_err());
+        assert!(check("fd00::1/128").is_err());
     }
 }

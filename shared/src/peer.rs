@@ -26,6 +26,7 @@ impl NewPeerInfo {
             candidates: vec![],
             announcement: None,
             observed_endpoint: None,
+            delegations: vec![],
         }
     }
 }
