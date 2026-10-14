@@ -263,3 +263,85 @@ impl PeerInfoExt for PeerInfo {
         last_handshake <= REJECT_AFTER_TIME
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PeerContents;
+
+    const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+
+    fn peer(ip: IpAddr) -> Peer {
+        Peer {
+            id: 1,
+            contents: PeerContents {
+                name: "peer1".parse().unwrap(),
+                ip,
+                cidr_id: 1,
+                public_key: PUBKEY.to_owned(),
+                endpoint: None,
+                persistent_keepalive_interval: None,
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+            },
+        }
+    }
+
+    fn device_with_peer(ip: IpAddr) -> Device {
+        Device {
+            name: "wg0".parse().unwrap(),
+            public_key: None,
+            private_key: None,
+            fwmark: None,
+            listen_port: None,
+            peers: vec![PeerInfo {
+                config: PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap())
+                    .add_allowed_ip(ip, 32)
+                    .into_peer_config(),
+                stats: Default::default(),
+            }],
+            linked_name: None,
+            backend: Backend::Userspace,
+        }
+    }
+
+    #[test]
+    fn test_diff_removes_disabled_peer() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let device = device_with_peer(ip);
+
+        // An enabled peer that is already on the device is not removed.
+        let peers = [peer(ip)];
+        assert!(device
+            .diff(&peers, &BTreeMap::new())
+            .iter()
+            .all(|diff| diff.new.is_some()));
+
+        // A disabled peer is removed from the device.
+        let mut disabled = peer(ip);
+        disabled.contents.is_disabled = true;
+        let peers = [disabled];
+        let diffs = device.diff(&peers, &BTreeMap::new());
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].new.is_none());
+    }
+
+    #[test]
+    fn test_diff_endpoint_override() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let device = device_with_peer(ip);
+        let peers = [peer(ip)];
+
+        // The override of the peer's IP is used as its endpoint.
+        let overrides = BTreeMap::from([(ip, "2.2.2.2:2222".parse().unwrap())]);
+        let diffs = device.diff(&peers, &overrides);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].changes().contains(&crate::PeerChange::Endpoint {
+            old: None,
+            new: Some("2.2.2.2:2222".parse().unwrap()),
+        }));
+    }
+}
