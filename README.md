@@ -139,6 +139,32 @@ sudo innernet forget-peer <interface>
 
 Until then, the client cannot reach the new peer. An admin client that runs `innernet delete-peer` forgets the deleted peer automatically.
 
+### Delegating Addresses to Peers
+
+A peer can be delegated prefixes of its CIDR, which the other peers route to it through WireGuard besides its own IP address, as if they belonged to that many peers with its key. The peer can then hand those addresses to containers (on a netkit or veth pair), to LAN or WiFi clients behind it, or to its own interface. A delegation must be an aligned prefix (e.g. `10.42.1.32/28`, or `10.42.1.40/32` for a single address) inside the leaf CIDR of the peer, short of its network and broadcast addresses, and may not include any peer's IP address, its own included, nor overlap another delegation. Only admins can delegate, from an admin client with
+
+```sh
+sudo innernet add-delegation <interface> --name <peer> --prefix <prefix>
+```
+
+or from the server with `innernet-server add-delegation <interface>`. `delete-delegation` withdraws one in the same way. `innernet show` lists each peer's delegations.
+
+To put delegated addresses on the peer's own interface (Linux only), list them in the `[interface]` section of its config, `/etc/innernet/<interface>.conf`:
+
+```toml
+extra-addresses = ["10.42.1.40"]
+```
+
+They are added as host addresses when the interface is brought up and on each fetch, as long as they are inside one of the peer's own delegations; others are skipped with a warning. The peer's own IP address remains the source of its traffic to the network.
+
+Clients pin delegations to the peer's public key as they pin IP addresses, so a withdrawn delegation is no longer routed to the peer but stays pinned to it, and a server can't hand it to another key unnoticed. Once a withdrawn prefix is delegated to another peer, every client that has seen the old delegation drops the new one with a warning on each fetch, and routes the prefix to neither peer, until it forgets the old one with
+
+```sh
+sudo innernet forget-delegation <interface> --prefix <prefix>
+```
+
+`innernet forget-peer` also forgets all of a peer's delegations, and an admin client that runs `innernet delete-delegation` forgets the delegation automatically.
+
 ### Specifying a Manual Endpoint
 
 The `innernet` server will try to use the internet endpoint it sees from a peer so other peers can connect to that peer as well. This doesn't always work and you may want to set an endpoint explicitly. To set an endpoint, use
