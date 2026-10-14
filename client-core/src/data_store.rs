@@ -6,8 +6,10 @@ use innernet_shared::{
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, Write},
+    net::IpAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
@@ -19,7 +21,9 @@ use wireguard_control::{InterfaceName, Key};
 #[derive(Debug)]
 pub struct DataStore {
     file: File,
-    contents: Contents,
+    /// The peers of the data store, indexed at runtime. The index is not persisted.
+    peers: PeersIndex,
+    cidrs: Vec<Cidr>,
     /// The network of the interface, from its config. It is not persisted.
     network: IpNet,
 }
@@ -51,7 +55,7 @@ impl DataStore {
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
-        let contents = match serde_json::from_str(&json) {
+        let Contents::V1 { peers, cidrs } = match serde_json::from_str(&json) {
             Ok(contents) => contents,
             // Only an empty file, which fails at its very start, is a new data store.
             Err(e) if e.is_eof() && e.line() == 1 && e.column() == 0 => Contents::V1 {
@@ -63,9 +67,39 @@ impl DataStore {
             Err(e) => return Err(io::Error::from(e)).with_path(path),
         };
 
+        // A data store written before public keys were pinned to their IP can hold a later record
+        // of a peer at another IP. The earliest record of each peer is kept. One written before
+        // peers were confined to the network can hold a peer outside it, which is never valid.
+        let mut index = PeersIndex::default();
+        for peer in peers {
+            if !network.contains(&peer.ip) {
+                log::warn!(
+                    "{}: ignoring stored peer {} at {}, outside of the network {}.",
+                    path.display(),
+                    peer.name,
+                    peer.ip,
+                    network,
+                );
+                continue;
+            }
+            let status = index.check(&peer);
+            if let PinStatus::ConflictingKey | PinStatus::ConflictingIp = status {
+                log::warn!(
+                    "{}: ignoring stored peer {} at {} ({:?}).",
+                    path.display(),
+                    peer.name,
+                    peer.ip,
+                    status
+                );
+            } else {
+                index.insert(peer);
+            }
+        }
+
         Ok(Self {
             file,
-            contents,
+            peers: index,
+            cidrs,
             network: network.trunc(),
         })
     }
@@ -117,89 +151,87 @@ impl DataStore {
     /// (IP, PublicKey) tuples are pinned before the coordination server reports anything. Each
     /// record is named by its public key until a fetch replaces it with the server's record.
     pub fn introduce(&mut self, config: &InterfaceConfig) -> Result<(), Error> {
-        let peers = match &mut self.contents {
-            Contents::V1 { ref mut peers, .. } => peers,
-        };
-        if !peers.is_empty() {
+        if !self.peers.peers.is_empty() {
             bail!("the data store to introduce peers into is not new.");
         }
-        peers.extend(introduced_peers(config)?);
+        for introduced in introduced_peers(config)? {
+            self.peers.insert(introduced);
+        }
         self.write()?;
 
         Ok(())
     }
 
     /// Merges the peers of `state` into the data store, replaces its CIDRs with those of `state`,
-    /// and writes it to disk.
+    /// and writes it to disk. Returns the peers of `state` that were dropped, each with the reason
+    /// that it was dropped.
     ///
     /// A peer that the data store already holds is updated, a new peer is added, and a peer that
     /// is absent from `state` is disabled rather than deleted, so that its (IP, PublicKey) tuple
-    /// remains pinned. The update is refused if any peer of `state` conflicts with a pin or lies
-    /// outside the network of the interface.
+    /// remains pinned. A peer of `state` is dropped if it lies outside the network of the
+    /// interface, conflicts with a pin, or shares its IP or public key with an earlier peer of
+    /// `state`. A dropped peer is absent from the update, so a pinned peer that it conflicts with
+    /// is disabled.
     ///
     /// Pinning prevents a compromised server from impersonating an existing peer, but not from
     /// adding a new peer under its control.
-    pub fn update(&mut self, state: &State) -> Result<(), Error> {
-        self.update_peers(&state.peers)?;
+    pub fn update<'a>(&mut self, state: &'a State) -> Result<Vec<(&'a Peer, Error)>, Error> {
+        let dropped = self.update_peers(&state.peers);
         self.set_cidrs(state.cidrs.clone());
         self.write()?;
 
-        Ok(())
+        Ok(dropped)
     }
 
-    /// Validates that no peer in `candidates` has an IP pinned to a different public key, or a
-    /// public key pinned to a different IP.
-    fn check_pins(&self, candidates: &[Peer]) -> Result<(), Error> {
-        for candidate in candidates.iter() {
-            for pin in self.peers() {
-                if pin.ip == candidate.ip && pin.public_key != candidate.public_key {
-                    bail!("PINNING ERROR: New peer has same IP but different public key.");
-                }
-                if pin.public_key == candidate.public_key && pin.ip != candidate.ip {
-                    bail!("PINNING ERROR: New peer has same public key but different IP.");
-                }
-            }
+    /// Validates that `candidate` lies within the network of the interface.
+    fn check_network_closure(&self, candidate: &Peer) -> Result<(), Error> {
+        if !self.network.contains(&candidate.ip) {
+            bail!(
+                "IP {} is outside of the network {}.",
+                candidate.ip,
+                self.network
+            );
         }
 
         Ok(())
     }
 
-    /// Validates that every peer in `candidates` lies within the network of the interface.
-    fn check_network_closure(&self, candidates: &[Peer]) -> Result<(), Error> {
-        for candidate in candidates.iter() {
-            if !self.network.contains(&candidate.ip) {
-                bail!(
-                    "peer {} has IP {} outside of the network {}.",
-                    candidate.name,
-                    candidate.ip,
-                    self.network
-                );
-            }
+    /// Validates that `candidate` lies within the network of the interface, matches the pins of
+    /// the data store, and shares neither its IP nor its public key with a peer of `accepted`.
+    fn check(&self, candidate: &Peer, accepted: &PeersIndex) -> Result<(), Error> {
+        self.check_network_closure(candidate)?;
+        match self.peers.check(candidate) {
+            PinStatus::New | PinStatus::Unchanged => {},
+            PinStatus::ConflictingKey => {
+                bail!("PINNING ERROR: New peer has same IP but different public key.")
+            },
+            PinStatus::ConflictingIp => {
+                bail!("PINNING ERROR: New peer has same public key but different IP.")
+            },
+        }
+        if accepted.check(candidate) != PinStatus::New {
+            bail!("IP or public key is shared with an earlier peer.");
         }
 
         Ok(())
     }
 
-    fn update_peers(&mut self, new_peers: &[Peer]) -> Result<(), Error> {
-        self.check_network_closure(new_peers)?;
-        self.check_pins(new_peers)?;
-
-        let peers = match &mut self.contents {
-            Contents::V1 { ref mut peers, .. } => peers,
-        };
-
+    fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<(&'a Peer, Error)> {
+        let mut accepted = PeersIndex::default();
+        let mut dropped = vec![];
         for new_peer in new_peers.iter() {
-            if let Some(existing_peer) = peers
-                .iter_mut()
-                .find(|p| p.public_key == new_peer.public_key)
-            {
-                *existing_peer = new_peer.clone();
-            } else {
-                peers.push(new_peer.clone());
+            match self.check(new_peer, &accepted) {
+                Ok(()) => {
+                    accepted.insert(new_peer.clone());
+                },
+                Err(e) => dropped.push((new_peer, e)),
             }
         }
 
-        for existing_peer in peers.iter_mut() {
+        // The server leaves disabled peers out of the state, so a stored peer that the state
+        // doesn't report is disabled. A dropped peer was reported, so the stored peer with its
+        // public key keeps its record unchanged.
+        for existing_peer in self.peers.peers.iter_mut() {
             if !new_peers
                 .iter()
                 .any(|p| p.public_key == existing_peer.public_key)
@@ -207,33 +239,34 @@ impl DataStore {
                 existing_peer.contents.is_disabled = true;
             }
         }
+        for new_peer in accepted.peers {
+            self.peers.insert(new_peer);
+        }
 
-        Ok(())
+        dropped
     }
 
     pub fn peers(&self) -> &[Peer] {
-        match &self.contents {
-            Contents::V1 { peers, .. } => peers,
-        }
+        &self.peers.peers
     }
 
     pub fn cidrs(&self) -> &[Cidr] {
-        match &self.contents {
-            Contents::V1 { cidrs, .. } => cidrs,
-        }
+        &self.cidrs
     }
 
     fn set_cidrs(&mut self, new_cidrs: Vec<Cidr>) {
-        match &mut self.contents {
-            Contents::V1 { ref mut cidrs, .. } => *cidrs = new_cidrs,
-        }
+        self.cidrs = new_cidrs;
     }
 
     fn write(&mut self) -> Result<(), io::Error> {
+        let contents = Contents::V1 {
+            peers: self.peers.peers.clone(),
+            cidrs: self.cidrs.clone(),
+        };
         self.file.rewind()?;
         self.file.set_len(0)?;
         self.file
-            .write_all(serde_json::to_string_pretty(&self.contents)?.as_bytes())?;
+            .write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
         Ok(())
     }
 }
@@ -282,6 +315,64 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<[Peer; 2], Error> {
             None,
         ),
     ])
+}
+
+/// How a peer relates to the (IP, PublicKey) pins of the peers of a [`PeersIndex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinStatus {
+    /// Neither its IP nor its public key belongs to a peer.
+    New,
+    /// Its IP and its public key belong to the same peer.
+    Unchanged,
+    /// Its IP belongs to a peer with a different public key.
+    ConflictingKey,
+    /// Its public key belongs to a peer at a different IP.
+    ConflictingIp,
+}
+
+/// Peers indexed by IP and by public key, in which each IP and each public key belongs to at
+/// most one peer. The index exists only at runtime.
+#[derive(Debug, Default)]
+struct PeersIndex {
+    peers: Vec<Peer>,
+    by_ip: HashMap<IpAddr, usize>,
+    by_public_key: HashMap<String, usize>,
+}
+
+impl PeersIndex {
+    /// How `peer` relates to the pins of the peers of the index.
+    fn check(&self, peer: &Peer) -> PinStatus {
+        match (
+            self.by_ip.get(&peer.ip),
+            self.by_public_key.get(&peer.public_key),
+        ) {
+            (None, None) => PinStatus::New,
+            (Some(by_ip), Some(by_public_key)) if by_ip == by_public_key => PinStatus::Unchanged,
+            (Some(_), _) => PinStatus::ConflictingKey,
+            (None, Some(_)) => PinStatus::ConflictingIp,
+        }
+    }
+
+    /// Adds `peer` if it is new, or replaces the peer with its IP and public key if it is
+    /// unchanged. A conflicting peer is not inserted. Returns how `peer` related to the pins.
+    fn insert(&mut self, peer: Peer) -> PinStatus {
+        let status = self.check(&peer);
+        match status {
+            PinStatus::New => {
+                let index = self.peers.len();
+                self.by_ip.insert(peer.ip, index);
+                self.by_public_key.insert(peer.public_key.clone(), index);
+                self.peers.push(peer);
+            },
+            PinStatus::Unchanged => {
+                let index = self.by_ip[&peer.ip];
+                self.peers[index] = peer;
+            },
+            PinStatus::ConflictingKey | PinStatus::ConflictingIp => {},
+        }
+
+        status
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +427,17 @@ mod tests {
             .unwrap();
     }
 
+    fn disabled(peers: &[Peer]) -> Vec<Peer> {
+        peers
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                p.contents.is_disabled = true;
+                p
+            })
+            .collect()
+    }
+
     #[test]
     fn test_sanity() {
         let dir = tempfile::tempdir().unwrap();
@@ -354,13 +456,17 @@ mod tests {
             DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
         // Should work, since peer is unmodified.
-        store.update_peers(&BASE_PEERS).unwrap();
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        assert_eq!(store.peers(), &*BASE_PEERS);
 
         let mut modified = BASE_PEERS.clone();
         modified[0].contents.public_key = "foo".to_string();
 
-        // Should NOT work, since peer is unmodified.
-        assert!(store.update_peers(&modified).is_err());
+        // Should NOT work, since the IP is pinned to another public key. The pinned peer is
+        // disabled, since it is absent from the update.
+        assert_eq!(store.peers.check(&modified[0]), PinStatus::ConflictingKey);
+        assert_eq!(store.update_peers(&modified).len(), 1);
+        assert_eq!(store.peers(), &disabled(&BASE_PEERS)[..]);
     }
 
     #[test]
@@ -370,11 +476,12 @@ mod tests {
         let mut store =
             DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
-        // The same public key reported at another IP is refused, before and when updating.
+        // The same public key reported at another IP is dropped from the update, and the pinned
+        // peer, which was reported, keeps its record unchanged.
         let mut moved = BASE_PEERS.clone();
         moved[0].contents.ip = "10.0.0.2".parse().unwrap();
-        assert!(store.check_pins(&moved).is_err());
-        assert!(store.update_peers(&moved).is_err());
+        assert_eq!(store.peers.check(&moved[0]), PinStatus::ConflictingIp);
+        assert_eq!(store.update_peers(&moved).len(), 1);
         assert_eq!(store.peers(), &*BASE_PEERS);
 
         // Other changes to a pinned peer are applied in place, and new peers are added.
@@ -384,7 +491,7 @@ mod tests {
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
         new_peer.contents.public_key = "def".to_string();
         updated.push(new_peer);
-        store.update_peers(&updated).unwrap();
+        assert!(store.update_peers(&updated).is_empty());
         assert_eq!(store.peers(), &updated[..]);
     }
 
@@ -423,14 +530,76 @@ mod tests {
         let mut store =
             DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
-        // A new peer outside the network is refused, before and when updating.
+        // A new peer outside the network is dropped, and the other peers are kept.
         let mut outside = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "1.1.1.1".parse().unwrap();
         new_peer.contents.public_key = "def".to_string();
         outside.push(new_peer);
-        assert!(store.check_network_closure(&outside).is_err());
-        assert!(store.update_peers(&outside).is_err());
+        let dropped = store.update_peers(&outside);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, &outside[1]);
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // A stored peer outside the network is ignored when the data store is opened.
+        let path = dir.path().join("outside.json");
+        let contents = Contents::V1 {
+            peers: outside.clone(),
+            cidrs: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
+        assert_eq!(store.peers(), &*BASE_PEERS);
+    }
+
+    #[test]
+    fn test_first_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+
+        // Of two new peers at the same IP, the first is kept and the second dropped.
+        let mut same_ip = BASE_PEERS.clone();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
+        new_peer.contents.public_key = "def".to_string();
+        same_ip.push(new_peer.clone());
+        new_peer.contents.public_key = "ghi".to_string();
+        same_ip.push(new_peer);
+        let dropped = store.update_peers(&same_ip);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, &same_ip[2]);
+        assert_eq!(store.peers(), &same_ip[..2]);
+
+        // Of two new peers with the same public key, the first is kept and the second dropped.
+        let mut same_public_key = same_ip[..2].to_vec();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "10.0.0.3".parse().unwrap();
+        new_peer.contents.public_key = "jkl".to_string();
+        same_public_key.push(new_peer.clone());
+        new_peer.contents.ip = "10.0.0.4".parse().unwrap();
+        same_public_key.push(new_peer);
+        let dropped = store.update_peers(&same_public_key);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, &same_public_key[3]);
+        assert_eq!(store.peers(), &same_public_key[..3]);
+    }
+
+    #[test]
+    fn test_conflicting_stored_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+
+        // A data store holding a later record of a peer at another IP keeps the earliest record.
+        let mut moved = BASE_PEERS[0].clone();
+        moved.contents.ip = "10.0.0.2".parse().unwrap();
+        let contents = Contents::V1 {
+            peers: vec![BASE_PEERS[0].clone(), moved],
+            cidrs: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
         assert_eq!(store.peers(), &*BASE_PEERS);
     }
 
@@ -442,16 +611,8 @@ mod tests {
             DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
         // Should work, since peer is unmodified.
-        store.update_peers(&[]).unwrap();
-        let new_peers = BASE_PEERS
-            .iter()
-            .cloned()
-            .map(|mut p| {
-                p.contents.is_disabled = true;
-                p
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(store.peers(), &new_peers);
+        assert!(store.update_peers(&[]).is_empty());
+        assert_eq!(store.peers(), &disabled(&BASE_PEERS)[..]);
     }
 
     /// The coordinator of [`introducing_config`], as the server reports it.
@@ -500,16 +661,16 @@ mod tests {
         // The coordinator can't be reported at another IP, nor another key at its IP.
         let mut moved = [COORDINATOR.clone()];
         moved[0].contents.ip = "10.0.0.3".parse().unwrap();
-        assert!(store.update_peers(&moved).is_err());
+        assert_eq!(store.update_peers(&moved).len(), 1);
         let mut replaced = [COORDINATOR.clone()];
         replaced[0].contents.public_key =
             "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
-        assert!(store.update_peers(&replaced).is_err());
+        assert_eq!(store.update_peers(&replaced).len(), 1);
 
         // The server's record of the coordinator replaces the introduced one.
-        store
+        assert!(store
             .update_peers(std::slice::from_ref(&*COORDINATOR))
-            .unwrap();
+            .is_empty());
         assert_eq!(store.peers()[0], *COORDINATOR);
         assert_eq!(store.peers().len(), 2);
 

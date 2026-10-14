@@ -238,7 +238,15 @@ pub fn fetch(
 
     // The data store validates the reported state before any of it reaches the interface.
     if let Some(state) = &state {
-        store.update(state).context(interface.to_string())?;
+        let dropped = store.update(state).context(interface.to_string())?;
+        for (peer, e) in dropped {
+            log::warn!(
+                "{}: dropping peer {}: {}",
+                interface.as_str_lossy().yellow(),
+                peer.name,
+                e
+            );
+        }
     }
 
     // The interface is configured from the enabled peers of the data store, with the local peer
