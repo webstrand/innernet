@@ -159,16 +159,13 @@ pub fn update_hosts_file(
     let mut hosts_builder = HostsBuilder::new(format!("innernet {interface}"));
     for peer in peers {
         let peer = peer.as_ref();
-        let peer_hostname = if let Some(suffix) = &opts.host_suffix {
-            if suffix.is_empty() {
-                peer.contents.name.to_string()
-            } else {
-                format!("{}.{}", peer.contents.name, suffix)
-            }
-        } else {
-            format!("{}.{}.wg", peer.contents.name, interface)
-        };
-        hosts_builder.add_hostname(peer.contents.ip, peer_hostname);
+        match peer_hostname(interface, opts.host_suffix.as_deref(), &peer.contents.name) {
+            Some(peer_hostname) => hosts_builder.add_hostname(peer.contents.ip, peer_hostname),
+            None => log::warn!(
+                "omitting peer {} from the hosts file, since its name is not a valid hostname.",
+                peer.contents.public_key
+            ),
+        }
     }
     match hosts_builder
         .write_to(opts.hosts_path.as_path())
@@ -185,4 +182,51 @@ pub fn update_hosts_file(
     };
 
     Ok(())
+}
+
+/// The hostname of the peer `name` in the hosts file, or `None` if the name isn't a valid
+/// hostname. A peer name is written unescaped, so a name such as one with a newline could
+/// otherwise add any entry to the hosts file.
+fn peer_hostname(
+    interface: &InterfaceName,
+    host_suffix: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    if !Hostname::is_valid(name) {
+        return None;
+    }
+    Some(match host_suffix {
+        None => format!("{name}.{interface}.wg"),
+        Some("") => name.to_string(),
+        Some(suffix) => format!("{name}.{suffix}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_hostname() {
+        let interface: InterfaceName = "wg0".parse().unwrap();
+        let hostname = |suffix, name| peer_hostname(&interface, suffix, name);
+
+        assert_eq!(hostname(None, "peer-1").as_deref(), Some("peer-1.wg0.wg"));
+        assert_eq!(
+            hostname(Some("evilnet"), "peer-1").as_deref(),
+            Some("peer-1.evilnet")
+        );
+        assert_eq!(hostname(Some(""), "peer-1").as_deref(), Some("peer-1"));
+
+        // A name that isn't a valid hostname is omitted.
+        assert_eq!(hostname(None, "peer\n10.0.0.1 example.com"), None);
+        assert_eq!(hostname(None, "a b"), None);
+        assert_eq!(hostname(None, "a.b"), None);
+        assert_eq!(hostname(None, "Peer"), None);
+        assert_eq!(hostname(None, ""), None);
+        assert_eq!(
+            hostname(None, "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE="),
+            None
+        );
+    }
 }
