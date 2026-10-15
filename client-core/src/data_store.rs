@@ -47,10 +47,17 @@ impl DataStore {
 
         let mut json = String::new();
         file.read_to_string(&mut json).with_path(path)?;
-        let contents = serde_json::from_str(&json).unwrap_or_else(|_| Contents::V1 {
-            peers: vec![],
-            cidrs: vec![],
-        });
+        let contents = match serde_json::from_str(&json) {
+            Ok(contents) => contents,
+            // Only an empty file, which fails at its very start, is a new data store.
+            Err(e) if e.is_eof() && e.line() == 1 && e.column() == 0 => Contents::V1 {
+                peers: vec![],
+                cidrs: vec![],
+            },
+            // Any other file that fails to parse is an error, since starting over would discard
+            // its pins.
+            Err(e) => return Err(io::Error::from(e)).with_path(path),
+        };
 
         Ok(Self { file, contents })
     }
@@ -333,6 +340,23 @@ mod tests {
         updated.push(new_peer);
         store.update_peers(&updated).unwrap();
         assert_eq!(store.peers(), &updated[..]);
+    }
+
+    #[test]
+    fn test_invalid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_store.json");
+
+        // An empty file is a new data store.
+        File::create(&path).unwrap();
+        let store = DataStore::open_with_path(&path, false).unwrap();
+        assert!(store.peers().is_empty());
+
+        // A file that fails to parse is refused rather than replaced, even if it is only whitespace.
+        std::fs::write(&path, r#"{"version": "1", "peers": [{"#).unwrap();
+        assert!(DataStore::open_with_path(&path, false).is_err());
+        std::fs::write(&path, "\n").unwrap();
+        assert!(DataStore::open_with_path(&path, false).is_err());
     }
 
     #[test]
