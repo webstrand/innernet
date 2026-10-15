@@ -201,7 +201,7 @@ pub fn fetch(
         "fetching state for {} from server...",
         interface.as_str_lossy().yellow()
     );
-    let mut store = DataStore::open_or_create(data_dir, interface)?;
+    let mut store = DataStore::open_or_create(data_dir, interface, &config)?;
     let rest_client = RestClient::new(&config.server);
     let state = match rest_client.http::<State>("GET", "/user/state") {
         Ok(state) => Some(state),
@@ -221,7 +221,6 @@ pub fn fetch(
         Err(e) => bail!(e),
     };
 
-    // The data store validates the reported state before any of it reaches the interface.
     if let Some(state) = &state {
         store.update(state).context(interface.to_string())?;
     }

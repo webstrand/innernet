@@ -547,8 +547,8 @@ fn delete_cidr(
 }
 
 fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), Error> {
-    let data_store = DataStore::open(&opts.data_dir, interface)?;
     let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
 
     if tree {
         let cidr_tree = CidrTree::new(data_store.cidrs());
@@ -806,7 +806,7 @@ fn override_peer_endpoint(
     sub_opts: OverridePeerEndpointOpts,
 ) -> Result<(), Error> {
     let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let data_store = DataStore::open(&opts.data_dir, interface)?;
+    let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
 
     if let Some((peer, endpoint_opt)) = prompts::override_peer_endpoint_prompt(
         data_store.peers(),
@@ -914,19 +914,17 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
     let devices = interfaces
         .into_iter()
         .map(|name| -> Result<Option<_>, Error> {
-            match DataStore::open(&opts.data_dir, &name) {
-                Ok(store) => {
-                    let device =
-                        Device::get(&name, opts.network.backend).with_str(name.as_str_lossy())?;
-                    let config = InterfaceConfig::from_interface(&opts.config_dir, &name)?;
-
-                    Ok(Some((device, store, config)))
-                },
-                // Skip WireGuard interfaces that aren't managed by innernet.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-                // Error on interfaces that *are* managed by innernet but are not readable.
-                Err(e) => Err(e.into()),
+            // Skip WireGuard interfaces that aren't managed by innernet.
+            if !DataStore::get_path(&opts.data_dir, &name).exists() {
+                return Ok(None);
             }
+
+            // Error on interfaces that *are* managed by innernet but are not readable.
+            let device = Device::get(&name, opts.network.backend).with_str(name.as_str_lossy())?;
+            let config = InterfaceConfig::from_interface(&opts.config_dir, &name)?;
+            let store = DataStore::open(&opts.data_dir, &name, &config)?;
+
+            Ok(Some((device, store, config)))
         })
         // Filter out Ok(None).
         .filter_map(Result::transpose)
