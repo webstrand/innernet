@@ -159,6 +159,11 @@ client a fetch e2e --no-write-hosts || fail "fetch as a"
 pass "a fetches"
 client adm list-associations e2e || fail "list associations as adm"
 pass "adm uses the admin API"
+client adm add-peer e2e --name new --auto-ip --cidr peers --admin false \
+    --invite-expires 1h --save-config "$work/new.toml" --yes >/dev/null || fail "add-peer as adm"
+[ "$(invitation "$work/new.toml" server public-key)" = "$server_key" ] ||
+    fail "adm's invitation names another server key"
+pass "adm's invitation names the server's key"
 
 step "something else on a peer's machine, without its key"
 expect_plain a GET /v1/user/state 401
