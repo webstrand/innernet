@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end test of delegations, run unprivileged in network namespaces.
+# End-to-end test of delegations, and of forwarding DNS to the nameserver a peer offers, run
+# unprivileged in network namespaces.
 #
 # Usage: scripts/e2e-delegations [--keep]
 #
@@ -8,12 +9,12 @@
 #   198.18.0.0/24 "internet" (bridge in the outer namespace)
 #     srv     198.18.0.1   innernet-server
 #     a       198.18.0.2   peer
-#     b       198.18.0.3   peer delegated 10.66.1.32/28
+#     b       198.18.0.3   peer delegated 10.66.1.32/28, offering a nameserver
 #       ctr   10.66.1.33   container behind b, on an L3 netkit pair
 #     c       198.18.0.4   peer the delegation is reassigned to
 #
-# Requires: unshare, ip (with netkit), wg, curl, sqlite3, python3 (3.11+), and the kernel
-# WireGuard and netkit modules.
+# Requires: unshare, ip (with netkit), wg, curl, sqlite3, python3 (3.11+), dnsmasq, dig, and the
+# kernel WireGuard and netkit modules.
 set -euo pipefail
 
 if [ -z "${E2E_INSIDE:-}" ]; then
@@ -316,6 +317,51 @@ sed -i '/^announce-delegations = /d' "$work/b/conf/e2e.conf"
 fetch b
 fetch a
 expect_routed a b "$b_key" "$prefix"
+
+step "a forwards DNS for b to b's nameserver"
+ns b dnsmasq --keep-in-foreground --no-resolv --no-hosts --bind-interfaces \
+    --listen-address="$b_ip" --port=53 --user=root --group= --pid-file= \
+    --host-record=example.com,10.66.1.35 --host-record=www.example.com,10.66.1.34 \
+    --cname=alias.example.com,www.example.com --log-facility=- --log-queries \
+    >"$work/b.dnsmasq.log" 2>&1 &
+pids+=($!)
+python3 -I - "$work/b/conf/e2e.conf" "$b_ip" <<'EOF'
+import sys
+path, ip = sys.argv[1:]
+text = open(path).read()
+text = text.replace("[interface]\n", f'[interface]\nannounce-nameserver = "{ip}:53"\nannounce-zone = "example.com"\n', 1)
+open(path, "w").write(text)
+EOF
+fetch b
+printf '\n[dns-forwarder]\nlisten = "127.0.0.1:5353"\n' >>"$work/a/conf/e2e.conf"
+client a -v up e2e --daemon --interval 2 --no-write-hosts >"$work/a.daemon.log" 2>&1 &
+daemon=$!
+pids+=("$daemon")
+dig_a() { ns a dig @127.0.0.1 -p 5353 +time=2 +tries=1 "$@"; }
+for _ in $(seq 20); do
+    [ "$(dig_a +short www.b.e2e.wg A)" = 10.66.1.34 ] && break
+    sleep 0.5
+done
+[ "$(dig_a +short www.b.e2e.wg A)" = 10.66.1.34 ] ||
+    { cat "$work/a.daemon.log" >&2; fail "a doesn't resolve www.b.e2e.wg: $(dig_a www.b.e2e.wg A)"; }
+pass "a resolves www.b.e2e.wg from b's nameserver"
+[ "$(dig_a +short b.e2e.wg A)" = 10.66.1.35 ] || fail "a doesn't resolve b.e2e.wg: $(dig_a b.e2e.wg A)"
+pass "a resolves b.e2e.wg as the zone apex"
+[ "$(dig_a +short alias.b.e2e.wg A | tr '\n' ' ')" = "www.b.e2e.wg. 10.66.1.34 " ] ||
+    fail "a doesn't restore the CNAME target: $(dig_a alias.b.e2e.wg A)"
+pass "a restores the CNAME target to www.b.e2e.wg"
+[ "$(dig_a +tcp +short www.b.e2e.wg A)" = 10.66.1.34 ] ||
+    fail "a doesn't resolve www.b.e2e.wg over TCP: $(dig_a +tcp www.b.e2e.wg A)"
+pass "a resolves www.b.e2e.wg over TCP"
+for name in c.e2e.wg example.com; do
+    dig_a "$name" A | grep -q "status: REFUSED" || fail "a doesn't refuse $name: $(dig_a "$name" A)"
+    pass "a refuses $name"
+done
+kill "$daemon"
+wait "$daemon" 2>/dev/null || true
+sed -i '/^announce-nameserver = \|^announce-zone = /d' "$work/b/conf/e2e.conf"
+fetch b
+fetch a
 
 step "only b's own address is b to the server"
 # Let b use plain HTTP, so that its own address alone is accepted.
