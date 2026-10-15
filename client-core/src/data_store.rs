@@ -1,54 +1,117 @@
-use anyhow::{bail, Error};
+use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use innernet_shared::{
-    deserialize_valid_peers, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname,
-    IoErrorContext, Peer, PeerContents, State, WrappedIoError,
+    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents, Endpoint, Hostname,
+    IoErrorContext, Peer, PeerContents, State,
 };
 use ipnet::IpNet;
-use serde::{Deserialize, Serialize};
+use rusqlite::{
+    config::DbConfig, params, Connection, OpenFlags, OptionalExtension as _, Transaction,
+    TransactionBehavior,
+};
+use rusqlite_migration::{HookError, Migrations, M};
+use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{self, Read, Seek, Write},
-    net::IpAddr,
+    fs::OpenOptions,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::{Duration, UNIX_EPOCH},
 };
 use wireguard_control::{InterfaceName, Key};
 
-/// File-backed storage of [`Peer`]s and [`Cidr`]s.
+/// SQLite-backed storage of [`Peer`]s and [`Cidr`]s, and of the (IP, PublicKey) pins of the peers.
 ///
-/// The file is stored at [`Self::get_path()`].
+/// The database is stored at [`Self::get_path()`]. A data store from before SQLite, at
+/// [`Self::get_legacy_path()`], is imported when the database is created, and left untouched.
 #[derive(Debug)]
 pub struct DataStore {
-    file: File,
-    /// The peers of the data store, indexed at runtime. The index is not persisted.
+    conn: Connection,
+    /// The peers of the data store, as last loaded from the database, indexed.
     peers: PeersIndex,
     cidrs: Vec<Cidr>,
     /// The network of the interface, from its config. It is not persisted.
     network: IpNet,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Identifies the database file as an innernet data store: "innr".
+const APPLICATION_ID: i32 = 0x696e_6e72;
+
+/// How long to wait for another process to finish writing the data store.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Server IDs aren't stored, so every peer loaded from the data store has this ID, and so does the
+/// CIDR of a peer outside every CIDR. The CIDRs are numbered from 1 when they are loaded.
+const UNKNOWN_ID: i64 = 0;
+
+/// The versions of the schema, each of which the binary knows how to migrate to. A migration runs
+/// in one transaction with the bump of `user_version`.
+fn migrations(legacy_path: PathBuf, network: IpNet) -> Migrations<'static> {
+    Migrations::new(vec![M::up_with_hook(
+        include_str!("data_store/v1.sql"),
+        move |tx: &Transaction| {
+            import_legacy(tx, &legacy_path, network).map_err(|e| HookError::Hook(format!("{e:#}")))
+        },
+    )])
+}
+
+/// The version of the schema that this binary writes.
+const SCHEMA_VERSION: i64 = 1;
+
+/// The kinds of the pins of `prefix_pins`, as the `pin_kinds` table names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinKind {
+    Address = 0,
+}
+
+impl PinKind {
+    #[cfg(test)]
+    const ALL: &'static [(Self, &'static str)] = &[(Self::Address, "address")];
+}
+
+/// The kinds of the endpoints of `endpoints`, as the `endpoint_kinds` table names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointKind {
+    Endpoint = 0,
+    Candidate = 1,
+}
+
+impl EndpointKind {
+    #[cfg(test)]
+    const ALL: &'static [(Self, &'static str)] =
+        &[(Self::Endpoint, "endpoint"), (Self::Candidate, "candidate")];
+
+    fn from_i64(kind: i64) -> Result<Self, Error> {
+        match kind {
+            0 => Ok(Self::Endpoint),
+            1 => Ok(Self::Candidate),
+            _ => bail!("unknown endpoint kind {kind}"),
+        }
+    }
+}
+
+/// The data store of the JSON file of earlier versions.
+#[derive(Debug, Deserialize)]
 #[serde(tag = "version")]
-enum Contents {
+enum LegacyContents {
     #[serde(rename = "1")]
-    V1 {
-        #[serde(deserialize_with = "deserialize_valid_peers")]
-        peers: Vec<Peer>,
-        cidrs: Vec<Cidr>,
-    },
+    V1 { peers: Vec<Peer>, cidrs: Vec<Cidr> },
 }
 
 impl DataStore {
-    fn open_with_path<P: AsRef<Path>>(
-        path: P,
+    fn open_with_paths(
+        path: &Path,
+        legacy_path: &Path,
         network: IpNet,
         create: bool,
-    ) -> Result<Self, WrappedIoError> {
-        let path = path.as_ref();
+    ) -> Result<Self, Error> {
+        // A legacy data store is imported into a new database, so the database is created for it.
+        let create = create || legacy_path.try_exists().with_path(legacy_path)?;
 
-        // The mode applies only if the file is created, in the same call that creates it.
-        let mut file = OpenOptions::new()
+        // The mode applies only if the file is created, in the same call that creates it. SQLite
+        // gives its journal the mode of the database.
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
@@ -56,61 +119,52 @@ impl DataStore {
             .open(path)
             .with_path(path)?;
         innernet_shared::warn_on_dangerous_mode(&file, path).with_path(path)?;
+        drop(file);
 
-        let mut json = String::new();
-        file.read_to_string(&mut json).with_path(path)?;
-        let Contents::V1 { peers, cidrs } = match serde_json::from_str(&json) {
-            Ok(contents) => contents,
-            // Only an empty file, which fails at its very start, is a new data store.
-            Err(e) if e.is_eof() && e.line() == 1 && e.column() == 0 => Contents::V1 {
-                peers: vec![],
-                cidrs: vec![],
-            },
-            // Any other file that fails to parse is an error, since starting over would discard
-            // its pins.
-            Err(e) => return Err(io::Error::from(e)).with_path(path),
-        };
-
-        // A data store written before public keys were pinned to their IP can hold a later record
-        // of a peer at another IP. The earliest record of each peer is kept. One written before
-        // peers were confined to the network can hold a peer outside it, which is never valid.
-        let mut index = PeersIndex::default();
-        for peer in peers {
-            if !network.contains(&peer.ip) {
-                log::warn!(
-                    "{}: ignoring stored peer {} at {}, outside of the network {}.",
-                    path.display(),
-                    peer.name,
-                    peer.ip,
-                    network,
-                );
-                continue;
-            }
-            let status = index.check(&peer);
-            if let PinStatus::ConflictingKey | PinStatus::ConflictingIp = status {
-                log::warn!(
-                    "{}: ignoring stored peer {} at {} ({:?}).",
-                    path.display(),
-                    peer.name,
-                    peer.ip,
-                    status
-                );
-            } else {
-                index.insert(peer);
-            }
-        }
+        let conn = connect(path, legacy_path.to_owned(), network)
+            .with_context(|| format!("failed to open the data store {}", path.display()))?;
+        let (peers, cidrs) = load(&conn, network)
+            .with_context(|| format!("failed to load the data store {}", path.display()))?;
 
         Ok(Self {
-            file,
-            peers: index,
+            conn,
+            peers,
             cidrs,
             network: network.trunc(),
         })
     }
 
-    /// Produce the path "`data_dir`/`interface`.json".
+    /// Produce the path "`data_dir`/`interface`.db".
     pub fn get_path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
+        data_dir.join(interface.to_string()).with_extension("db")
+    }
+
+    /// Produce the path "`data_dir`/`interface`.json" of the data store of earlier versions.
+    pub fn get_legacy_path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
         data_dir.join(interface.to_string()).with_extension("json")
+    }
+
+    /// The files of the data store of `interface`: the database, its journal and the data store of
+    /// earlier versions.
+    pub fn get_paths(data_dir: &Path, interface: &InterfaceName) -> [PathBuf; 3] {
+        [
+            Self::get_path(data_dir, interface),
+            data_dir.join(format!("{interface}.db-journal")),
+            Self::get_legacy_path(data_dir, interface),
+        ]
+    }
+
+    /// Whether a data store exists for `interface`, either the database or one of earlier versions.
+    pub fn exists(data_dir: &Path, interface: &InterfaceName) -> Result<bool, Error> {
+        for path in [
+            Self::get_path(data_dir, interface),
+            Self::get_legacy_path(data_dir, interface),
+        ] {
+            if path.try_exists().with_path(&path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn _open(
@@ -118,32 +172,33 @@ impl DataStore {
         interface: &InterfaceName,
         config: &InterfaceConfig,
         create: bool,
-    ) -> Result<Self, WrappedIoError> {
+    ) -> Result<Self, Error> {
         ensure_dirs_exist(&[data_dir])?;
-        Self::open_with_path(
-            Self::get_path(data_dir, interface),
+        Self::open_with_paths(
+            &Self::get_path(data_dir, interface),
+            &Self::get_legacy_path(data_dir, interface),
             config.interface.address,
             create,
         )
     }
 
-    /// Open the data store residing at "`data_dir`/`interface`.json", whose peers must lie within
-    /// the network of `config`.
+    /// Open the data store residing at "`data_dir`/`interface`.db", whose peers must lie within
+    /// the network of `config`, importing the one of earlier versions if there is one.
     pub fn open(
         data_dir: &Path,
         interface: &InterfaceName,
         config: &InterfaceConfig,
-    ) -> Result<Self, WrappedIoError> {
+    ) -> Result<Self, Error> {
         Self::_open(data_dir, interface, config, false)
     }
 
-    /// Open or create the data store residing at "`data_dir`/`interface`.json", whose peers must
-    /// lie within the network of `config`.
+    /// Open or create the data store residing at "`data_dir`/`interface`.db", whose peers must
+    /// lie within the network of `config`, importing the one of earlier versions if there is one.
     pub fn open_or_create(
         data_dir: &Path,
         interface: &InterfaceName,
         config: &InterfaceConfig,
-    ) -> Result<Self, WrappedIoError> {
+    ) -> Result<Self, Error> {
         Self::_open(data_dir, interface, config, true)
     }
 
@@ -226,7 +281,9 @@ impl DataStore {
 
     #[cfg(test)]
     fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<(&'a Peer, Error)> {
-        self.update_reported_peers(new_peers, &[])
+        let dropped = self.update_reported_peers(new_peers, &[]);
+        self.write().unwrap();
+        dropped
     }
 
     /// Merges `new_peers` into the data store, dropping each that is invalid. `invalid_peer_keys`
@@ -277,34 +334,385 @@ impl DataStore {
         self.cidrs = new_cidrs;
     }
 
-    fn write(&mut self) -> Result<(), io::Error> {
-        let contents = Contents::V1 {
-            peers: self.peers.peers.clone(),
-            cidrs: self.cidrs.clone(),
-        };
-        self.file.rewind()?;
-        self.file.set_len(0)?;
-        self.file
-            .write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
+    /// Writes the peers and CIDRs to the database in one transaction, and loads them back.
+    fn write(&mut self) -> Result<(), Error> {
+        let tx = self.conn.transaction()?;
+        for peer in self.peers.peers.iter() {
+            write_peer(&tx, peer)
+                .with_context(|| format!("failed to store peer {}", peer.public_key))?;
+        }
+        write_cidrs(&tx, &self.cidrs)?;
+        tx.commit()?;
+
+        (self.peers, self.cidrs) = load(&self.conn, self.network)?;
         Ok(())
     }
 }
 
-/// The ID of the record of the coordinator from the interface config. Server IDs are positive, so
-/// it never collides with the ID of a fetched peer.
-const INTRODUCED_COORDINATOR_ID: i64 = -1;
-/// The ID of the record of this client from the interface config.
-const INTRODUCED_SELF_ID: i64 = -2;
+/// Opens the database at `path`, configures the connection, and migrates the schema to
+/// [`SCHEMA_VERSION`], importing the legacy data store at `legacy_path` into a new database.
+fn connect(path: &Path, legacy_path: PathBuf, network: IpNet) -> Result<Connection, Error> {
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+
+    // The connection turns off what the data store doesn't need: SQL that deliberately corrupts
+    // the database, functions with side effects called from the schema, and double-quoted
+    // strings, which otherwise fall back to literals when no column has the name and so hide
+    // typos.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    // Recursive triggers make the deletion with which REPLACE resolves a conflict fire the
+    // triggers that refuse to delete pins.
+    conn.pragma_update(None, "recursive_triggers", true)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // A deferred transaction that upgrades from reading to writing can fail with SQLITE_BUSY
+    // despite the busy timeout, so every transaction takes the write lock up front.
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
+
+    let application_id: i32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        application_id == APPLICATION_ID || (application_id == 0 && version == 0),
+        "the file is not an innernet data store"
+    );
+
+    if version > SCHEMA_VERSION {
+        // A newer binary wrote the database. It can be used as it is, unless a later migration
+        // added an invariant that this binary would break.
+        let min_reader_version: i64 = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'min_reader_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            min_reader_version <= SCHEMA_VERSION,
+            "the data store is of version {version}, which needs a newer innernet"
+        );
+        return Ok(conn);
+    }
+
+    if let Err(e) = migrations(legacy_path, network).to_latest(&mut conn) {
+        // Another process may have migrated the database between this one reading its version and
+        // taking the write lock, in which case this migration failed and was rolled back.
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < SCHEMA_VERSION {
+            return Err(e.into());
+        }
+    }
+
+    Ok(conn)
+}
+
+/// Loads the peers and CIDRs of the database. Server IDs aren't stored: every peer has
+/// [`UNKNOWN_ID`], and the CIDRs are numbered from 1, each with the smallest CIDR that contains it
+/// as its parent, and each peer with the smallest CIDR that contains its IP as its CIDR.
+fn load(conn: &Connection, network: IpNet) -> Result<(PeersIndex, Vec<Cidr>), Error> {
+    let mut cidrs = vec![];
+    let mut stmt = conn.prepare(
+        "SELECT address, prefix_len, name FROM cidrs ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let cidr = prefix_from_row(row.get(0)?, row.get(1)?)?;
+        cidrs.push(Cidr {
+            id: cidrs.len() as i64 + 1,
+            contents: CidrContents {
+                name: row.get(2)?,
+                cidr,
+                parent: None,
+            },
+        });
+    }
+    let parents: Vec<Option<i64>> = cidrs
+        .iter()
+        .map(|child| {
+            smallest_containing(&cidrs, |cidr| {
+                *cidr != child.cidr && cidr.contains(&child.cidr)
+            })
+        })
+        .collect();
+    for (cidr, parent) in cidrs.iter_mut().zip(parents) {
+        cidr.contents.parent = parent;
+    }
+
+    let mut endpoints: HashMap<Vec<u8>, (Option<Endpoint>, Vec<Endpoint>)> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT public_key, kind, address, domain, port FROM endpoints
+         ORDER BY public_key, kind, position",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let port: u16 = row.get(4)?;
+        let endpoint = match (
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ) {
+            (Some(address), None) => {
+                Endpoint::from(std::net::SocketAddr::new(ip_from_bytes(&address)?, port))
+            },
+            (None, Some(domain)) => {
+                Endpoint::from_domain(&domain, port).map_err(|e| anyhow!("{domain}: {e}"))?
+            },
+            _ => bail!("an endpoint is neither an address nor a domain"),
+        };
+        let entry = endpoints.entry(row.get(0)?).or_default();
+        match EndpointKind::from_i64(row.get(1)?)? {
+            EndpointKind::Endpoint => entry.0 = Some(endpoint),
+            EndpointKind::Candidate => entry.1.push(endpoint),
+        }
+    }
+
+    let mut peers = PeersIndex::default();
+    let mut stmt = conn.prepare(
+        "SELECT p.public_key, p.name, p.is_admin, p.is_disabled, p.is_redeemed,
+                p.persistent_keepalive_interval, p.invite_expires, a.address
+         FROM peers p
+         LEFT JOIN prefix_pins a ON a.public_key = p.public_key AND a.kind = ?1
+         ORDER BY length(a.address), a.address",
+    )?;
+    let mut rows = stmt.query([PinKind::Address as i64])?;
+    while let Some(row) = rows.next()? {
+        let key_bytes: Vec<u8> = row.get(0)?;
+        let public_key = key_from_bytes(&key_bytes)?;
+        let address: Option<Vec<u8>> = row.get(7)?;
+        let ip = ip_from_bytes(
+            &address.ok_or_else(|| anyhow!("peer {public_key} has no address pinned"))?,
+        )?;
+        ensure!(
+            network.contains(&ip),
+            "peer {public_key} at {ip} is outside of the network {network}"
+        );
+        let invite_expires = row
+            .get::<_, Option<u64>>(6)?
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        let (endpoint, candidates) = endpoints.remove(&key_bytes).unwrap_or_default();
+        let peer = Peer {
+            id: UNKNOWN_ID,
+            contents: PeerContents {
+                name: Hostname::unchecked(row.get(1)?),
+                ip,
+                cidr_id: smallest_containing(&cidrs, |cidr| cidr.contains(&ip))
+                    .unwrap_or(UNKNOWN_ID),
+                public_key,
+                endpoint,
+                persistent_keepalive_interval: row.get(5)?,
+                is_admin: row.get(2)?,
+                is_disabled: row.get(3)?,
+                is_redeemed: row.get(4)?,
+                invite_expires,
+                candidates,
+            },
+        };
+        let status = peers.insert(peer);
+        ensure!(
+            status == PinStatus::New,
+            "the pins of the data store conflict ({status:?})"
+        );
+    }
+
+    Ok((peers, cidrs))
+}
+
+/// Writes `peer` and its endpoints, and pins its IP to its public key, or checks that it is
+/// already pinned to it.
+fn write_peer(tx: &Transaction, peer: &Peer) -> Result<(), Error> {
+    let public_key = key_to_bytes(&peer.public_key)?;
+    let invite_expires = peer
+        .invite_expires
+        .map(|time| time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO peers (public_key, name, is_admin, is_disabled, is_redeemed,
+                            persistent_keepalive_interval, invite_expires)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (public_key) DO UPDATE SET
+           name = excluded.name,
+           is_admin = excluded.is_admin,
+           is_disabled = excluded.is_disabled,
+           is_redeemed = excluded.is_redeemed,
+           persistent_keepalive_interval = excluded.persistent_keepalive_interval,
+           invite_expires = excluded.invite_expires",
+        params![
+            public_key,
+            &*peer.name,
+            peer.is_admin,
+            peer.is_disabled,
+            peer.is_redeemed,
+            peer.persistent_keepalive_interval,
+            invite_expires,
+        ],
+    )?;
+
+    let address = ip_to_bytes(peer.ip);
+    let pinned: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT address FROM prefix_pins WHERE public_key = ?1 AND kind = ?2",
+            params![public_key, PinKind::Address as i64],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match pinned {
+        None => {
+            tx.execute(
+                "INSERT INTO prefix_pins (address, prefix_len, public_key, kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    address,
+                    address.len() * 8,
+                    public_key,
+                    PinKind::Address as i64
+                ],
+            )?;
+        },
+        Some(pinned) => ensure!(pinned == address, "its address is pinned to another IP"),
+    }
+
+    tx.execute(
+        "DELETE FROM endpoints WHERE public_key = ?1",
+        params![public_key],
+    )?;
+    let endpoints = peer
+        .endpoint
+        .iter()
+        .map(|endpoint| (EndpointKind::Endpoint, 0, endpoint))
+        .chain(
+            peer.candidates
+                .iter()
+                .enumerate()
+                .map(|(position, endpoint)| (EndpointKind::Candidate, position, endpoint)),
+        );
+    for (kind, position, endpoint) in endpoints {
+        tx.execute(
+            "INSERT INTO endpoints (public_key, kind, position, address, domain, port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                public_key,
+                kind as i64,
+                position,
+                endpoint.ip().map(ip_to_bytes),
+                endpoint.domain(),
+                endpoint.port(),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Replaces the CIDRs of the database with `cidrs`. They are only displayed, so of two CIDRs with
+/// the same prefix, the first is kept.
+fn write_cidrs(tx: &Transaction, cidrs: &[Cidr]) -> Result<(), Error> {
+    tx.execute("DELETE FROM cidrs", [])?;
+    for cidr in cidrs {
+        let prefix = cidr.cidr.trunc();
+        tx.execute(
+            "INSERT INTO cidrs (address, prefix_len, name) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![ip_to_bytes(prefix.addr()), prefix.prefix_len(), cidr.name],
+        )?;
+    }
+    Ok(())
+}
+
+/// Imports the legacy data store at `path` into the new database, if there is one. The import
+/// refuses, rather than repairs, a data store that holds an invalid public key, a peer outside the
+/// network or two records in conflict. The file itself is left untouched, so that earlier
+/// versions still find their pins in it.
+fn import_legacy(tx: &Transaction, path: &Path, network: IpNet) -> Result<(), Error> {
+    let json = match std::fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => Err::<String, _>(e).with_path(path)?,
+    };
+    // An empty file was a new data store.
+    if json.is_empty() {
+        return Ok(());
+    }
+    let LegacyContents::V1 { peers, cidrs } = serde_json::from_str(&json)
+        .with_context(|| format!("{} is not a valid data store", path.display()))?;
+    for peer in &peers {
+        ensure!(
+            network.contains(&peer.ip),
+            "{}: peer {} at {} is outside of the network {}",
+            path.display(),
+            peer.public_key,
+            peer.ip,
+            network,
+        );
+        write_peer(tx, peer).with_context(|| {
+            format!(
+                "{}: failed to import peer {} at {}",
+                path.display(),
+                peer.public_key,
+                peer.ip
+            )
+        })?;
+    }
+    write_cidrs(tx, &cidrs)?;
+    log::info!(
+        "imported {} peers from {} into the new data store.",
+        peers.len(),
+        path.display()
+    );
+
+    Ok(())
+}
+
+/// The ID of the smallest of `cidrs` for which `contains` holds.
+fn smallest_containing(cidrs: &[Cidr], contains: impl Fn(&IpNet) -> bool) -> Option<i64> {
+    cidrs
+        .iter()
+        .filter(|cidr| contains(&cidr.cidr))
+        .max_by_key(|cidr| cidr.cidr.prefix_len())
+        .map(|cidr| cidr.id)
+}
+
+fn key_to_bytes(public_key: &str) -> Result<[u8; 32], Error> {
+    Ok(Key::from_base64(public_key)?.0)
+}
+
+fn key_from_bytes(bytes: &[u8]) -> Result<String, Error> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("a public key is not 32 bytes"))?;
+    Ok(Key(bytes).to_base64())
+}
+
+fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+fn ip_from_bytes(bytes: &[u8]) -> Result<IpAddr, Error> {
+    if let Ok(octets) = <[u8; 4]>::try_from(bytes) {
+        Ok(Ipv4Addr::from(octets).into())
+    } else if let Ok(octets) = <[u8; 16]>::try_from(bytes) {
+        Ok(Ipv6Addr::from(octets).into())
+    } else {
+        bail!("an address is neither 4 nor 16 bytes")
+    }
+}
+
+fn prefix_from_row(address: Vec<u8>, prefix_len: u8) -> Result<IpNet, Error> {
+    Ok(IpNet::new(ip_from_bytes(&address)?, prefix_len)?)
+}
 
 /// The coordinator and this client, as the interface config introduces them. Each record is named
 /// by its public key, and has no CIDR.
 fn introduced_peers(config: &InterfaceConfig) -> Result<[Peer; 2], Error> {
-    let introduced = |id, ip, public_key: String, endpoint| Peer {
-        id,
+    let introduced = |ip, public_key: String, endpoint| Peer {
+        id: UNKNOWN_ID,
         contents: PeerContents {
             name: Hostname::placeholder(&public_key),
             ip,
-            cidr_id: -1,
+            cidr_id: UNKNOWN_ID,
             public_key,
             endpoint,
             persistent_keepalive_interval: None,
@@ -322,17 +730,11 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<[Peer; 2], Error> {
         .to_base64();
     Ok([
         introduced(
-            INTRODUCED_COORDINATOR_ID,
             config.server.internal_endpoint.ip(),
             server_key,
             Some(config.server.external_endpoint.clone()),
         ),
-        introduced(
-            INTRODUCED_SELF_ID,
-            config.interface.address.addr(),
-            own_key,
-            None,
-        ),
+        introduced(config.interface.address.addr(), own_key, None),
     ])
 }
 
@@ -430,9 +832,30 @@ mod tests {
 
     static NETWORK: Lazy<IpNet> = Lazy::new(|| "10.0.0.0/16".parse().unwrap());
 
+    fn db_path(dir: &Path) -> PathBuf {
+        dir.join("wg0.db")
+    }
+
+    fn legacy_path(dir: &Path) -> PathBuf {
+        dir.join("wg0.json")
+    }
+
+    fn open(dir: &Path, create: bool) -> Result<DataStore, Error> {
+        DataStore::open_with_paths(&db_path(dir), &legacy_path(dir), *NETWORK, create)
+    }
+
+    /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it.
+    fn write_legacy(dir: &Path, peers: &[Peer], cidrs: &[Cidr]) {
+        let contents = serde_json::json!({ "version": "1", "peers": peers, "cidrs": cidrs });
+        std::fs::write(
+            legacy_path(dir),
+            serde_json::to_string_pretty(&contents).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn setup_basic_store(dir: &Path) {
-        let mut store =
-            DataStore::open_with_path(dir.join("peer_store.json"), *NETWORK, true).unwrap();
+        let mut store = open(dir, true).unwrap();
 
         println!("{store:?}");
         assert_eq!(0, store.peers().len());
@@ -462,8 +885,7 @@ mod tests {
     fn test_sanity() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let store = open(dir.path(), false).unwrap();
         assert_eq!(store.peers(), &*BASE_PEERS);
         assert_eq!(store.cidrs(), &*BASE_CIDRS);
     }
@@ -472,8 +894,7 @@ mod tests {
     fn test_pinning() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // Should work, since peer is unmodified.
         assert!(store.update_peers(&BASE_PEERS).is_empty());
@@ -494,8 +915,7 @@ mod tests {
     fn test_pinning_public_key_to_ip() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // The same public key reported at another IP is dropped from the update, and the pinned
         // peer, which was reported, keeps its record unchanged.
@@ -521,35 +941,59 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peer_store.json");
-        DataStore::open_with_path(&path, *NETWORK, true).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        open(dir.path(), true).unwrap();
+        let mode = std::fs::metadata(db_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode & 0o077, 0);
     }
 
     #[test]
-    fn test_invalid_store() {
+    fn test_missing_store() {
+        // Without a database or a legacy data store, only creating opens one.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peer_store.json");
+        assert!(open(dir.path(), false).is_err());
+        assert!(!db_path(dir.path()).exists());
+        assert!(open(dir.path(), true).unwrap().peers().is_empty());
+    }
+
+    #[test]
+    fn test_invalid_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_path(dir.path());
 
         // An empty file is a new data store.
-        File::create(&path).unwrap();
-        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
-        assert!(store.peers().is_empty());
+        std::fs::write(&path, "").unwrap();
+        assert!(open(dir.path(), false).unwrap().peers().is_empty());
 
-        // A file that fails to parse is refused rather than replaced, even if it is only whitespace.
-        std::fs::write(&path, r#"{"version": "1", "peers": [{"#).unwrap();
-        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
-        std::fs::write(&path, "\n").unwrap();
-        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
+        // A file that fails to parse is refused, even if it is only whitespace, and the database
+        // is left without a schema, so that the import is tried again on the next open.
+        for invalid in [r#"{"version": "1", "peers": [{"#, "\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(legacy_path(dir.path()), invalid).unwrap();
+            assert!(open(dir.path(), false).is_err());
+            let conn = Connection::open(db_path(dir.path())).unwrap();
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 0);
+            let tables: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(tables, 0);
+
+            write_legacy(dir.path(), &BASE_PEERS, &BASE_CIDRS);
+            assert_eq!(open(dir.path(), false).unwrap().peers(), &*BASE_PEERS);
+        }
     }
 
     #[test]
     fn test_invalid_name() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // A peer whose name isn't a valid hostname is dropped, and the other peers are kept.
         let mut invalid = BASE_PEERS.clone();
@@ -574,8 +1018,7 @@ mod tests {
     fn test_network() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // A new peer outside the network is dropped, and the other peers are kept.
         let mut outside = BASE_PEERS.clone();
@@ -588,36 +1031,24 @@ mod tests {
         assert_eq!(dropped[0].0, &outside[1]);
         assert_eq!(store.peers(), &*BASE_PEERS);
 
-        // A stored peer outside the network is ignored when the data store is opened.
-        let path = dir.path().join("outside.json");
-        outside[1].contents.public_key = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=".to_string();
-        let contents = Contents::V1 {
-            peers: outside.clone(),
-            cidrs: vec![],
-        };
-        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
-        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
-        assert_eq!(store.peers(), &*BASE_PEERS);
+        // A legacy data store with a peer outside the network is refused.
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy(dir.path(), &outside, &[]);
+        assert!(open(dir.path(), false).is_err());
     }
 
     #[test]
     fn test_invalid_peers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peer_store.json");
 
-        // A peer with an invalid public key is dropped, and the other peers are kept, both from a
-        // stored data store and from a state.
+        // A legacy data store with an invalid public key is refused, while a state drops the peer
+        // and keeps the others.
         let mut invalid = BASE_PEERS[0].clone();
         invalid.contents.ip = "10.0.0.2".parse().unwrap();
         invalid.contents.public_key = "abc".to_string();
         let peers = [BASE_PEERS[0].clone(), invalid];
-        let contents = Contents::V1 {
-            peers: peers.to_vec(),
-            cidrs: vec![],
-        };
-        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
-        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
-        assert_eq!(store.peers(), &*BASE_PEERS);
+        write_legacy(dir.path(), &peers, &[]);
+        assert!(open(dir.path(), false).is_err());
 
         let state = State {
             peers: peers.to_vec(),
@@ -633,15 +1064,15 @@ mod tests {
     fn test_invalid_reported_peer() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // A reported peer that fails to deserialize, but whose public key is valid, was still
         // reported, so the stored peer with that key keeps its record rather than being disabled.
         let mut entry = serde_json::to_value(&BASE_PEERS[0]).unwrap();
         entry["ip"] = "not an IP".into();
         let state: State =
-            serde_json::from_value(serde_json::json!({ "peers": [entry], "cidrs": [] })).unwrap();
+            serde_json::from_value(serde_json::json!({ "peers": [entry], "cidrs": *BASE_CIDRS }))
+                .unwrap();
         assert!(state.peers.is_empty());
         assert_eq!(state.invalid_peer_keys, [BASE_PEERS[0].public_key.clone()]);
         assert!(store.update(&state).unwrap().is_empty());
@@ -649,7 +1080,8 @@ mod tests {
 
         // A peer that isn't reported at all is disabled.
         let state: State =
-            serde_json::from_value(serde_json::json!({ "peers": [], "cidrs": [] })).unwrap();
+            serde_json::from_value(serde_json::json!({ "peers": [], "cidrs": *BASE_CIDRS }))
+                .unwrap();
         store.update(&state).unwrap();
         assert_eq!(store.peers(), &disabled(&BASE_PEERS)[..]);
     }
@@ -658,8 +1090,7 @@ mod tests {
     fn test_first_wins() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // Of two new peers at the same IP, the first is kept and the second dropped.
         let mut same_ip = BASE_PEERS.clone();
@@ -689,28 +1120,25 @@ mod tests {
     }
 
     #[test]
-    fn test_conflicting_stored_peers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peer_store.json");
-
-        // A data store holding a later record of a peer at another IP keeps the earliest record.
+    fn test_conflicting_legacy_peers() {
+        // A legacy data store holding two records of a peer at different IPs, or two peers at one
+        // IP, is refused.
         let mut moved = BASE_PEERS[0].clone();
         moved.contents.ip = "10.0.0.2".parse().unwrap();
-        let contents = Contents::V1 {
-            peers: vec![BASE_PEERS[0].clone(), moved],
-            cidrs: vec![],
-        };
-        std::fs::write(&path, serde_json::to_string(&contents).unwrap()).unwrap();
-        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
-        assert_eq!(store.peers(), &*BASE_PEERS);
+        let mut replaced = BASE_PEERS[0].clone();
+        replaced.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        for conflicting in [moved, replaced] {
+            let dir = tempfile::tempdir().unwrap();
+            write_legacy(dir.path(), &[BASE_PEERS[0].clone(), conflicting], &[]);
+            assert!(open(dir.path(), false).is_err());
+        }
     }
 
     #[test]
     fn test_peer_persistence() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
 
         // Should work, since peer is unmodified.
         assert!(store.update_peers(&[]).is_empty());
@@ -746,10 +1174,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let own_key = wireguard_control::KeyPair::generate();
         let config = introducing_config(&own_key);
-        let path = dir.path().join("peer_store.json");
 
         // A new data store pins the coordinator and this client, named by their public keys.
-        let mut store = DataStore::open_with_path(&path, *NETWORK, true).unwrap();
+        let mut store = open(dir.path(), true).unwrap();
         store.introduce(&config).unwrap();
         let peers = store.peers();
         assert_eq!(peers.len(), 2);
@@ -769,15 +1196,284 @@ mod tests {
             "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         assert_eq!(store.update_peers(&replaced).len(), 1);
 
-        // The server's record of the coordinator replaces the introduced one.
+        // The server's record of the coordinator replaces the introduced one. The data store
+        // holds no CIDRs, so the coordinator has none.
         assert!(store
             .update_peers(std::slice::from_ref(&*COORDINATOR))
             .is_empty());
-        assert_eq!(store.peers()[0], *COORDINATOR);
+        let mut expected = COORDINATOR.clone();
+        expected.contents.cidr_id = UNKNOWN_ID;
+        assert_eq!(store.peers()[0], expected);
         assert_eq!(store.peers().len(), 2);
 
         // Only a new data store is introduced.
         assert!(store.introduce(&config).is_err());
         assert_eq!(store.peers().len(), 2);
+    }
+
+    /// Peers with endpoints of every shape, in a network of each family.
+    fn varied_peers() -> Vec<Peer> {
+        let mut v4 = BASE_PEERS[0].clone();
+        v4.contents.endpoint = Some("203.0.113.1:51820".parse().unwrap());
+        v4.contents.candidates = vec![
+            "192.168.1.2:51820".parse().unwrap(),
+            "[2001:db8::1]:4000".parse().unwrap(),
+            "peer.example.com:1".parse().unwrap(),
+        ];
+        v4.contents.persistent_keepalive_interval = Some(25);
+        v4.contents.invite_expires = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        v4.contents.is_admin = true;
+        let mut domain = BASE_PEERS[0].clone();
+        domain.contents.ip = "10.0.1.1".parse().unwrap();
+        domain.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        domain.contents.endpoint = Some("vpn.example.com:51820".parse().unwrap());
+        domain.contents.cidr_id = 2;
+        vec![v4, domain]
+    }
+
+    fn varied_cidrs() -> Vec<Cidr> {
+        let cidr = |id, name: &str, cidr: &str, parent| Cidr {
+            id,
+            contents: CidrContents {
+                name: name.to_string(),
+                cidr: cidr.parse().unwrap(),
+                parent,
+            },
+        };
+        vec![
+            cidr(1, "cidr", "10.0.0.0/24", Some(3)),
+            cidr(2, "other", "10.0.1.0/24", Some(3)),
+            cidr(3, "root", "10.0.0.0/16", None),
+        ]
+    }
+
+    #[test]
+    fn test_round_trip() {
+        // Every field survives the database, the CIDRs are numbered by prefix, each with the
+        // smallest CIDR containing it as its parent, and each peer with the smallest CIDR
+        // containing its IP.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path(), true).unwrap();
+        let mut cidrs = varied_cidrs();
+        cidrs.reverse();
+        store
+            .update(&State {
+                peers: varied_peers(),
+                cidrs,
+                invalid_peer_keys: vec![],
+            })
+            .unwrap();
+        let expected_cidrs = {
+            let mut cidrs = varied_cidrs();
+            // The CIDRs are ordered by address, then prefix length.
+            cidrs.sort_by_key(|c| (c.cidr.addr(), c.cidr.prefix_len()));
+            for (i, cidr) in cidrs.iter_mut().enumerate() {
+                cidr.id = i as i64 + 1;
+            }
+            cidrs[1].contents.parent = Some(1);
+            cidrs[2].contents.parent = Some(1);
+            cidrs
+        };
+        let mut expected_peers = varied_peers();
+        expected_peers[0].contents.cidr_id = 2;
+        expected_peers[1].contents.cidr_id = 3;
+        assert_eq!(store.cidrs(), &expected_cidrs[..]);
+        assert_eq!(store.peers(), &expected_peers[..]);
+
+        let store = open(dir.path(), false).unwrap();
+        assert_eq!(store.cidrs(), &expected_cidrs[..]);
+        assert_eq!(store.peers(), &expected_peers[..]);
+    }
+
+    #[test]
+    fn test_ipv6_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let network: IpNet = "fd00::/64".parse().unwrap();
+        let mut peer = BASE_PEERS[0].clone();
+        peer.contents.ip = "fd00::1".parse().unwrap();
+        peer.contents.cidr_id = UNKNOWN_ID;
+        peer.contents.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
+        let mut store = DataStore::open_with_paths(
+            &db_path(dir.path()),
+            &legacy_path(dir.path()),
+            network,
+            true,
+        )
+        .unwrap();
+        assert!(store.update_peers(std::slice::from_ref(&peer)).is_empty());
+        assert_eq!(store.peers(), std::slice::from_ref(&peer));
+    }
+
+    #[test]
+    fn test_import_legacy() {
+        // A legacy data store is imported into the new database, without its server IDs, and the
+        // file is left untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy_peers = varied_peers();
+        legacy_peers[0].id = 7;
+        write_legacy(dir.path(), &legacy_peers, &varied_cidrs());
+        let legacy = std::fs::read(legacy_path(dir.path())).unwrap();
+        let mut store = open(dir.path(), false).unwrap();
+        let mut expected_peers = varied_peers();
+        expected_peers[0].contents.cidr_id = 2;
+        expected_peers[1].contents.cidr_id = 3;
+        assert_eq!(store.peers(), &expected_peers[..]);
+        assert_eq!(store.cidrs().len(), 3);
+
+        // From then on the database is the data store, and the legacy one is never read again.
+        store.update_peers(&[]);
+        write_legacy(dir.path(), &[], &[]);
+        let store = open(dir.path(), false).unwrap();
+        assert_eq!(store.peers(), &disabled(&expected_peers)[..]);
+        write_legacy(dir.path(), &legacy_peers, &varied_cidrs());
+        assert_eq!(std::fs::read(legacy_path(dir.path())).unwrap(), legacy);
+    }
+
+    #[test]
+    fn test_connection_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), true).unwrap();
+        let conn = &store.conn;
+        let pragma = |name| -> i64 { conn.pragma_query_value(None, name, |r| r.get(0)).unwrap() };
+        assert_eq!(pragma("foreign_keys"), 1);
+        assert_eq!(pragma("recursive_triggers"), 1);
+        assert_eq!(pragma("trusted_schema"), 0);
+        assert_eq!(pragma("busy_timeout"), BUSY_TIMEOUT.as_millis() as i64);
+        assert_eq!(pragma("application_id"), APPLICATION_ID as i64);
+        assert_eq!(pragma("user_version"), SCHEMA_VERSION);
+        assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());
+        assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML).unwrap());
+        assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL).unwrap());
+
+        // Every table is strict.
+        let lax: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_list WHERE schema = 'main'
+                 AND name NOT LIKE 'sqlite_%' AND strict = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lax, 0);
+    }
+
+    #[test]
+    fn test_kinds_match_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), true).unwrap();
+        let kinds = |table: &str| -> Vec<(i64, String)> {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("SELECT kind, name FROM {table} ORDER BY kind"))
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let expected = |all: &[(i64, &str)]| -> Vec<(i64, String)> {
+            all.iter().map(|(k, n)| (*k, n.to_string())).collect()
+        };
+        assert_eq!(
+            kinds("pin_kinds"),
+            expected(
+                &PinKind::ALL
+                    .iter()
+                    .map(|(k, n)| (*k as i64, *n))
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            kinds("endpoint_kinds"),
+            expected(
+                &EndpointKind::ALL
+                    .iter()
+                    .map(|(k, n)| (*k as i64, *n))
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
+    fn test_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let set = |version: i64, min_reader_version: i64| {
+            let conn = Connection::open(db_path(dir.path())).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'min_reader_version'",
+                [min_reader_version],
+            )
+            .unwrap();
+        };
+
+        // A newer database that this version can still read is opened, without migrating it.
+        set(SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        assert_eq!(open(dir.path(), false).unwrap().peers(), &*BASE_PEERS);
+        let conn = Connection::open(db_path(dir.path())).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+
+        // One that needs a newer reader is refused.
+        set(SCHEMA_VERSION + 1, SCHEMA_VERSION + 1);
+        assert!(open(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn test_foreign_file() {
+        // A database of something else is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(db_path(dir.path())).unwrap();
+        conn.execute_batch("CREATE TABLE other (x); PRAGMA user_version = 1;")
+            .unwrap();
+        assert!(open(dir.path(), false).is_err());
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn test_pins_enforced_by_database() {
+        // The database refuses to move, change or delete a pin, or to delete a peer, including by
+        // REPLACE.
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let store = open(dir.path(), false).unwrap();
+        let key = key_to_bytes(&BASE_PEERS[0].public_key).unwrap();
+        let other = key_to_bytes("HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=").unwrap();
+        let conn = &store.conn;
+        conn.execute_batch(&format!(
+            "INSERT INTO peers VALUES (x'{other}', 'other', 0, 0, 1, NULL, NULL);
+             INSERT INTO prefix_pins VALUES (x'0a000002', 32, x'{other}', 0);",
+            other = hex(&other),
+        ))
+        .unwrap();
+        for refused in [
+            "UPDATE prefix_pins SET kind = kind",
+            "UPDATE prefix_pins SET address = x'0a000003' WHERE public_key = x'{key}'",
+            "UPDATE prefix_pins SET public_key = x'{other}' WHERE public_key = x'{key}'",
+            "INSERT OR REPLACE INTO prefix_pins VALUES (x'0a000001', 32, x'{other}', 0)",
+            "INSERT INTO prefix_pins VALUES (x'0a000001', 32, x'{other}', 0)
+             ON CONFLICT DO UPDATE SET public_key = excluded.public_key",
+            "INSERT INTO prefix_pins VALUES (x'0a000003', 32, x'{key}', 0)",
+            "INSERT INTO prefix_pins VALUES (x'0a000003', 24, x'{other}', 0)",
+            "DELETE FROM prefix_pins WHERE public_key = x'{key}'",
+            "DELETE FROM peers WHERE public_key = x'{key}'",
+            "INSERT OR REPLACE INTO peers VALUES (x'{key}', 'blah', 0, 0, 1, NULL, NULL)",
+        ] {
+            let refused = refused
+                .replace("{key}", &hex(&key))
+                .replace("{other}", &hex(&other));
+            assert!(
+                conn.execute_batch(&refused).is_err(),
+                "{refused} was accepted"
+            );
+        }
+        drop(store);
+        assert_eq!(open(dir.path(), false).unwrap().peers()[0], BASE_PEERS[0]);
     }
 }

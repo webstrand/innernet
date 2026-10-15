@@ -26,6 +26,8 @@ pub enum RedeemInviteError {
     InterfaceConfigExists(InterfaceName),
     #[error("Data store for innernet interface {0} already exists.")]
     DataStoreExists(InterfaceName),
+    #[error("Error accessing the data store: {0:#}")]
+    DataStoreAccess(Error),
     #[error("Error introducing the coordinator and this client into the data store: {0:#}")]
     DataStoreIntroduction(Error),
     #[error("Error making a REST request: {0}")]
@@ -65,7 +67,7 @@ pub fn redeem_invite(
     if config_path.exists() {
         return Err(RedeemInviteError::InterfaceConfigExists(*interface));
     }
-    if DataStore::get_path(data_dir, interface).exists() {
+    if DataStore::exists(data_dir, interface).map_err(RedeemInviteError::DataStoreAccess)? {
         return Err(RedeemInviteError::DataStoreExists(*interface));
     }
 
@@ -151,7 +153,6 @@ fn update_keypair(
     );
 
     DataStore::open_or_create(data_dir, interface, &config)
-        .map_err(Error::from)
         .and_then(|mut store| store.introduce(&config))
         .map_err(RedeemInviteError::DataStoreIntroduction)?;
 

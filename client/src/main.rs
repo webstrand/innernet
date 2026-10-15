@@ -437,9 +437,8 @@ fn up(
 
 fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Error> {
     let config = InterfaceConfig::get_path(&opts.config_dir, interface);
-    let data = DataStore::get_path(&opts.data_dir, interface);
 
-    if !config.exists() && !data.exists() {
+    if !config.exists() && !DataStore::exists(&opts.data_dir, interface)? {
         bail!(
             "No network named \"{}\" exists.",
             interface.as_str_lossy().yellow()
@@ -462,10 +461,17 @@ fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Er
             .with_path(&config)
             .map_err(|e| log::warn!("{}", e.to_string().yellow()))
             .ok();
-        std::fs::remove_file(&data)
-            .with_path(&data)
-            .map_err(|e| log::warn!("{}", e.to_string().yellow()))
-            .ok();
+        for data in DataStore::get_paths(&opts.data_dir, interface) {
+            match std::fs::remove_file(&data) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                result => {
+                    result
+                        .with_path(&data)
+                        .map_err(|e| log::warn!("{}", e.to_string().yellow()))
+                        .ok();
+                },
+            }
+        }
         log::info!(
             "network {} is uninstalled.",
             interface.as_str_lossy().yellow()
@@ -924,8 +930,7 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
         .into_iter()
         .map(|name| -> Result<Option<_>, Error> {
             // Skip WireGuard interfaces that aren't managed by innernet.
-            let path = DataStore::get_path(&opts.data_dir, &name);
-            if !path.try_exists().with_path(&path)? {
+            if !DataStore::exists(&opts.data_dir, &name)? {
                 return Ok(None);
             }
 

@@ -158,6 +158,31 @@ impl Endpoint {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// The host of the endpoint, if it is an IP address.
+    pub fn ip(&self) -> Option<IpAddr> {
+        match &self.host {
+            Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
+            Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
+            Host::Domain(_) => None,
+        }
+    }
+
+    /// The host of the endpoint, if it is a domain name.
+    pub fn domain(&self) -> Option<&str> {
+        match &self.host {
+            Host::Domain(domain) => Some(domain),
+            Host::Ipv4(_) | Host::Ipv6(_) => None,
+        }
+    }
+
+    /// The endpoint at `domain`, which must be a domain name rather than an IP address.
+    pub fn from_domain(domain: &str, port: u16) -> Result<Self, &'static str> {
+        match Host::parse(domain) {
+            Ok(host @ Host::Domain(_)) => Ok(Self { host, port }),
+            _ => Err("not a domain name"),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -635,14 +660,6 @@ fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<Peer>, Vec<String>) {
     (valid, invalid_keys)
 }
 
-/// Deserializes a list of peers, dropping with a warning each peer that fails to deserialize, such
-/// as one with an invalid public key, so that one invalid peer doesn't cost the others.
-pub fn deserialize_valid_peers<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<Peer>, D::Error> {
-    Ok(split_valid_peers(Vec::<MaybePeer>::deserialize(deserializer)?).0)
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Peer {
     pub id: i64,
@@ -980,6 +997,11 @@ impl Hostname {
     /// placeholder is never a valid hostname, and never written to the hosts file.
     pub fn placeholder(public_key: &str) -> Self {
         Self(public_key.to_string())
+    }
+
+    /// The name as it was stored, without validating it, as deserializing doesn't either.
+    pub fn unchecked(name: String) -> Self {
+        Self(name)
     }
 }
 
