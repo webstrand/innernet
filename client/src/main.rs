@@ -1420,7 +1420,25 @@ fn print_peer(
         );
         println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);
         if !peer.delegations.is_empty() {
-            let delegations: Vec<_> = peer.delegations.iter().map(|d| d.to_string()).collect();
+            let announced = peer.announced_delegations();
+            let delegations: Vec<_> = peer
+                .delegations
+                .iter()
+                .map(|delegation| {
+                    let parts: Vec<_> = announced
+                        .iter()
+                        .filter(|prefix| delegation.contains(*prefix))
+                        .collect();
+                    if parts.is_empty() {
+                        format!("{delegation} {}", "(not announced)".dimmed())
+                    } else if parts.contains(&delegation) {
+                        delegation.to_string()
+                    } else {
+                        let parts: Vec<_> = parts.iter().map(|p| p.to_string()).collect();
+                        format!("{delegation} (announced: {})", parts.join(", "))
+                    }
+                })
+                .collect();
             println_pad!(
                 pad,
                 "  {}: {}",
