@@ -836,6 +836,7 @@ dependencies = [
  "anyhow",
  "colored",
  "env_logger",
+ "innernet-domain",
  "innernet-shared",
  "ipnet",
  "log",

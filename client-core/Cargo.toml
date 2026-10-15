@@ -20,6 +20,7 @@ version = "2.0.0"
 [dependencies]
 anyhow = "1"
 colored.workspace = true
+innernet-domain = { version = "2.0.0", path = "../domain" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = { version = "2.4", features = ["serde"] }
 log = "0.4"

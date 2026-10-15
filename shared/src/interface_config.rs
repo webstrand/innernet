@@ -93,6 +93,18 @@ pub struct InterfaceInfo {
     /// `["0.0.0.0/0", "::/0"]` would.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announce_delegations: Option<Vec<PrefixSelector>>,
+
+    /// The nameserver that this peer offers for names under its own name. It must be at this
+    /// peer's address or within the parts of its delegations that it announces, or peers
+    /// disregard it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce_nameserver: Option<SocketAddr>,
+
+    /// The domain that the nameserver answers for, which peers substitute for this peer's name.
+    /// When absent, it is this peer's name followed by the local host suffix, and a peer without a
+    /// name offers no nameserver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce_zone: Option<String>,
 }
 
 impl InterfaceInfo {
@@ -105,6 +117,8 @@ impl InterfaceInfo {
             external_endpoint: None,
             extra_addresses: vec![],
             announce_delegations: None,
+            announce_nameserver: None,
+            announce_zone: None,
         }
     }
 

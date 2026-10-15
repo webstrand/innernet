@@ -200,7 +200,7 @@ pub fn update_hosts_file(
 /// suffix. Without a suffix, the hostname is the peer name alone, which
 /// [`innernet_domain::is_canonical_domain`] must accept, so that it does not end in a number. A
 /// dotted peer name without a suffix names an arbitrary domain, such as "www.example.com".
-fn peer_hostname(
+pub fn peer_hostname(
     interface: &InterfaceName,
     host_suffix: Option<&str>,
     name: &str,

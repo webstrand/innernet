@@ -19,7 +19,10 @@ use anyhow::{bail, Error};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use wireguard_control::Key;
 
 /// Domain separator for announcements. Only changes on an incompatible format change.
@@ -73,9 +76,22 @@ pub struct Announcement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegations: Vec<IpNet>,
 
+    /// The nameserver that the peer offers for names under its own name, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsAnnouncement>,
+
     /// Fields from newer versions, in strictly increasing tag order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<Extension>,
+}
+
+/// A nameserver that a peer offers. Recipients forward queries for the peer's name, and the names
+/// under it, to the nameserver, with the peer's name replaced by `zone`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsAnnouncement {
+    pub nameserver: SocketAddr,
+    /// The domain that the nameserver answers for, which stands in for the peer's name.
+    pub zone: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +145,25 @@ impl Announcement {
                 },
             }
             out.push(prefix.prefix_len());
+        }
+        match &self.dns {
+            None => out.push(0),
+            Some(dns) => {
+                out.push(1);
+                match dns.nameserver.ip() {
+                    IpAddr::V4(ip) => {
+                        out.push(4);
+                        out.extend_from_slice(&ip.octets());
+                    },
+                    IpAddr::V6(ip) => {
+                        out.push(6);
+                        out.extend_from_slice(&ip.octets());
+                    },
+                }
+                out.extend_from_slice(&dns.nameserver.port().to_le_bytes());
+                out.extend_from_slice(&(dns.zone.len() as u32).to_le_bytes());
+                out.extend_from_slice(dns.zone.as_bytes());
+            },
         }
         out.extend_from_slice(&(self.extensions.len() as u32).to_le_bytes());
         for extension in &self.extensions {
@@ -375,6 +410,10 @@ mod tests {
                 "10.0.0.32/28".parse().unwrap(),
                 "fd00::1:0/112".parse().unwrap(),
             ],
+            dns: Some(DnsAnnouncement {
+                nameserver: "10.0.0.33:53".parse().unwrap(),
+                zone: "example.com".into(),
+            }),
             extensions: vec![],
         }
     }
@@ -421,7 +460,7 @@ mod tests {
     fn test_rejects_tampering() {
         let (keypair, network, signer) = setup();
         let signed = signer.sign(&network, announcement()).unwrap();
-        let tamper: [fn(&mut Announcement); 8] = [
+        let tamper: [fn(&mut Announcement); 11] = [
             |a| a.timestamp += 1,
             |a| a.allow_observed = false,
             |a| a.endpoint = Some("203.0.113.9:51820".parse().unwrap()),
@@ -429,6 +468,9 @@ mod tests {
             |a| a.candidates.swap(0, 1),
             |a| a.delegations[0] = "10.0.0.32/27".parse().unwrap(),
             |a| a.delegations.swap(0, 1),
+            |a| a.dns = None,
+            |a| a.dns.as_mut().unwrap().nameserver = "10.0.0.33:5353".parse().unwrap(),
+            |a| a.dns.as_mut().unwrap().zone = "example.org".into(),
             |a| {
                 a.extensions.push(Extension {
                     tag: 1,

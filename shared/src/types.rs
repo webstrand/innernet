@@ -709,6 +709,20 @@ impl PeerContents {
         announced
     }
 
+    /// The nameserver that the peer announces, if it is reachable through the peer and its zone
+    /// is a canonical domain name: at the peer's own address, or within the parts of its
+    /// delegations that it announces.
+    pub fn announced_dns(&self) -> Option<&crate::announcement::DnsAnnouncement> {
+        let dns = self.announcement.as_ref()?.announcement.dns.as_ref()?;
+        let address = dns.nameserver.ip();
+        let is_reachable = address == self.ip
+            || self
+                .announced_delegations()
+                .iter()
+                .any(|prefix| prefix.contains(&address));
+        (is_reachable && innernet_domain::is_canonical_domain(&dns.zone)).then_some(dns)
+    }
+
     /// The prefixes WireGuard routes to the peer: its own address, then the parts of its
     /// delegations that it announces.
     pub fn allowed_ips(&self) -> Vec<AllowedIp> {
@@ -1469,6 +1483,7 @@ mod tests {
                 candidates: vec![],
                 allow_observed: false,
                 delegations: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
+                dns: None,
                 extensions: vec![],
             },
             signature: vec![],
@@ -1531,6 +1546,61 @@ mod tests {
             config.allowed_ips,
             ["fd00::1/128", "fd00::1:0/112"].map(|ip| ip.parse::<AllowedIp>().unwrap())
         );
+    }
+
+    #[test]
+    fn test_announced_dns() {
+        let with_dns = |nameserver: &str, zone: &str| {
+            let mut peer = announcing(
+                peer_with("peer1", "10.0.0.1", &["10.0.0.32/28"]),
+                &["10.0.0.32/29"],
+            );
+            peer.contents
+                .announcement
+                .as_mut()
+                .unwrap()
+                .announcement
+                .dns = Some(crate::announcement::DnsAnnouncement {
+                nameserver: nameserver.parse().unwrap(),
+                zone: zone.into(),
+            });
+            peer
+        };
+
+        // At the peer's own address, or within the announced part of a delegation.
+        assert!(with_dns("10.0.0.1:53", "example.com")
+            .announced_dns()
+            .is_some());
+        assert!(with_dns("10.0.0.33:5353", "example.com")
+            .announced_dns()
+            .is_some());
+        // Within a delegation but not its announced part, or outside the peer altogether.
+        assert!(with_dns("10.0.0.41:53", "example.com")
+            .announced_dns()
+            .is_none());
+        assert!(with_dns("10.0.0.2:53", "example.com")
+            .announced_dns()
+            .is_none());
+        assert!(with_dns("192.0.2.1:53", "example.com")
+            .announced_dns()
+            .is_none());
+        // A zone that is not a canonical domain name.
+        assert!(with_dns("10.0.0.1:53", "Example.com")
+            .announced_dns()
+            .is_none());
+        assert!(with_dns("10.0.0.1:53", "example.com.")
+            .announced_dns()
+            .is_none());
+        assert!(with_dns("10.0.0.1:53", "10.0.0.1")
+            .announced_dns()
+            .is_none());
+        // Without an announcement, or one without a nameserver.
+        assert!(peer_with("peer1", "10.0.0.1", &[])
+            .announced_dns()
+            .is_none());
+        assert!(announcing(peer_with("peer1", "10.0.0.1", &[]), &[])
+            .announced_dns()
+            .is_none());
     }
 
     #[test]

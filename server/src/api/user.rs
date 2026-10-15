@@ -770,6 +770,7 @@ mod tests {
             candidates: vec!["192.168.1.2:51820".parse().unwrap()],
             allow_observed: true,
             delegations: vec![],
+            dns: None,
             extensions: vec![],
         }
     }

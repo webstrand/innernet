@@ -10,8 +10,8 @@ use crate::{
 use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_shared::{
-    announcement::{self, Announcement, AnnouncementSigner, Received},
-    get_local_addrs, prefix_set, update_hosts_file,
+    announcement::{self, Announcement, AnnouncementSigner, DnsAnnouncement, Received},
+    get_local_addrs, peer_hostname, prefix_set, update_hosts_file,
     wg::{self, DeviceExt as _},
     Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
@@ -322,13 +322,14 @@ pub fn fetch(
         // Fails before anything is sent if the private key doesn't match the interface.
         let signer = AnnouncementSigner::new(&config.interface.private_key, &own_public_key)
             .context(interface.to_string())?;
-        let delegations = own_peer.map_or(&[][..], |peer| &peer.delegations[..]);
         report_announcement(
             &rest_client,
             nat,
             listen_port,
             &config,
-            delegations,
+            interface,
+            hosts_opts,
+            own_peer,
             &signer,
             &network,
         )?;
@@ -580,16 +581,21 @@ fn warn_about_server_endpoint_override(
 
 /// Signs and reports this peer's announcement: the endpoints it can be reached at, which are its
 /// override from the local config and its local interface addresses as NAT traversal
-/// candidates, and the parts of `delegations`, its own, that the local config selects.
+/// candidates, the parts of its delegations that the local config selects, and the nameserver
+/// that the local config offers. `own_peer` is this peer as the data store holds it.
+#[allow(clippy::too_many_arguments)]
 fn report_announcement(
     rest_client: &RestClient,
     nat: &NatOpts,
     listen_port: u16,
     config: &InterfaceConfig,
-    delegations: &[IpNet],
+    interface: &InterfaceName,
+    hosts_opts: &HostsOpts,
+    own_peer: Option<&Peer>,
     signer: &AnnouncementSigner,
     network: &Key,
 ) -> Result<(), Error> {
+    let delegations = own_peer.map_or(&[][..], |peer| &peer.delegations[..]);
     let mut candidates = local_candidates(nat, listen_port)?;
     candidates.truncate(10);
     let endpoint = config.interface.external_endpoint.clone();
@@ -606,6 +612,7 @@ fn report_announcement(
             candidates,
             allow_observed,
             delegations: prefix_set::select(delegations, &config.interface.announce_delegations()),
+            dns: dns_announcement(config, interface, hosts_opts, own_peer),
             extensions: vec![],
         },
     )?;
@@ -630,6 +637,41 @@ fn report_announcement(
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// The nameserver that the local config offers, with its zone, which defaults to this peer's
+/// hostname. Without a zone and a name to derive it from, or with an invalid zone, none is
+/// offered.
+fn dns_announcement(
+    config: &InterfaceConfig,
+    interface: &InterfaceName,
+    hosts_opts: &HostsOpts,
+    own_peer: Option<&Peer>,
+) -> Option<DnsAnnouncement> {
+    let nameserver = config.interface.announce_nameserver?;
+    let zone = match &config.interface.announce_zone {
+        Some(zone) => zone.clone(),
+        None => {
+            let name = own_peer.and_then(|peer| peer.name.as_ref());
+            match name
+                .and_then(|name| peer_hostname(interface, hosts_opts.host_suffix.as_deref(), name))
+            {
+                Some(zone) => zone,
+                None => {
+                    log::warn!(
+                        "this peer has no hostname to serve as the zone of its nameserver; set \
+                         announce-zone to offer it."
+                    );
+                    return None;
+                },
+            }
+        },
+    };
+    if !innernet_domain::is_canonical_domain(&zone) {
+        log::warn!("the zone {zone:?} of this peer's nameserver is not a valid domain name; not offering it.");
+        return None;
+    }
+    Some(DnsAnnouncement { nameserver, zone })
 }
 
 fn local_candidates(nat: &NatOpts, listen_port: u16) -> Result<Vec<Endpoint>, Error> {
@@ -741,6 +783,7 @@ mod tests {
                         candidates: vec!["192.168.1.2:51820".parse().unwrap()],
                         allow_observed: false,
                         delegations: vec![],
+                        dns: None,
                         extensions: vec![],
                     },
                 )
@@ -838,5 +881,69 @@ mod tests {
         assert!(valid_extra_addresses(&extra, None).is_empty());
         let peer = peer_with_delegations(&[]);
         assert!(valid_extra_addresses(&extra, Some(&peer)).is_empty());
+    }
+
+    #[test]
+    fn test_dns_announcement() {
+        let interface: InterfaceName = "test0".parse().unwrap();
+        let config = |zone: Option<&str>| -> InterfaceConfig {
+            let mut interface = serde_json::json!({
+                "network-name": "test0",
+                "address": "10.0.0.3/16",
+                "private-key": KeyPair::generate().private.to_base64(),
+                "announce-nameserver": "10.0.0.3:53",
+            });
+            if let Some(zone) = zone {
+                interface["announce-zone"] = zone.into();
+            }
+            serde_json::from_value(serde_json::json!({
+                "interface": interface,
+                "server": {
+                    "public-key": KeyPair::generate().public.to_base64(),
+                    "external-endpoint": "198.51.100.1:51820",
+                    "internal-endpoint": "10.0.0.1:51820",
+                },
+            }))
+            .unwrap()
+        };
+        let hosts = |suffix: Option<&str>| HostsOpts {
+            hosts_path: "/nonexistent".into(),
+            no_write_hosts: true,
+            host_suffix: suffix.map(str::to_string),
+        };
+        let peer = Fixture::new().peer;
+        let zone = |zone, suffix, peer: Option<&Peer>| {
+            dns_announcement(&config(zone), &interface, &hosts(suffix), peer).map(|dns| dns.zone)
+        };
+        let name = peer.name.as_deref().unwrap().to_string();
+
+        // The zone defaults to the peer's hostname under the local host suffix.
+        assert_eq!(
+            zone(None, None, Some(&peer)),
+            Some(format!("{name}.test0.wg"))
+        );
+        assert_eq!(
+            zone(None, Some("lan"), Some(&peer)),
+            Some(format!("{name}.lan"))
+        );
+        assert_eq!(zone(None, Some(""), Some(&peer)), Some(name));
+        // A configured zone takes precedence, and an invalid one offers nothing.
+        assert_eq!(
+            zone(Some("example.com"), None, Some(&peer)).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(zone(Some("Example.com"), None, Some(&peer)), None);
+        // Without a name, only a configured zone offers the nameserver.
+        let mut nameless = peer.clone();
+        nameless.contents.name = None;
+        assert_eq!(zone(None, None, Some(&nameless)), None);
+        assert_eq!(zone(None, None, None), None);
+        assert_eq!(
+            zone(Some("example.com"), None, Some(&nameless)).as_deref(),
+            Some("example.com")
+        );
+
+        let dns = dns_announcement(&config(None), &interface, &hosts(None), Some(&peer)).unwrap();
+        assert_eq!(dns.nameserver, "10.0.0.3:53".parse().unwrap());
     }
 }
