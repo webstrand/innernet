@@ -173,6 +173,26 @@ sudo innernet forget-delegation <interface> --prefix <prefix>
 
 `innernet forget-peer` also forgets all of a peer's delegations, and an admin client that runs `innernet delete-delegation` forgets the delegation automatically.
 
+### Offering and Forwarding DNS
+
+A peer can offer a nameserver for its own hostname and the names under it, such as `www.<peer>.<interface>.wg`. The nameserver is not part of innernet, and must be at the peer's own IP address or within the parts of its delegations that it announces. To offer it, set in the `[interface]` section of the peer's config:
+
+```toml
+announce-nameserver = "10.42.1.33:53"
+announce-zone = "example.com"
+```
+
+The nameserver answers for `announce-zone`, which stands for the peer's hostname. When absent, the zone is the peer's own hostname, its name followed by its host suffix. A peer that offers a nameserver has no entry in the hosts file of any peer.
+
+Another peer resolves those names through a DNS forwarder, which `innernet up --daemon` runs when its config has the section:
+
+```toml
+[dns-forwarder]
+listen = "127.0.0.1:5353"
+```
+
+The forwarder answers over UDP and TCP. For a query under the hostname of a peer that offers a nameserver, it replaces the hostname with the peer's zone, forwards the query to the peer's nameserver, and replaces the zone with the hostname again in the answer. It refuses queries for any other name. innernet does not configure the system resolver to use the forwarder, which is for example done with dnsmasq's `server=/<interface>.wg/127.0.0.1#5353`.
+
 ### Specifying a Manual Endpoint
 
 The `innernet` server will try to use the internet endpoint it sees from a peer so other peers can connect to that peer as well. This doesn't always work and you may want to set an endpoint explicitly. To set an endpoint, use
