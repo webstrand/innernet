@@ -690,10 +690,30 @@ pub struct PeerContents {
 }
 
 impl PeerContents {
-    /// The prefixes WireGuard routes to the peer: its own address, then its delegations.
+    /// The parts of the peer's delegations that its announcement accepts traffic for: each
+    /// announced prefix that lies within one of its delegations. Other announced prefixes are
+    /// disregarded, and a peer without an announcement accepts traffic for none of its
+    /// delegations.
+    pub fn announced_delegations(&self) -> Vec<IpNet> {
+        let Some(announcement) = &self.announcement else {
+            return vec![];
+        };
+        let mut announced: Vec<IpNet> = vec![];
+        for prefix in &announcement.announcement.delegations {
+            let prefix = prefix.trunc();
+            if self.delegations.iter().any(|d| d.contains(&prefix)) && !announced.contains(&prefix)
+            {
+                announced.push(prefix);
+            }
+        }
+        announced
+    }
+
+    /// The prefixes WireGuard routes to the peer: its own address, then the parts of its
+    /// delegations that it announces.
     pub fn allowed_ips(&self) -> Vec<AllowedIp> {
         std::iter::once(IpNet::from(self.ip))
-            .chain(self.delegations.iter().copied())
+            .chain(self.announced_delegations())
             .map(|net| AllowedIp {
                 address: net.network(),
                 cidr: net.prefix_len(),
@@ -1439,6 +1459,23 @@ mod tests {
         }
     }
 
+    /// `peer` with an announcement of `prefixes`, unsigned, as only the routing of an accepted
+    /// announcement matters here.
+    fn announcing(mut peer: Peer, prefixes: &[&str]) -> Peer {
+        peer.contents.announcement = Some(crate::announcement::SignedAnnouncement {
+            announcement: crate::announcement::Announcement {
+                timestamp: 1,
+                endpoint: None,
+                candidates: vec![],
+                allow_observed: false,
+                delegations: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
+                extensions: vec![],
+            },
+            signature: vec![],
+        });
+        peer
+    }
+
     fn info_with_allowed_ips(peer: &Peer, allowed_ips: &[&str]) -> PeerInfo {
         let allowed_ips: Vec<AllowedIp> =
             allowed_ips.iter().map(|ip| ip.parse().unwrap()).collect();
@@ -1451,16 +1488,44 @@ mod tests {
     }
 
     #[test]
-    fn test_allowed_ips_include_delegations() {
+    fn test_allowed_ips_include_announced_delegations() {
+        let allowed_ips =
+            |peer: &Peer| PeerConfigBuilder::from(peer).into_peer_config().allowed_ips;
+        let ips =
+            |ips: &[&str]| -> Vec<AllowedIp> { ips.iter().map(|ip| ip.parse().unwrap()).collect() };
         let peer = peer_with("peer1", "10.0.0.1", &["10.0.0.32/28", "10.0.0.7/32"]);
-        let config = PeerConfigBuilder::from(&peer).into_peer_config();
+
+        // Without an announcement, only the peer's own address is routed.
+        assert_eq!(allowed_ips(&peer), ips(&["10.0.0.1/32"]));
+
+        let all = announcing(peer.clone(), &["10.0.0.32/28", "10.0.0.7/32"]);
         assert_eq!(
-            config.allowed_ips,
-            ["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"]
-                .map(|ip| ip.parse::<AllowedIp>().unwrap())
+            allowed_ips(&all),
+            ips(&["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"])
         );
 
-        let peer = peer_with("peer1", "fd00::1", &["fd00::1:0/112"]);
+        // Parts of a delegation are routed, prefixes beyond the delegations are disregarded,
+        // and duplicates are routed once.
+        let partial = announcing(
+            peer.clone(),
+            &[
+                "10.0.0.40/29",
+                "10.0.0.40/29",
+                "10.0.0.32/27",
+                "10.0.0.6/31",
+                "10.0.0.64/28",
+            ],
+        );
+        assert_eq!(allowed_ips(&partial), ips(&["10.0.0.1/32", "10.0.0.40/29"]));
+        assert_eq!(
+            partial.announced_delegations(),
+            vec!["10.0.0.40/29".parse::<IpNet>().unwrap()]
+        );
+
+        let peer = announcing(
+            peer_with("peer1", "fd00::1", &["fd00::1:0/112"]),
+            &["fd00::1:0/112"],
+        );
         let config = PeerConfigBuilder::from(&peer).into_peer_config();
         assert_eq!(
             config.allowed_ips,
@@ -1470,7 +1535,10 @@ mod tests {
 
     #[test]
     fn test_peer_diff_delegations() {
-        let peer = peer_with("peer1", "10.0.0.1", &["10.0.0.32/28", "10.0.0.7/32"]);
+        let peer = announcing(
+            peer_with("peer1", "10.0.0.1", &["10.0.0.32/28", "10.0.0.7/32"]),
+            &["10.0.0.32/28", "10.0.0.7/32"],
+        );
 
         // The same allowed IPs, listed in another order, are no change.
         let info = info_with_allowed_ips(&peer, &["10.0.0.7/32", "10.0.0.1/32", "10.0.0.32/28"]);

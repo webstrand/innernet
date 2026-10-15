@@ -186,8 +186,8 @@ fn open_database_connection(
     Ok(conn)
 }
 
-/// Replaces a peer's allowed IPs on the interface after its delegations changed. Disabled peers
-/// aren't on the interface, and are left off it.
+/// Replaces a peer's allowed IPs on the interface after its delegations or its announcement
+/// changed. Disabled peers aren't on the interface, and are left off it.
 pub(crate) fn update_allowed_ips(
     peer: &Peer,
     interface: &InterfaceName,

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::{DatabaseCidr, DatabasePeer},
+    update_allowed_ips,
     util::{form_body, json_response, status_response},
     Context, ServerError, Session,
 };
@@ -214,6 +215,15 @@ mod handlers {
             }
         }
         selected_peer.set_announcement(&conn, contents)?;
+
+        // The server routes the announced parts of the peer's delegations too.
+        if cfg!(not(test)) {
+            update_allowed_ips(
+                &selected_peer,
+                &session.context.interface,
+                session.context.backend,
+            )?;
+        }
 
         status_response(StatusCode::NO_CONTENT)
     }

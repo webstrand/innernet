@@ -181,6 +181,12 @@ server add-delegation e2e --name b --prefix "$prefix" --yes >/dev/null
 db "SELECT prefix FROM delegations WHERE peer_id = (SELECT id FROM peers WHERE name = 'b')" |
     grep -qx "$prefix" || fail "the delegation isn't stored"
 pass "the delegation is stored"
+# Neither the server nor a routes it before b announces it.
+expect_not_routed srv b "$b_key" "$prefix"
+fetch a
+expect_not_routed a b "$b_key" "$prefix"
+# b announces every delegation by default.
+fetch b
 expect_routed srv b "$b_key" "$prefix"
 fetch a
 expect_routed a b "$b_key" "$prefix"
@@ -319,6 +325,7 @@ pass "a's show lists $prefix as withdrawn from b"
 
 step "reassign it to c"
 server add-delegation e2e --name c --prefix "$prefix" --yes >/dev/null
+fetch c
 fetch a
 expect_log a "dropping delegation $prefix of peer c: PINNING ERROR: Delegation overlaps $prefix, previously seen delegated to peer b."
 expect_not_routed a c "$c_key" "$prefix"
