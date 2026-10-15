@@ -3,6 +3,7 @@ use innernet_shared::{
     ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname, IoErrorContext, Peer,
     PeerContents, State, WrappedIoError,
 };
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -19,6 +20,8 @@ use wireguard_control::{InterfaceName, Key};
 pub struct DataStore {
     file: File,
     contents: Contents,
+    /// The network of the interface, from its config. It is not persisted.
+    network: IpNet,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,7 +32,11 @@ enum Contents {
 }
 
 impl DataStore {
-    fn open_with_path<P: AsRef<Path>>(path: P, create: bool) -> Result<Self, WrappedIoError> {
+    fn open_with_path<P: AsRef<Path>>(
+        path: P,
+        network: IpNet,
+        create: bool,
+    ) -> Result<Self, WrappedIoError> {
         let path = path.as_ref();
 
         // The mode applies only if the file is created, in the same call that creates it.
@@ -56,7 +63,11 @@ impl DataStore {
             Err(e) => return Err(io::Error::from(e)).with_path(path),
         };
 
-        Ok(Self { file, contents })
+        Ok(Self {
+            file,
+            contents,
+            network: network.trunc(),
+        })
     }
 
     /// Produce the path "`data_dir`/`interface`.json".
@@ -67,23 +78,35 @@ impl DataStore {
     fn _open(
         data_dir: &Path,
         interface: &InterfaceName,
+        config: &InterfaceConfig,
         create: bool,
     ) -> Result<Self, WrappedIoError> {
         ensure_dirs_exist(&[data_dir])?;
-        Self::open_with_path(Self::get_path(data_dir, interface), create)
+        Self::open_with_path(
+            Self::get_path(data_dir, interface),
+            config.interface.address,
+            create,
+        )
     }
 
-    /// Open the data store residing at "`data_dir`/`interface`.json".
-    pub fn open(data_dir: &Path, interface: &InterfaceName) -> Result<Self, WrappedIoError> {
-        Self::_open(data_dir, interface, false)
+    /// Open the data store residing at "`data_dir`/`interface`.json", whose peers must lie within
+    /// the network of `config`.
+    pub fn open(
+        data_dir: &Path,
+        interface: &InterfaceName,
+        config: &InterfaceConfig,
+    ) -> Result<Self, WrappedIoError> {
+        Self::_open(data_dir, interface, config, false)
     }
 
-    /// Open or create the data store residing at "`data_dir`/`interface`.json".
+    /// Open or create the data store residing at "`data_dir`/`interface`.json", whose peers must
+    /// lie within the network of `config`.
     pub fn open_or_create(
         data_dir: &Path,
         interface: &InterfaceName,
+        config: &InterfaceConfig,
     ) -> Result<Self, WrappedIoError> {
-        Self::_open(data_dir, interface, true)
+        Self::_open(data_dir, interface, config, true)
     }
 
     /// Records the coordinator and this client as the interface config introduces them, and
@@ -111,8 +134,8 @@ impl DataStore {
     ///
     /// A peer that the data store already holds is updated, a new peer is added, and a peer that
     /// is absent from `state` is disabled rather than deleted, so that its (IP, PublicKey) tuple
-    /// remains pinned. The update is refused if any peer of `state` has a pinned IP with a
-    /// different public key, or a pinned public key at a different IP.
+    /// remains pinned. The update is refused if any peer of `state` conflicts with a pin or lies
+    /// outside the network of the interface.
     ///
     /// Pinning prevents a compromised server from impersonating an existing peer, but not from
     /// adding a new peer under its control.
@@ -124,25 +147,46 @@ impl DataStore {
         Ok(())
     }
 
-    fn update_peers(&mut self, new_peers: &[Peer]) -> Result<(), Error> {
-        let peers = match &mut self.contents {
-            Contents::V1 { ref mut peers, .. } => peers,
-        };
-
-        for new_peer in new_peers.iter() {
-            for existing_peer in peers.iter() {
-                if existing_peer.ip == new_peer.ip
-                    && existing_peer.public_key != new_peer.public_key
-                {
+    /// Validates that no peer in `candidates` has an IP pinned to a different public key, or a
+    /// public key pinned to a different IP.
+    fn check_pins(&self, candidates: &[Peer]) -> Result<(), Error> {
+        for candidate in candidates.iter() {
+            for pin in self.peers() {
+                if pin.ip == candidate.ip && pin.public_key != candidate.public_key {
                     bail!("PINNING ERROR: New peer has same IP but different public key.");
                 }
-                if existing_peer.public_key == new_peer.public_key
-                    && existing_peer.ip != new_peer.ip
-                {
+                if pin.public_key == candidate.public_key && pin.ip != candidate.ip {
                     bail!("PINNING ERROR: New peer has same public key but different IP.");
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Validates that every peer in `candidates` lies within the network of the interface.
+    fn check_network_closure(&self, candidates: &[Peer]) -> Result<(), Error> {
+        for candidate in candidates.iter() {
+            if !self.network.contains(&candidate.ip) {
+                bail!(
+                    "peer {} has IP {} outside of the network {}.",
+                    candidate.name,
+                    candidate.ip,
+                    self.network
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn update_peers(&mut self, new_peers: &[Peer]) -> Result<(), Error> {
+        self.check_network_closure(new_peers)?;
+        self.check_pins(new_peers)?;
+
+        let peers = match &mut self.contents {
+            Contents::V1 { ref mut peers, .. } => peers,
+        };
 
         for new_peer in new_peers.iter() {
             if let Some(existing_peer) = peers
@@ -274,8 +318,11 @@ mod tests {
         }]
     });
 
+    static NETWORK: Lazy<IpNet> = Lazy::new(|| "10.0.0.0/16".parse().unwrap());
+
     fn setup_basic_store(dir: &Path) {
-        let mut store = DataStore::open_with_path(dir.join("peer_store.json"), true).unwrap();
+        let mut store =
+            DataStore::open_with_path(dir.join("peer_store.json"), *NETWORK, true).unwrap();
 
         println!("{store:?}");
         assert_eq!(0, store.peers().len());
@@ -293,7 +340,8 @@ mod tests {
     fn test_sanity() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
-        let store = DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+        let store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
         assert_eq!(store.peers(), &*BASE_PEERS);
         assert_eq!(store.cidrs(), &*BASE_CIDRS);
     }
@@ -303,7 +351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
         let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
         // Should work, since peer is unmodified.
         store.update_peers(&BASE_PEERS).unwrap();
@@ -320,11 +368,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
         let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
-        // The same public key reported at another IP is refused.
+        // The same public key reported at another IP is refused, before and when updating.
         let mut moved = BASE_PEERS.clone();
         moved[0].contents.ip = "10.0.0.2".parse().unwrap();
+        assert!(store.check_pins(&moved).is_err());
         assert!(store.update_peers(&moved).is_err());
         assert_eq!(store.peers(), &*BASE_PEERS);
 
@@ -345,7 +394,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peer_store.json");
-        DataStore::open_with_path(&path, true).unwrap();
+        DataStore::open_with_path(&path, *NETWORK, true).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode & 0o077, 0);
     }
@@ -357,14 +406,32 @@ mod tests {
 
         // An empty file is a new data store.
         File::create(&path).unwrap();
-        let store = DataStore::open_with_path(&path, false).unwrap();
+        let store = DataStore::open_with_path(&path, *NETWORK, false).unwrap();
         assert!(store.peers().is_empty());
 
         // A file that fails to parse is refused rather than replaced, even if it is only whitespace.
         std::fs::write(&path, r#"{"version": "1", "peers": [{"#).unwrap();
-        assert!(DataStore::open_with_path(&path, false).is_err());
+        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
         std::fs::write(&path, "\n").unwrap();
-        assert!(DataStore::open_with_path(&path, false).is_err());
+        assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
+    }
+
+    #[test]
+    fn test_network() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+
+        // A new peer outside the network is refused, before and when updating.
+        let mut outside = BASE_PEERS.clone();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "1.1.1.1".parse().unwrap();
+        new_peer.contents.public_key = "def".to_string();
+        outside.push(new_peer);
+        assert!(store.check_network_closure(&outside).is_err());
+        assert!(store.update_peers(&outside).is_err());
+        assert_eq!(store.peers(), &*BASE_PEERS);
     }
 
     #[test]
@@ -372,7 +439,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
         let mut store =
-            DataStore::open_with_path(dir.path().join("peer_store.json"), false).unwrap();
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
 
         // Should work, since peer is unmodified.
         store.update_peers(&[]).unwrap();
@@ -419,7 +486,7 @@ mod tests {
         let path = dir.path().join("peer_store.json");
 
         // A new data store pins the coordinator and this client, named by their public keys.
-        let mut store = DataStore::open_with_path(&path, true).unwrap();
+        let mut store = DataStore::open_with_path(&path, *NETWORK, true).unwrap();
         store.introduce(&config).unwrap();
         let peers = store.peers();
         assert_eq!(peers.len(), 2);

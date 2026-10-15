@@ -150,7 +150,7 @@ fn update_keypair(
         config_path.to_string_lossy().yellow()
     );
 
-    DataStore::open_or_create(data_dir, interface)
+    DataStore::open_or_create(data_dir, interface, &config)
         .map_err(Error::from)
         .and_then(|mut store| store.introduce(&config))
         .map_err(RedeemInviteError::DataStoreIntroduction)?;
@@ -216,7 +216,7 @@ pub fn fetch(
         "fetching state for {} from server...",
         interface.as_str_lossy().yellow()
     );
-    let mut store = DataStore::open_or_create(data_dir, interface)?;
+    let mut store = DataStore::open_or_create(data_dir, interface, &config)?;
     let rest_client = RestClient::new(&config.server);
     let state = match rest_client.http::<State>("GET", "/user/state") {
         Ok(state) => Some(state),
