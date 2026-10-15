@@ -26,6 +26,11 @@ pub struct InterfaceConfig {
     /// The necessary contact information for the server.
     pub server: ServerInfo,
 
+    /// The DNS forwarder for the peers of this interface that offer a nameserver. `innernet up
+    /// --daemon` runs it while this section is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_forwarder: Option<DnsForwarderInfo>,
+
     /// A configurable map of peer public keys (base64) to Endpoints which should
     /// be used as the WireGuard endpoint for that peer.
     #[serde(default, deserialize_with = "deserialize_peer_endpoint_overrides")]
@@ -56,6 +61,16 @@ fn deserialize_peer_endpoint_overrides<'de, D: Deserializer<'de>>(
             Ok((public_key.to_base64(), endpoint))
         })
         .collect()
+}
+
+/// A DNS forwarder that answers queries for the hostnames of the peers that offer a nameserver,
+/// and for the names under them, from the peers' nameservers. It refuses queries for any other
+/// name. innernet does not configure the system resolver to use it.
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DnsForwarderInfo {
+    /// The address to answer queries at, over both UDP and TCP (e.g. "127.0.0.1:5353").
+    pub listen: SocketAddr,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -161,6 +176,7 @@ impl InterfaceConfig {
         InterfaceConfig {
             interface,
             server,
+            dns_forwarder: None,
             peer_endpoint_overrides: BTreeMap::new(),
         }
     }
@@ -443,5 +459,26 @@ mod tests {
         // An empty list announces nothing, and a malformed entry is refused.
         assert_eq!(with("[]").unwrap().interface.announce_delegations(), vec![]);
         assert!(with(r#"["10.0.0.40"]"#).is_err());
+    }
+
+    #[test]
+    fn test_dns_forwarder() {
+        let config = config("");
+        assert_eq!(config.dns_forwarder, None);
+        assert!(!config.as_toml().contains("dns-forwarder"));
+
+        let toml = config.as_toml().replace(
+            "[server]\n",
+            "[dns-forwarder]\nlisten = \"127.0.0.1:5353\"\n\n[server]\n",
+        );
+        let config: InterfaceConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            config.dns_forwarder,
+            Some(DnsForwarderInfo {
+                listen: "127.0.0.1:5353".parse().unwrap()
+            })
+        );
+        let reloaded: InterfaceConfig = toml::from_str(&config.as_toml()).unwrap();
+        assert_eq!(reloaded.dns_forwarder, config.dns_forwarder);
     }
 }

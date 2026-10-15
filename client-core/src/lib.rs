@@ -15,6 +15,7 @@ use innernet_shared::wg;
 use std::path::Path;
 
 pub mod data_store;
+pub mod dns;
 pub mod interface;
 mod nat;
 pub mod peer;

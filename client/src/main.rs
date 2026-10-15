@@ -6,6 +6,7 @@ use dialoguer::{Confirm, Input};
 use indoc::eprintdoc;
 use innernet_client_core::{
     data_store::DataStore,
+    dns::{self, Forwards},
     interface::{fetch, redeem_invite},
     peer::create_peer,
     rest_client::{RestClient, RestError},
@@ -21,9 +22,11 @@ use innernet_shared::{
     ServerCapabilities, WrappedIoError,
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
     thread,
     time::Duration,
 };
@@ -462,6 +465,7 @@ fn up(
     hosts_opts: HostsOpts,
     nat_opts: &NatOpts,
 ) -> Result<(), Error> {
+    let mut forwarders = HashMap::new();
     loop {
         let interfaces = match &specific_interface {
             Some(iface) => vec![iface.clone()],
@@ -478,6 +482,15 @@ fn up(
                 &interface,
                 true,
             )?;
+            if loop_interval.is_some() {
+                if let Err(e) = update_dns_forwarder(&mut forwarders, opts, &hosts_opts, &interface)
+                {
+                    log::warn!(
+                        "{}: failed to update the DNS forwarder: {e:#}",
+                        interface.as_str_lossy().yellow()
+                    );
+                }
+            }
         }
 
         match loop_interval {
@@ -486,6 +499,36 @@ fn up(
         }
     }
 
+    Ok(())
+}
+
+/// Starts the DNS forwarder of `interface` if its config has one and it isn't running yet, and
+/// replaces the forwards it answers from with those of the peers just fetched.
+fn update_dns_forwarder(
+    forwarders: &mut HashMap<String, Forwards>,
+    opts: &Opts,
+    hosts_opts: &HostsOpts,
+    interface: &InterfaceName,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let Some(forwarder) = &config.dns_forwarder else {
+        return Ok(());
+    };
+    let store = DataStore::open(&opts.data_dir, interface, &config)?;
+    let forwards = dns::forwards(interface, hosts_opts.host_suffix.as_deref(), store.peers());
+    if let Some(running) = forwarders.get(&interface.to_string()) {
+        *running.write().unwrap() = forwards;
+        return Ok(());
+    }
+    let running = Arc::new(RwLock::new(forwards));
+    dns::spawn(forwarder.listen, running.clone())
+        .with_str(format!("DNS forwarder on {}", forwarder.listen))?;
+    log::info!(
+        "{}: forwarding DNS for peers that offer a nameserver on {}.",
+        interface.as_str_lossy().yellow(),
+        forwarder.listen
+    );
+    forwarders.insert(interface.to_string(), running);
     Ok(())
 }
 
