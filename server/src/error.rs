@@ -29,6 +29,9 @@ pub enum ServerError {
     )]
     PromotionRequiresTls,
 
+    #[error("the peer has changed since it was read; read it again before changing it")]
+    PreconditionFailed,
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -56,6 +59,7 @@ impl From<&ServerError> for StatusCode {
             PromotionRequiresTls => StatusCode::UNPROCESSABLE_ENTITY,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
+            PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
             // Special-case the constraint violation situation.
             Database(rusqlite::Error::SqliteFailure(libsqlite3_sys::Error { code, .. }, ..))
@@ -77,7 +81,9 @@ impl TryFrom<ServerError> for Response<Body> {
     fn try_from(e: ServerError) -> Result<Self, Self::Error> {
         // Explain the errors that an outdated client can't make sense of on its own.
         let body = match e {
-            ServerError::TlsRequired | ServerError::PromotionRequiresTls => e.to_string().into(),
+            ServerError::TlsRequired
+            | ServerError::PromotionRequiresTls
+            | ServerError::PreconditionFailed => e.to_string().into(),
             _ => Body::empty(),
         };
         Response::builder().status(StatusCode::from(&e)).body(body)

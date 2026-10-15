@@ -660,11 +660,16 @@ fn rename_peer(
     log::info!("Fetching peers");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
 
-    if let Some((peer_request, _)) = prompts::rename_peer(&peers, &sub_opts)? {
+    if let Some((peer_request, id)) = prompts::rename_peer(&peers, &sub_opts)? {
         log::info!("Renaming peer...");
 
+        let listed = peers
+            .iter()
+            .find(|p| p.id == id)
+            .expect("the renamed peer is listed");
+        let etag = rest_client.peer_etag(listed)?;
         let path = format!("/admin/peers/{}", peer_request.api_path_segment());
-        rest_client.http_form::<_, ()>("PUT", &path, peer_request)?;
+        rest_client.http_if_match::<_, ()>("PUT", &path, Some(peer_request), etag.as_deref())?;
         log::info!("Peer renamed.");
     } else {
         log::info!("exited without renaming peer.");
@@ -686,10 +691,11 @@ fn enable_or_disable_peer(
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
 
     if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
+        let etag = rest_client.peer_etag(&peer)?;
         let mut contents = peer.contents;
         contents.is_disabled = !enable;
         let path = format!("/admin/peers/{}", contents.api_path_segment());
-        rest_client.http_form::<_, ()>("PUT", &path, contents)?;
+        rest_client.http_if_match::<_, ()>("PUT", &path, Some(contents), etag.as_deref())?;
     } else {
         log::info!("exiting without enabling or disabling peer.");
     }
@@ -713,9 +719,12 @@ fn delete_peer(
     let disabled_peers: Vec<Peer> = peers.into_iter().filter(|p| p.is_disabled).collect();
 
     if let Some(peer) = prompts::delete_or_forget_peer(&disabled_peers[..], &sub_opts, "delete")? {
-        rest_client.http::<()>(
+        let etag = rest_client.peer_etag(peer)?;
+        rest_client.http_if_match::<(), ()>(
             "DELETE",
             &format!("/admin/peers/permanent/{}", peer.api_path_segment()),
+            None,
+            etag.as_deref(),
         )?;
 
         // This client never sees the peer again, so the peer is un-pinned here right away.
@@ -827,10 +836,12 @@ fn add_delegation(
     let peers = rest_client.get_peers()?;
 
     if let Some((peer, prefix)) = prompts::add_delegation(&peers, &cidrs, &sub_opts)? {
-        rest_client.http_form::<_, Peer>(
+        let etag = rest_client.peer_etag(&peer)?;
+        rest_client.http_if_match::<_, Peer>(
             "POST",
             &format!("/admin/peers/delegations/{}", peer.api_path_segment()),
-            DelegationContents { prefix },
+            Some(DelegationContents { prefix }),
+            etag.as_deref(),
         )?;
         log::info!(
             "{} delegated to peer {}, from the next fetch of the peers that see it.",
@@ -859,13 +870,16 @@ fn delete_delegation(
     let peers = rest_client.get_peers()?;
 
     if let Some((peer, prefix)) = prompts::delete_delegation(&peers, &sub_opts)? {
-        rest_client.http::<()>(
+        let etag = rest_client.peer_etag(&peer)?;
+        rest_client.http_if_match::<(), ()>(
             "DELETE",
             &format!(
                 "/admin/peers/delegations/{}/{}",
                 peer.api_path_segment(),
                 prefix
             ),
+            None,
+            etag.as_deref(),
         )?;
 
         // This client never sees the delegation again, so it is un-pinned here right away.

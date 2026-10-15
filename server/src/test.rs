@@ -250,7 +250,12 @@ impl Server {
         self.raw_request(ip_str, req).await
     }
 
-    fn form_request_builder<F: Serialize>(&self, verb: &str, path: &str, form: F) -> Request<Body> {
+    pub fn form_request_builder<F: Serialize>(
+        &self,
+        verb: &str,
+        path: &str,
+        form: F,
+    ) -> Request<Body> {
         let json = serde_json::to_string(&form).unwrap();
         self.base_request_builder(verb, path)
             .header("Content-Type", "application/json")

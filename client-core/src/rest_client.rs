@@ -64,7 +64,31 @@ impl<'a> RestClient<'a> {
     ///
     /// Example: `rest_client.http("GET", "/admin/peers")?;`.
     pub fn http<T: DeserializeOwned>(&self, verb: &str, endpoint: &str) -> Result<T, RestError> {
-        self.request::<(), _>(verb, endpoint, None)
+        Ok(self.request::<(), _>(verb, endpoint, None, None)?.0)
+    }
+
+    /// Fetches the peer that `listed` was listed as, and returns its entity tag, if the server
+    /// sends one, so that the peer can be changed only as long as it stays as it was listed. Its endpoint, candidates,
+    /// announcement and observed endpoint are not compared, as they change as the peer reports
+    /// them.
+    #[allow(clippy::result_large_err)]
+    pub fn peer_etag(&self, listed: &Peer) -> Result<Option<String>, RestError> {
+        let path = format!("/admin/peers/{}", listed.api_path_segment());
+        let (current, etag) = self.request::<(), Peer>("GET", &path, None, None)?;
+        let without_endpoints = |peer: &Peer| Peer {
+            id: peer.id,
+            contents: PeerContents {
+                endpoint: None,
+                candidates: vec![],
+                announcement: None,
+                observed_endpoint: None,
+                ..peer.contents.clone()
+            },
+        };
+        if without_endpoints(&current) != without_endpoints(listed) {
+            return Err(RestError::PeerChanged);
+        }
+        Ok(etag)
     }
 
     /// Send serializable data using a `verb` HTTP request at the given `endpoint`
@@ -77,16 +101,31 @@ impl<'a> RestClient<'a> {
         endpoint: &str,
         form: S,
     ) -> Result<T, RestError> {
-        self.request(verb, endpoint, Some(form))
+        Ok(self.request(verb, endpoint, Some(form), None)?.0)
     }
 
+    /// Performs a `verb` HTTP request at the given `endpoint`, with the optional `form`, only if
+    /// the resource still has the entity tag `etag`, if any.
+    #[allow(clippy::result_large_err)]
+    pub fn http_if_match<S: Serialize, T: DeserializeOwned>(
+        &self,
+        verb: &str,
+        endpoint: &str,
+        form: Option<S>,
+        etag: Option<&str>,
+    ) -> Result<T, RestError> {
+        Ok(self.request(verb, endpoint, form, etag)?.0)
+    }
+
+    /// Returns the response and its entity tag, if any.
     #[allow(clippy::result_large_err)]
     fn request<S: Serialize, T: DeserializeOwned>(
         &self,
         verb: &str,
         endpoint: &str,
         form: Option<S>,
-    ) -> Result<T, RestError> {
+        if_match: Option<&str>,
+    ) -> Result<(T, Option<String>), RestError> {
         let payload = form
             .map(serde_json::to_value)
             .transpose()
@@ -99,6 +138,10 @@ impl<'a> RestClient<'a> {
                 &format!("https://{}/v1{}", self.server.internal_endpoint, endpoint),
             )
             .set(INNERNET_PUBKEY_HEADER, &self.server.public_key);
+        let request = match if_match {
+            Some(etag) => request.set("If-Match", etag),
+            None => request,
+        };
 
         let result = match payload {
             Some(payload) => request.send_json(payload),
@@ -119,12 +162,14 @@ impl<'a> RestClient<'a> {
             Err(e) => return Err(RestError::RequestSend(Box::new(e))),
         };
 
+        let etag = response.header("ETag").map(str::to_string);
         let mut response = response.into_string().map_err(RestError::ResponseRead)?;
         // A little trick for serde to parse an empty response as `()`.
         if response.is_empty() {
             response = "null".into();
         }
-        serde_json::from_str(&response).map_err(RestError::ResponseDeserialize)
+        let response = serde_json::from_str(&response).map_err(RestError::ResponseDeserialize)?;
+        Ok((response, etag))
     }
 }
 
@@ -156,6 +201,8 @@ pub enum RestError {
          upgraded before its clients."
     )]
     ServerPredatesTls,
+    #[error("The peer has changed since it was listed. Run the command again.")]
+    PeerChanged,
     /// A transport error; error statuses are [`Self::Status`] and [`Self::Refused`].
     #[error("Error sending request: {0}")]
     RequestSend(Box<ureq::Error>),

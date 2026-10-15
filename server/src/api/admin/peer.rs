@@ -4,11 +4,14 @@ use crate::{
     api::inject_endpoints,
     db::DatabasePeer,
     update_allowed_ips,
-    util::{form_body, json_response, json_status_response, status_response},
+    util::{
+        check_if_match, etag, form_body, if_match, json_etag_response, json_response,
+        json_status_response, status_response,
+    },
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::{DelegationContents, PeerContents, PeerEndpoints};
+use innernet_shared::{DelegationContents, Peer, PeerContents, PeerEndpoints};
 use ipnet::IpNet;
 use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
@@ -44,6 +47,29 @@ fn next_peer(components: &mut VecDeque<String>) -> Result<PeerRef, ServerError> 
     PeerRef::parse(&components.pop_front().ok_or(ServerError::NotFound)?)
 }
 
+/// The entity tag of a peer: that of the peer without its endpoint, candidates, announcement and
+/// observed endpoint, which change as the peer reports them, and which
+/// `/admin/peers/{peer}/endpoints` tags apart.
+fn peer_etag(peer: &Peer) -> Result<String, ServerError> {
+    etag(&Peer {
+        id: peer.id,
+        contents: PeerContents {
+            endpoint: None,
+            candidates: vec![],
+            announcement: None,
+            observed_endpoint: None,
+            ..peer.contents.clone()
+        },
+    })
+}
+
+fn peer_endpoints(peer: &Peer) -> PeerEndpoints {
+    PeerEndpoints {
+        endpoint: peer.endpoint.clone(),
+        candidates: peer.candidates.clone(),
+    }
+}
+
 /// Takes the next path segment, which must be the last.
 fn last_segment(components: &mut VecDeque<String>) -> Result<Option<String>, ServerError> {
     let segment = components.pop_front();
@@ -59,6 +85,8 @@ pub async fn routes(
     mut components: VecDeque<String>,
     session: Session,
 ) -> Result<Response<Body>, ServerError> {
+    let if_match = if_match(&req)?;
+    let if_match = if_match.as_deref();
     match (req.method(), components.pop_front().as_deref()) {
         (&Method::GET, None) => handlers::list(session).await,
         (&Method::POST, None) => {
@@ -70,6 +98,7 @@ pub async fn routes(
         (&Method::GET, Some(peer)) => {
             let peer = PeerRef::parse(peer)?;
             match last_segment(&mut components)?.as_deref() {
+                None => handlers::get(peer, session).await,
                 Some("endpoints") => handlers::endpoints(peer, session).await,
                 _ => Err(ServerError::NotFound),
             }
@@ -79,11 +108,11 @@ pub async fn routes(
             match last_segment(&mut components)?.as_deref() {
                 None => {
                     let form = form_body(req).await?;
-                    handlers::update(peer, form, session).await
+                    handlers::update(peer, if_match, form, session).await
                 },
                 Some("endpoints") => {
                     let form = form_body(req).await?;
-                    handlers::set_endpoints(peer, form, session).await
+                    handlers::set_endpoints(peer, if_match, form, session).await
                 },
                 _ => Err(ServerError::NotFound),
             }
@@ -92,13 +121,13 @@ pub async fn routes(
         // route that to `delete` (disable) and report success.
         (&Method::DELETE, Some("permanent")) => {
             let peer = next_peer(&mut components)?;
-            handlers::delete_permanently(peer, session).await
+            handlers::delete_permanently(peer, if_match, session).await
         },
         // Likewise not under `/peers/{id}/`, so that older servers answer 404.
         (&Method::POST, Some("delegations")) => {
             let peer = next_peer(&mut components)?;
             let form = form_body(req).await?;
-            handlers::add_delegation(peer, form, session).await
+            handlers::add_delegation(peer, if_match, form, session).await
         },
         // The prefix ends the path, as in `/peers/delegations/{id}/10.42.1.32/28`.
         (&Method::DELETE, Some("delegations")) => {
@@ -107,14 +136,14 @@ pub async fn routes(
                 .join("/")
                 .parse()
                 .map_err(|_| ServerError::InvalidQuery)?;
-            handlers::remove_delegation(peer, prefix, session).await
+            handlers::remove_delegation(peer, if_match, prefix, session).await
         },
         (&Method::DELETE, Some(peer)) => {
             let peer = PeerRef::parse(peer)?;
             if last_segment(&mut components)?.is_some() {
                 return Err(ServerError::NotFound);
             }
-            handlers::delete(peer, session).await
+            handlers::delete(peer, if_match, session).await
         },
         _ => Err(ServerError::NotFound),
     }
@@ -147,11 +176,13 @@ mod handlers {
 
     pub async fn update(
         peer: PeerRef,
+        if_match: Option<&str>,
         form: PeerContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut peer = peer.get(&conn)?;
+        check_if_match(if_match, &peer_etag(&peer)?)?;
         peer.update(&conn, form)?;
 
         status_response(StatusCode::NO_CONTENT)
@@ -161,16 +192,24 @@ mod handlers {
     /// observes, so that they can be written back as they are read.
     pub async fn endpoints(peer: PeerRef, session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let peer = peer.get(&conn)?;
-        json_response(&PeerEndpoints {
-            endpoint: peer.endpoint.clone(),
-            candidates: peer.candidates.clone(),
-        })
+        let endpoints = peer_endpoints(&peer.get(&conn)?.inner);
+        json_etag_response(&endpoints, &etag(&endpoints)?)
+    }
+
+    /// A peer as the listing reports it, tagged with its entity tag.
+    pub async fn get(peer: PeerRef, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let peer = peer.get(&conn)?.inner;
+        let etag = peer_etag(&peer)?;
+        let mut peers = vec![peer];
+        inject_endpoints(&session, &mut peers);
+        json_etag_response(&peers[0], &etag)
     }
 
     /// Sets the endpoint and candidates of a peer on its behalf.
     pub async fn set_endpoints(
         peer: PeerRef,
+        if_match: Option<&str>,
         form: PeerEndpoints,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
@@ -179,6 +218,7 @@ mod handlers {
         }
         let conn = session.context.db.lock();
         let mut peer = peer.get(&conn)?;
+        check_if_match(if_match, &etag(&peer_endpoints(&peer))?)?;
         peer.set_endpoint(&conn, form.endpoint)?;
         peer.set_candidates(&conn, form.candidates)?;
         log::info!("set the endpoints of peer {}", *peer);
@@ -197,9 +237,15 @@ mod handlers {
         json_response(&peers)
     }
 
-    pub async fn delete(peer: PeerRef, session: Session) -> Result<Response<Body>, ServerError> {
+    pub async fn delete(
+        peer: PeerRef,
+        if_match: Option<&str>,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        DatabasePeer::disable(&conn, peer.get(&conn)?.id)?;
+        let peer = peer.get(&conn)?;
+        check_if_match(if_match, &peer_etag(&peer)?)?;
+        DatabasePeer::disable(&conn, peer.id)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -207,10 +253,12 @@ mod handlers {
     /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
     pub async fn delete_permanently(
         peer: PeerRef,
+        if_match: Option<&str>,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let peer = peer.get(&conn)?;
+        check_if_match(if_match, &peer_etag(&peer)?)?;
         DatabasePeer::delete(&conn, peer.id)?;
         log::info!("permanently deleted peer {}", *peer);
 
@@ -231,11 +279,13 @@ mod handlers {
     /// Delegates a prefix of its CIDR to a peer, as if it were that many more peers.
     pub async fn add_delegation(
         peer: PeerRef,
+        if_match: Option<&str>,
         form: DelegationContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut peer = peer.get(&conn)?;
+        check_if_match(if_match, &peer_etag(&peer)?)?;
         peer.add_delegation(&conn, form.prefix)?;
         log::info!("delegated {} to peer {}", form.prefix, *peer);
 
@@ -249,11 +299,13 @@ mod handlers {
     /// Withdraws a prefix delegated to a peer.
     pub async fn remove_delegation(
         peer: PeerRef,
+        if_match: Option<&str>,
         prefix: IpNet,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut peer = peer.get(&conn)?;
+        check_if_match(if_match, &peer_etag(&peer)?)?;
         peer.remove_delegation(&conn, prefix)?;
         log::info!("withdrew {} from peer {}", prefix, *peer);
 
@@ -535,6 +587,80 @@ mod tests {
             assert_eq!(res.status(), StatusCode::NOT_FOUND);
         }
         assert!(!DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_disabled);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_if_match() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let segment =
+            DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.api_path_segment();
+        let path = format!("/v1/admin/peers/{segment}");
+        let get = |path: String| {
+            let server = &server;
+            async move {
+                let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+                assert_eq!(res.status(), StatusCode::OK);
+                res.headers()[hyper::header::ETAG]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let put = |etag: &str, change: &PeerContents| {
+            let mut request = server.form_request_builder("PUT", &path, change);
+            request
+                .headers_mut()
+                .insert(hyper::header::IF_MATCH, etag.parse().unwrap());
+            let server = &server;
+            async move {
+                server
+                    .raw_request(test::ADMIN_PEER_IP, request)
+                    .await
+                    .status()
+            }
+        };
+        let rename = |name: &str| PeerContents {
+            name: Some(name.parse().unwrap()),
+            ..DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)
+                .unwrap()
+                .contents
+                .clone()
+        };
+
+        let seen = get(path.clone()).await;
+        assert_eq!(get(path.clone()).await, seen);
+
+        // The endpoints that the peer reports are tagged apart, and leave its tag unchanged.
+        let endpoints_path = format!("{path}/endpoints");
+        let seen_endpoints = get(endpoints_path.clone()).await;
+        {
+            let conn = server.db.lock();
+            let candidates = vec!["198.51.100.2:51820".parse().unwrap()];
+            DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?
+                .set_candidates(&conn, candidates)?;
+        }
+        assert_eq!(get(path.clone()).await, seen);
+        assert_ne!(get(endpoints_path).await, seen_endpoints);
+
+        // A change by another admin turns away a write based on what was seen before it.
+        assert_eq!(put(&seen, &rename("first")).await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            put(&seen, &rename("second")).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+        let peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(peer.name.as_deref(), Some("first"));
+
+        // The current tag, one of a list, or any tag at all is accepted.
+        let current = get(path.clone()).await;
+        assert_ne!(current, seen);
+        assert_eq!(
+            put(&format!("{seen}, {current}"), &rename("third")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(put("*", &rename("fourth")).await, StatusCode::NO_CONTENT);
 
         Ok(())
     }
