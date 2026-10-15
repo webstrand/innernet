@@ -683,9 +683,11 @@ pub struct PeerDiff<'a> {
 }
 
 impl<'a> PeerDiff<'a> {
+    /// `endpoint_override`, if any, replaces the endpoint of `new`.
     pub fn new(
         old_info: Option<&'a PeerInfo>,
         new: Option<&'a Peer>,
+        endpoint_override: Option<&Endpoint>,
     ) -> Result<Option<Self>, Error> {
         let old = old_info.map(|p| &p.config);
         match (old_info, new) {
@@ -694,12 +696,14 @@ impl<'a> PeerDiff<'a> {
             ),
             (None, None) => Ok(None),
             _ => Ok(
-                Self::peer_config_builder(old_info, new).map(|(builder, changes)| Self {
-                    old,
-                    new,
-                    builder,
-                    changes,
-                }),
+                Self::peer_config_builder(old_info, new, endpoint_override).map(
+                    |(builder, changes)| Self {
+                        old,
+                        new,
+                        builder,
+                        changes,
+                    },
+                ),
             ),
         }
     }
@@ -715,6 +719,7 @@ impl<'a> PeerDiff<'a> {
     fn peer_config_builder(
         old_info: Option<&PeerInfo>,
         new: Option<&Peer>,
+        endpoint_override: Option<&Endpoint>,
     ) -> Option<(PeerConfigBuilder, Vec<PeerChange>)> {
         let old = old_info.map(|p| &p.config);
         let public_key = match (old, new) {
@@ -765,7 +770,9 @@ impl<'a> PeerDiff<'a> {
             .unwrap_or_default()
         {
             let mut endpoint_changed = false;
-            let resolved = new.endpoint.as_ref().and_then(|e| e.resolve().ok());
+            let resolved = endpoint_override
+                .or(new.endpoint.as_ref())
+                .and_then(|e| e.resolve().ok());
             if let Some(addr) = resolved {
                 if old.is_none() || matches!(old, Some(old) if old.endpoint != resolved) {
                     builder = builder.set_endpoint(addr);
@@ -791,7 +798,7 @@ impl<'a> PeerDiff<'a> {
 
 impl From<&Peer> for PeerConfigBuilder {
     fn from(peer: &Peer) -> Self {
-        PeerDiff::new(None, Some(peer))
+        PeerDiff::new(None, Some(peer), None)
             .expect("No Err on explicitly set peer data")
             .expect("None -> Some(peer) will always create a PeerDiff")
             .into()
@@ -987,7 +994,7 @@ mod tests {
             stats: Default::default(),
         };
 
-        let diff = PeerDiff::new(Some(&info), Some(&peer)).unwrap();
+        let diff = PeerDiff::new(Some(&info), Some(&peer), None).unwrap();
 
         println!("{diff:?}");
         assert_eq!(diff, None);
@@ -1021,7 +1028,7 @@ mod tests {
             config,
             stats: Default::default(),
         };
-        let diff = PeerDiff::new(Some(&info), Some(&peer)).unwrap();
+        let diff = PeerDiff::new(Some(&info), Some(&peer), None).unwrap();
 
         println!("{peer:?}");
         println!("{:?}", info.config);
@@ -1062,12 +1069,46 @@ mod tests {
 
         // If there hasn't been a recent handshake, endpoint should be being set.
         assert!(matches!(
-            PeerDiff::new(Some(&info), Some(&peer)),
+            PeerDiff::new(Some(&info), Some(&peer), None),
             Ok(Some(_))
         ));
 
         // If there *has* been a recent handshake, endpoint should *not* be being set.
         info.stats.last_handshake_time = Some(SystemTime::now());
-        assert!(matches!(PeerDiff::new(Some(&info), Some(&peer)), Ok(None)));
+        assert!(matches!(
+            PeerDiff::new(Some(&info), Some(&peer), None),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_peer_diff_endpoint_override() {
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        let peer = Peer {
+            id: 1,
+            contents: PeerContents {
+                name: "peer1".parse().unwrap(),
+                ip: "10.0.0.1".parse().unwrap(),
+                cidr_id: 1,
+                public_key: PUBKEY.to_owned(),
+                endpoint: Some("1.1.1.1:1111".parse().unwrap()),
+                persistent_keepalive_interval: None,
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+            },
+        };
+        let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();
+
+        // The override replaces the endpoint of the peer.
+        let diff = PeerDiff::new(None, Some(&peer), Some(&endpoint_override))
+            .unwrap()
+            .unwrap();
+        assert!(diff.changes().contains(&PeerChange::Endpoint {
+            old: None,
+            new: Some("2.2.2.2:2222".parse().unwrap()),
+        }));
     }
 }
