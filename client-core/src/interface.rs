@@ -12,7 +12,7 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
@@ -203,35 +203,37 @@ pub fn fetch(
     );
     let mut store = DataStore::open_or_create(data_dir, interface)?;
     let rest_client = RestClient::new(&config.server);
-    let (State { mut peers, cidrs }, server_is_reachable) = match rest_client
-        .http("GET", "/user/state")
-    {
-        Ok(state) => (state, true),
-        Err(e) => {
-            if e.is_transport_error() {
-                if store.peers().is_empty() {
-                    bail!(
-                        "Could not connect to the innernet server and there are no cached peers, \
+    let state = match rest_client.http::<State>("GET", "/user/state") {
+        Ok(state) => Some(state),
+        Err(e) if e.is_transport_error() => {
+            if store.peers().is_empty() {
+                bail!(
+                    "Could not connect to the innernet server and there are no cached peers, \
                      exiting."
-                    )
-                }
-
-                log::warn!(
-                    "Could not connect to the innernet server, proceeding with cached state instead."
-                );
-
-                let state = State {
-                    peers: store.peers().to_vec(),
-                    cidrs: store.cidrs().to_vec(),
-                };
-                (state, false)
-            } else {
-                bail!(e)
+                )
             }
+
+            log::warn!(
+                "Could not connect to the innernet server, proceeding with cached state instead."
+            );
+            None
         },
+        Err(e) => bail!(e),
     };
 
-    // Apply the local peer endpoint overrides.
+    // The data store validates the reported state before any of it reaches the interface.
+    if let Some(state) = &state {
+        store.update(state).context(interface.to_string())?;
+    }
+
+    // The interface is configured from the enabled peers of the data store, with the local peer
+    // endpoint overrides applied.
+    let mut peers: Vec<Peer> = store
+        .peers()
+        .iter()
+        .filter(|peer| !peer.is_disabled)
+        .cloned()
+        .collect();
     for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
         log::debug!(
             "overriding peer IP {} with endpoint {}",
@@ -271,12 +273,8 @@ pub fn fetch(
     }
     let interface_updated_time = Instant::now();
 
-    store
-        .update_peers_and_set_cidrs(&peers, cidrs)
-        .context(interface.to_string())?;
-
     let listen_port = device.listen_port.unwrap_or(51820);
-    if server_is_reachable {
+    if state.is_some() {
         report_candidates(&rest_client, nat, listen_port)?;
     }
 

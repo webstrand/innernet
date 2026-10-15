@@ -1,5 +1,7 @@
 use anyhow::{bail, Error};
-use innernet_shared::{chmod, ensure_dirs_exist, Cidr, IoErrorContext, Peer, WrappedIoError};
+use innernet_shared::{
+    chmod, ensure_dirs_exist, Cidr, IoErrorContext, Peer, State, WrappedIoError,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -79,21 +81,19 @@ impl DataStore {
         Self::_open(data_dir, interface, true)
     }
 
-    /// Add new peers to the PeerStore, never deleting old ones; overwrite CIDRs; persist to disk.
+    /// Merges the peers of `state` into the data store, replaces its CIDRs with those of `state`,
+    /// and writes it to disk.
     ///
-    /// This is done as a protective measure, validating that the (IP, PublicKey) tuple
-    /// of the interface's peers never change, i.e. "pinning" them. This prevents a compromised
-    /// server from impersonating an existing peer.
+    /// A peer that the data store already holds is updated, a new peer is added, and a peer that
+    /// is absent from `state` is disabled rather than deleted, so that its (IP, PublicKey) tuple
+    /// remains pinned. The update is refused if any peer of `state` has a pinned IP with a
+    /// different public key, or a pinned public key at a different IP.
     ///
-    /// Note, however, that this does not prevent a compromised server from adding a new
-    /// peer under its control, of course.
-    pub fn update_peers_and_set_cidrs(
-        &mut self,
-        new_peers: &[Peer],
-        new_cidrs: Vec<Cidr>,
-    ) -> Result<(), Error> {
-        self.update_peers(new_peers)?;
-        self.set_cidrs(new_cidrs);
+    /// Pinning prevents a compromised server from impersonating an existing peer, but not from
+    /// adding a new peer under its control.
+    pub fn update(&mut self, state: &State) -> Result<(), Error> {
+        self.update_peers(&state.peers)?;
+        self.set_cidrs(state.cidrs.clone());
         self.write()?;
 
         Ok(())
@@ -211,7 +211,10 @@ mod tests {
         assert_eq!(0, store.cidrs().len());
 
         store
-            .update_peers_and_set_cidrs(&BASE_PEERS, BASE_CIDRS.to_owned())
+            .update(&State {
+                peers: BASE_PEERS.to_owned(),
+                cidrs: BASE_CIDRS.to_owned(),
+            })
             .unwrap();
     }
 
