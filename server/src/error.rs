@@ -45,8 +45,8 @@ impl From<&ServerError> for StatusCode {
             Gone => StatusCode::GONE,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
             // Special-case the constraint violation situation.
-            Database(rusqlite::Error::SqliteFailure(libsqlite3_sys::Error { code, .. }, ..))
-                if *code == libsqlite3_sys::ErrorCode::ConstraintViolation =>
+            Database(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..))
+                if *code == rusqlite::ErrorCode::ConstraintViolation =>
             {
                 StatusCode::BAD_REQUEST
             },

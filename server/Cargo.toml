@@ -46,13 +46,12 @@ innernet-publicip = { version = "2.0.0", path = "../publicip" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = { version = "2.4", features = ["serde"] }
 libc = "0.2"
-libsqlite3-sys = "0.26"
 log = "0.4"
 once_cell = "1.17.1"
 parking_lot = "0.12"
 pretty_env_logger = "0.4"
 regex = { version = "1", default-features = false, features = ["std"] }
-rusqlite = "0.29"
+rusqlite.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
@@ -64,10 +63,6 @@ wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2 = { version = "0.5.2", features = ["all"] }
-
-# Workaround for https://github.com/rusqlite/rusqlite/issues/914
-[target.'cfg(target_env = "musl")'.dependencies]
-rusqlite = { version = "0.29", features = ["bundled"] }
 
 [dev-dependencies]
 anyhow = "1"
@@ -106,7 +101,7 @@ assets = [
     "644",
   ],
 ]
-depends = "libc6, libgcc1, libsqlite3-0, zlib1g, systemd"
+depends = "libc6, libgcc1, zlib1g, systemd"
 maintainer = "tonari <hey@tonari.no>"
 name = "innernet-server"
 priority = "optional"
