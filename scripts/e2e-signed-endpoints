@@ -203,7 +203,7 @@ fetch a
 expect_no_log a "announcement"
 db "UPDATE peers SET announcement = '$accepted' WHERE name = 'b'"
 fetch a
-expect_log a "older endpoint announcement"
+expect_log a "older announcement"
 python3 -I -c 'import json, sys; sys.exit(json.loads(sys.argv[1]) != json.loads(sys.argv[2]))' \
     "$(stored a b announcement)" "$newer" || fail "a didn't keep b's newer announcement"
 pass "a kept b's newer announcement"

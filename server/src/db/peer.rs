@@ -25,7 +25,7 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       is_redeemed     INTEGER DEFAULT 0 NOT NULL,   /* Has the peer redeemed their invite yet?                          */
       invite_expires  INTEGER,                      /* The UNIX time that an invited peer can no longer redeem.         */
       candidates      TEXT,                         /* A list of additional endpoints that peers can use to connect.    */
-      announcement    TEXT,                         /* The peer's latest signed endpoint announcement (JSON).           */
+      announcement    TEXT,                         /* The peer's latest signed announcement (JSON).                    */
       requires_tls    INTEGER DEFAULT 0 NOT NULL,   /* Must the peer authenticate over TLS rather than by its IP?       */
       FOREIGN KEY (cidr_id)
          REFERENCES cidrs (id)

@@ -239,7 +239,7 @@ mod tests {
     use crate::{db::DatabaseAssociation, test};
     use bytes::Buf;
     use innernet_shared::{
-        announcement::{AnnouncementSigner, EndpointAnnouncement},
+        announcement::{Announcement, AnnouncementSigner},
         AssociationContents, CidrContents, Endpoint, EndpointContents, Error,
     };
 
@@ -753,12 +753,13 @@ mod tests {
         (signer, server.context().public_key)
     }
 
-    fn announcement(timestamp: u64) -> EndpointAnnouncement {
-        EndpointAnnouncement {
+    fn announcement(timestamp: u64) -> Announcement {
+        Announcement {
             timestamp,
             endpoint: None,
             candidates: vec!["192.168.1.2:51820".parse().unwrap()],
             allow_observed: true,
+            delegations: vec![],
             extensions: vec![],
         }
     }

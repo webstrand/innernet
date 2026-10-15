@@ -65,7 +65,7 @@ enum Command {
         #[clap(flatten)]
         hosts: HostsOpts,
 
-        /// How far ahead of this server's clock a peer's signed endpoint announcement may be
+        /// How far ahead of this server's clock a peer's signed announcement may be
         /// dated. Announcements dated further ahead are refused. Must comfortably exceed 37s,
         /// the difference between TAI and UTC, plus any clock skew.
         #[clap(long, default_value = "10m")]

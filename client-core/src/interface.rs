@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_shared::{
-    announcement::{self, AnnouncementSigner, EndpointAnnouncement, Received},
+    announcement::{self, Announcement, AnnouncementSigner, Received},
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
     Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
@@ -449,22 +449,22 @@ fn apply_announcements(
         match outcome {
             Received::Nothing | Received::Unchanged | Received::Accepted => {},
             Received::Stale => log::warn!(
-                "the server sent an older endpoint announcement for peer {} than one already \
+                "the server sent an older announcement for peer {} than one already \
                  accepted; ignoring it.",
                 peer.display_name()
             ),
             Received::TooFarAhead => log::warn!(
-                "the endpoint announcement for peer {} is dated too far in the future; ignoring \
+                "the announcement for peer {} is dated too far in the future; ignoring \
                  it for now. Either its clock or this one is wrong.",
                 peer.display_name()
             ),
             Received::Invalid => log::warn!(
-                "the server sent an endpoint announcement for peer {} that isn't signed by its \
+                "the server sent an announcement for peer {} that isn't signed by its \
                  key; ignoring it.",
                 peer.display_name()
             ),
             Received::UnknownCritical(tag) => log::warn!(
-                "the endpoint announcement for peer {} needs a newer innernet (critical \
+                "the announcement for peer {} needs a newer innernet (critical \
                  extension {tag:#06x}); ignoring it.",
                 peer.display_name()
             ),
@@ -589,30 +589,31 @@ fn report_endpoints(
     };
     let signed = signer.sign(
         network,
-        EndpointAnnouncement {
+        Announcement {
             timestamp: announcement::timestamp_now(),
             endpoint,
             candidates,
             allow_observed,
+            delegations: vec![],
             extensions: vec![],
         },
     )?;
 
     match rest_client.http_form::<_, ()>("PUT", "/user/announcement", &signed) {
-        Ok(()) => log::debug!("signed endpoint announcement successfully reported"),
+        Ok(()) => log::debug!("signed announcement successfully reported"),
         Err(e) if e.has_status_of(404) => {
             log::warn!(
                 "your network is using an old version of innernet-server that doesn't relay \
-                 signed endpoint announcements."
+                 signed announcements."
             );
             report_candidates(rest_client, signed.announcement.candidates)?;
         },
         Err(e) if e.has_status_of(422) => log::warn!(
-            "the server rejected this peer's endpoint announcement as dated too far in the \
+            "the server rejected this peer's announcement as dated too far in the \
              future; this clock or the server's may be wrong. Peers keep using the previous one."
         ),
         Err(e) if e.has_status_of(409) => log::warn!(
-            "the server holds a newer endpoint announcement than this one; the clock may have \
+            "the server holds a newer announcement than this one; the clock may have \
              gone backwards. Peers keep using the newer one."
         ),
         Err(e) => return Err(e.into()),
@@ -723,11 +724,12 @@ mod tests {
             self.signer
                 .sign(
                     &self.network,
-                    EndpointAnnouncement {
+                    Announcement {
                         timestamp,
                         endpoint: Some(endpoint.parse().unwrap()),
                         candidates: vec!["192.168.1.2:51820".parse().unwrap()],
                         allow_observed: false,
+                        delegations: vec![],
                         extensions: vec![],
                     },
                 )

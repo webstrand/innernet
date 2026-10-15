@@ -1,12 +1,13 @@
-//! Signed endpoint announcements.
+//! Signed peer announcements.
 //!
-//! A peer signs the endpoints it can be reached at with its WireGuard private key, using
-//! [XEdDSA](crate::xeddsa), and the coordinating server relays the result to the other peers. Recipients verify
-//! it against the public key they have pinned for that peer, so the server cannot announce
-//! endpoints on the peer's behalf.
+//! A peer signs what it states about itself, such as the endpoints it can be reached at and the
+//! delegated prefixes it accepts traffic for, with its WireGuard private key, using
+//! [XEdDSA](crate::xeddsa), and the coordinating server relays the result to the other peers.
+//! Recipients verify it against the public key they have pinned for that peer, so the server
+//! cannot make statements on the peer's behalf.
 //!
 //! The server relays announcements as structured data, and each recipient re-derives the signed
-//! bytes from it with [`EndpointAnnouncement::encode`]. Fields added by future versions are
+//! bytes from it with [`Announcement::encode`]. Fields added by future versions are
 //! carried as [`Extension`]s, which every version encodes the same way whether or not it
 //! understands them, so that older servers and recipients don't break newer signatures.
 
@@ -16,12 +17,13 @@ use crate::{
 };
 use anyhow::{bail, Error};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::Duration;
 use wireguard_control::Key;
 
-/// Domain separator for endpoint announcements. Only changes on an incompatible format change.
-const CONTEXT: &[u8] = b"innernet/v1/peer-endpoints\0";
+/// Domain separator for announcements. Only changes on an incompatible format change.
+const CONTEXT: &[u8] = b"innernet/v1/peer-announcement\0";
 
 /// Extension tags with this bit set alter the meaning of the other fields, so an announcement
 /// carrying one that the recipient doesn't understand must not be used.
@@ -43,9 +45,10 @@ pub fn is_too_far_ahead(timestamp: u64, now: u64, max_ahead: Duration) -> bool {
     timestamp > now.saturating_add(max_ahead)
 }
 
-/// The endpoints a peer can be reached at, as stated by the peer itself.
+/// What a peer states about itself: the endpoints it can be reached at, and the prefixes of its
+/// delegations that it accepts traffic for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EndpointAnnouncement {
+pub struct Announcement {
     /// Orders announcements from the same peer: recipients only accept a greater timestamp than
     /// the last one they accepted. Nanoseconds of `CLOCK_TAI` (or `CLOCK_REALTIME`) by
     /// convention, see [`timestamp_now`], but any increasing value is valid.
@@ -63,6 +66,12 @@ pub struct EndpointAnnouncement {
     /// from, which cannot be verified.
     #[serde(default)]
     pub allow_observed: bool,
+
+    /// The prefixes that the peer accepts traffic for, each within one of its delegations.
+    /// Recipients route a prefix to the peer only if it lies within a prefix delegated to the
+    /// peer, so the peer can narrow its delegations but not extend them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<IpNet>,
 
     /// Fields from newer versions, in strictly increasing tag order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -84,12 +93,12 @@ impl Extension {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAnnouncement {
-    pub announcement: EndpointAnnouncement,
+    pub announcement: Announcement,
     #[serde(with = "base64_bytes")]
     pub signature: Vec<u8>,
 }
 
-impl EndpointAnnouncement {
+impl Announcement {
     /// The canonical encoding that is signed. Every variable-length item is length-prefixed and
     /// integers are little-endian.
     pub fn encode(&self) -> Vec<u8> {
@@ -106,6 +115,20 @@ impl EndpointAnnouncement {
         out.extend_from_slice(&(self.candidates.len() as u32).to_le_bytes());
         for candidate in &self.candidates {
             candidate.encode(&mut out);
+        }
+        out.extend_from_slice(&(self.delegations.len() as u32).to_le_bytes());
+        for prefix in &self.delegations {
+            match prefix {
+                IpNet::V4(prefix) => {
+                    out.push(4);
+                    out.extend_from_slice(&prefix.addr().octets());
+                },
+                IpNet::V6(prefix) => {
+                    out.push(6);
+                    out.extend_from_slice(&prefix.addr().octets());
+                },
+            }
+            out.push(prefix.prefix_len());
         }
         out.extend_from_slice(&(self.extensions.len() as u32).to_le_bytes());
         for extension in &self.extensions {
@@ -173,7 +196,7 @@ impl SignedAnnouncement {
         let length = (body.len() as u64).to_le_bytes();
         xeddsa::verify(
             signer,
-            &EndpointAnnouncement::message(network, signer, &length, &body),
+            &Announcement::message(network, signer, &length, &body),
             &self.signature,
         )
     }
@@ -269,7 +292,7 @@ impl AnnouncementSigner {
     pub fn sign(
         &self,
         network: &Key,
-        mut announcement: EndpointAnnouncement,
+        mut announcement: Announcement,
     ) -> Result<SignedAnnouncement, Error> {
         announcement
             .extensions
@@ -281,7 +304,7 @@ impl AnnouncementSigner {
         let length = (body.len() as u64).to_le_bytes();
         let signature = self
             .private_key
-            .sign(&EndpointAnnouncement::message(
+            .sign(&Announcement::message(
                 network,
                 &self.public_key,
                 &length,
@@ -338,8 +361,8 @@ mod tests {
     use super::*;
     use wireguard_control::KeyPair;
 
-    fn announcement() -> EndpointAnnouncement {
-        EndpointAnnouncement {
+    fn announcement() -> Announcement {
+        Announcement {
             timestamp: 1,
             endpoint: Some("0.0.0.0:51820".parse().unwrap()),
             candidates: vec![
@@ -348,6 +371,10 @@ mod tests {
                 "peer.example.com:51820".parse().unwrap(),
             ],
             allow_observed: true,
+            delegations: vec![
+                "10.0.0.32/28".parse().unwrap(),
+                "fd00::1:0/112".parse().unwrap(),
+            ],
             extensions: vec![],
         }
     }
@@ -394,12 +421,14 @@ mod tests {
     fn test_rejects_tampering() {
         let (keypair, network, signer) = setup();
         let signed = signer.sign(&network, announcement()).unwrap();
-        let tamper: [fn(&mut EndpointAnnouncement); 6] = [
+        let tamper: [fn(&mut Announcement); 8] = [
             |a| a.timestamp += 1,
             |a| a.allow_observed = false,
             |a| a.endpoint = Some("203.0.113.9:51820".parse().unwrap()),
             |a| a.candidates.pop().map(drop).unwrap_or_default(),
             |a| a.candidates.swap(0, 1),
+            |a| a.delegations[0] = "10.0.0.32/27".parse().unwrap(),
+            |a| a.delegations.swap(0, 1),
             |a| {
                 a.extensions.push(Extension {
                     tag: 1,
