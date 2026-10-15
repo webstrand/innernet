@@ -149,7 +149,15 @@ sudo innernet add-delegation <interface> --name <peer> --prefix <prefix>
 
 or from the server with `innernet-server add-delegation <interface>`. `delete-delegation` withdraws one in the same way. `innernet show` lists each peer's delegations.
 
-To put delegated addresses on the peer's own interface (Linux only), list them in the `[interface]` section of its config, `/etc/innernet/<interface>.conf`:
+A delegation is routed to its peer only once the peer announces it, which it does on its next fetch. By default a peer announces all of its delegations. To announce only parts of them, list prefixes to include and, prefixed with `!`, prefixes to exclude, in the `[interface]` section of its config, `/etc/innernet/<interface>.conf`:
+
+```toml
+announce-delegations = ["0.0.0.0/0", "::/0", "!10.42.1.40/29"]
+```
+
+The default is `["0.0.0.0/0", "::/0"]`, and an empty list announces nothing. `innernet show` marks the delegations, or their parts, that a peer does not announce.
+
+To put delegated addresses on the peer's own interface (Linux only), list them in the same section:
 
 ```toml
 extra-addresses = ["10.42.1.40"]
