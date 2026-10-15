@@ -12,7 +12,7 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
@@ -228,26 +228,17 @@ pub fn fetch(
 
     // The interface is configured from the enabled peers of the data store, with the local peer
     // endpoint overrides applied.
-    let mut peers: Vec<Peer> = store
-        .peers()
-        .iter()
-        .filter(|peer| !peer.is_disabled)
-        .cloned()
-        .collect();
     for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
         log::debug!(
             "overriding peer IP {} with endpoint {}",
             peer_ip,
             endpoint_override
         );
-
-        if let Some(peer) = peers.iter_mut().find(|p| p.ip == *peer_ip) {
-            peer.endpoint = Some(endpoint_override.clone());
-        }
     }
+    let peers = store.peers();
 
     let device = Device::get(interface, network_opts.backend)?;
-    let modifications = device.diff(&peers);
+    let modifications = device.diff(peers, config.peer_endpoint_overrides());
 
     let updates = modifications
         .iter()
@@ -263,7 +254,11 @@ pub fn fetch(
             .context(interface.to_string())?;
 
         if !hosts_opts.no_write_hosts {
-            update_hosts_file(interface, hosts_opts, &peers)?;
+            update_hosts_file(
+                interface,
+                hosts_opts,
+                peers.iter().filter(|peer| !peer.is_disabled),
+            )?;
         }
 
         println!();

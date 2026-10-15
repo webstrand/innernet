@@ -1,6 +1,7 @@
-use crate::{Error, IoErrorContext, NetworkOpts, Peer, PeerDiff};
+use crate::{Endpoint, Error, IoErrorContext, NetworkOpts, Peer, PeerDiff};
 use ipnet::IpNet;
 use std::{
+    collections::BTreeMap,
     io,
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -183,15 +184,25 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
 pub use super::netlink::add_route;
 
 pub trait DeviceExt {
-    /// Diff the output of a wgctrl device with a list of server-reported peers.
-    fn diff<'a>(&'a self, peers: &'a [Peer]) -> Vec<PeerDiff<'a>>;
+    /// Diff the output of a wgctrl device with a list of peers, of which the disabled peers are
+    /// removed from the device. The endpoint of a peer whose IP is in `endpoint_overrides` is
+    /// replaced with its override.
+    fn diff<'a>(
+        &'a self,
+        peers: &'a [Peer],
+        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+    ) -> Vec<PeerDiff<'a>>;
 
     // /// Get a peer by their public key, a helper function.
     fn get_peer(&self, public_key: &str) -> Option<&PeerInfo>;
 }
 
 impl DeviceExt for Device {
-    fn diff<'a>(&'a self, peers: &'a [Peer]) -> Vec<PeerDiff<'a>> {
+    fn diff<'a>(
+        &'a self,
+        peers: &'a [Peer],
+        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+    ) -> Vec<PeerDiff<'a>> {
         let interface_public_key = self
             .public_key
             .as_ref()
@@ -207,7 +218,7 @@ impl DeviceExt for Device {
                 let existing_peer = existing_peers
                     .iter()
                     .find(|p| p.config.public_key.to_base64() == peer.public_key);
-                PeerDiff::new(existing_peer, Some(peer)).unwrap()
+                PeerDiff::new(existing_peer, Some(peer), endpoint_overrides.get(&peer.ip)).unwrap()
             }
         });
 
@@ -220,7 +231,7 @@ impl DeviceExt for Device {
             {
                 None
             } else {
-                PeerDiff::new(Some(existing), None).unwrap()
+                PeerDiff::new(Some(existing), None, None).unwrap()
             }
         });
 
