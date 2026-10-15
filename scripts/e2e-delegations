@@ -290,6 +290,33 @@ pass "b still reaches a from $b_ip"
 ns a ping -c3 -W2 10.66.1.40 >/dev/null || fail "a can't ping b's extra address"
 pass "a pings b's extra address"
 
+step "b announces only part of its delegation"
+python3 -I - "$work/b/conf/e2e.conf" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+text = text.replace("[interface]\n", '[interface]\nannounce-delegations = ["0.0.0.0/0", "!10.66.1.40/29"]\n', 1)
+open(path, "w").write(text)
+EOF
+fetch b
+fetch a
+for ns in srv a; do
+    expect_routed "$ns" b "$b_key" 10.66.1.32/29
+    expect_not_routed "$ns" b "$b_key" "$prefix"
+done
+ns a ping -c3 -W2 "$ctr_ip" >/dev/null || fail "a can't ping the container"
+pass "a still pings the container"
+! ns a ping -c1 -W1 10.66.1.40 >/dev/null 2>&1 || fail "a still pings b's extra address"
+pass "a no longer pings b's extra address"
+client a show e2e 2>&1 | sed 's/\x1b\[[0-9;]*m//g' >"$work/a.show.log"
+grep -qF "delegations: $prefix (announced: 10.66.1.32/29)" "$work/a.show.log" ||
+    { cat "$work/a.show.log" >&2; fail "a's show doesn't list the announced part of $prefix"; }
+pass "a's show lists the announced part of $prefix"
+sed -i '/^announce-delegations = /d' "$work/b/conf/e2e.conf"
+fetch b
+fetch a
+expect_routed a b "$b_key" "$prefix"
+
 step "only b's own address is b to the server"
 # Let b use plain HTTP, so that its own address alone is accepted.
 db "UPDATE peers SET requires_tls = 0 WHERE name = 'b'"
