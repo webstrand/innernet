@@ -590,8 +590,17 @@ pub struct HostsOpts {
     /// Use a different suffix for hosts, than 'INTERFACE.wg' , ex.
     /// --host-suffix 'evilnet' names peers: PEER.evilnet, and
     /// --host-suffix '' gives peers no suffix, just: PEER
-    #[clap(long = "host-suffix")]
+    #[clap(long = "host-suffix", value_parser = parse_host_suffix)]
     pub host_suffix: Option<String>,
+}
+
+/// Parses a host suffix: empty, or labels that are each a valid hostname, separated by dots.
+fn parse_host_suffix(suffix: &str) -> Result<String, String> {
+    if suffix.is_empty() || suffix.split('.').all(Hostname::is_valid) {
+        Ok(suffix.to_string())
+    } else {
+        Err("each dot-separated label must be a valid hostname".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1076,6 +1085,24 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use wireguard_control::{Key, PeerConfigBuilder, PeerStats};
+
+    #[test]
+    fn test_parse_host_suffix() {
+        for valid in ["", "evilnet", "wg.example.com"] {
+            assert_eq!(parse_host_suffix(valid).as_deref(), Ok(valid));
+        }
+        for invalid in [
+            "evil net",
+            "wg\nexample.com",
+            "wg#1",
+            ".wg",
+            "wg.",
+            "Wg",
+            "wgé",
+        ] {
+            assert!(parse_host_suffix(invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn test_peer_no_diff() {
