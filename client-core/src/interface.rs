@@ -241,9 +241,10 @@ pub fn fetch(
         let dropped = store.update(state).context(interface.to_string())?;
         for (peer, e) in dropped {
             log::warn!(
-                "{}: dropping peer {}: {}",
+                "{}: dropping peer {} at {} from the update: {}",
                 interface.as_str_lossy().yellow(),
-                peer.name,
+                peer.public_key,
+                peer.ip,
                 e
             );
         }

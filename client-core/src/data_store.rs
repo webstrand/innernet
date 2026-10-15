@@ -200,9 +200,13 @@ impl DataStore {
         Ok(())
     }
 
-    /// Validates that `candidate` lies within the network of the interface, matches the pins of
-    /// the data store, and shares neither its IP nor its public key with a peer of `accepted`.
+    /// Validates that the name of `candidate` is a valid hostname, that it lies within the network
+    /// of the interface, matches the pins of the data store, and shares neither its IP nor its
+    /// public key with a peer of `accepted`.
     fn check(&self, candidate: &Peer, accepted: &PeersIndex) -> Result<(), Error> {
+        if !Hostname::is_valid(&candidate.name) {
+            bail!("name is not a valid hostname.");
+        }
         self.check_network_closure(candidate)?;
         match self.peers.check(candidate) {
             PinStatus::New | PinStatus::Unchanged => {},
@@ -538,6 +542,32 @@ mod tests {
         assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
         std::fs::write(&path, "\n").unwrap();
         assert!(DataStore::open_with_path(&path, *NETWORK, false).is_err());
+    }
+
+    #[test]
+    fn test_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store =
+            DataStore::open_with_path(dir.path().join("peer_store.json"), *NETWORK, false).unwrap();
+
+        // A peer whose name isn't a valid hostname is dropped, and the other peers are kept.
+        let mut invalid = BASE_PEERS.clone();
+        let mut new_peer = BASE_PEERS[0].clone();
+        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
+        new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        new_peer.contents.name = serde_json::from_str(r#""peer\n10.0.0.1 example.com""#).unwrap();
+        invalid.push(new_peer);
+        let dropped = store.update_peers(&invalid);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, &invalid[1]);
+        assert_eq!(store.peers(), &*BASE_PEERS);
+
+        // A stored peer renamed to an invalid name keeps its record, and stays enabled.
+        let mut renamed = BASE_PEERS.clone();
+        renamed[0].contents.name = serde_json::from_str(r#""Blah""#).unwrap();
+        assert_eq!(store.update_peers(&renamed).len(), 1);
+        assert_eq!(store.peers(), &*BASE_PEERS);
     }
 
     #[test]
