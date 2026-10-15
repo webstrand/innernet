@@ -24,7 +24,6 @@ colored.workspace = true
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = "2.4"
 log = "0.4"
-regex = { version = "1", default-features = false, features = ["std"] }
 rusqlite.workspace = true
 rusqlite_migration = "2.6.0"
 serde = { version = "1.0", features = ["derive"] }

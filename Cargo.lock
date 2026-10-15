@@ -773,7 +773,6 @@ dependencies = [
  "innernet-client-core",
  "innernet-shared",
  "log",
- "regex",
  "ureq",
  "wireguard-control",
 ]
@@ -789,7 +788,6 @@ dependencies = [
  "ipnet",
  "log",
  "once_cell",
- "regex",
  "rusqlite",
  "rusqlite_migration",
  "serde",
