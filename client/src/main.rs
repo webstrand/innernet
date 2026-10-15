@@ -297,7 +297,13 @@ fn install(
     };
 
     let interface_name = interface_name.parse()?;
-    redeem_invite(&opts.config_dir, &opts.network, &interface_name, config)?;
+    redeem_invite(
+        &opts.config_dir,
+        &opts.data_dir,
+        &opts.network,
+        &interface_name,
+        config,
+    )?;
 
     let mut fetch_success = false;
     for _ in 0..3 {

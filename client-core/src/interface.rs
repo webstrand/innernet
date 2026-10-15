@@ -24,6 +24,10 @@ pub enum RedeemInviteError {
     InterfaceConfigAccess(WrappedIoError),
     #[error("Config file for innernet interface {0} already exists.")]
     InterfaceConfigExists(InterfaceName),
+    #[error("Data store for innernet interface {0} already exists.")]
+    DataStoreExists(InterfaceName),
+    #[error("Error introducing the coordinator and this client into the data store: {0:#}")]
+    DataStoreIntroduction(Error),
     #[error("Error making a REST request: {0}")]
     RestRequest(#[from] RestError),
     #[error("Could not resolve server address for endpoint {endpoint}: {error}")]
@@ -45,10 +49,12 @@ pub enum RedeemInviteError {
 /// - Brings the WireGuard interface up.
 /// - Generates a fresh key pair and uses the public part to redeem the invite and the private part
 ///   to update the WireGuard interface.
+/// - Creates the data store with the coordinator and this client, as the config introduces them.
 /// - Bails if either a WireGuard or an innernet `interface` of the same name already exists and
 ///   brings the interface down if it was already up.
 pub fn redeem_invite(
     config_dir: &Path,
+    data_dir: &Path,
     network_opts: &NetworkOpts,
     interface: &InterfaceName,
     config: InterfaceConfig,
@@ -58,6 +64,9 @@ pub fn redeem_invite(
 
     if config_path.exists() {
         return Err(RedeemInviteError::InterfaceConfigExists(*interface));
+    }
+    if DataStore::get_path(data_dir, interface).exists() {
+        return Err(RedeemInviteError::DataStoreExists(*interface));
     }
 
     if Device::list(network_opts.backend)
@@ -99,7 +108,7 @@ pub fn redeem_invite(
         error: e,
     })?;
 
-    update_keypair(network_opts, interface, &config_path, config).inspect_err(|e| {
+    update_keypair(network_opts, interface, &config_path, data_dir, config).inspect_err(|e| {
         log::error!("failed to update keypair (is the innernet server reachable?): {e}.",);
         log::info!("bringing down the interface.");
         if let Err(e) = wg::down(interface, network_opts.backend) {
@@ -114,6 +123,7 @@ fn update_keypair(
     network_opts: &NetworkOpts,
     interface: &InterfaceName,
     config_path: &Path,
+    data_dir: &Path,
     mut config: InterfaceConfig,
 ) -> Result<(), RedeemInviteError> {
     log::info!("Generating new keypair.");
@@ -139,6 +149,11 @@ fn update_keypair(
         "New keypair registered. Copied config to {}.\n",
         config_path.to_string_lossy().yellow()
     );
+
+    DataStore::open_or_create(data_dir, interface)
+        .map_err(Error::from)
+        .and_then(|mut store| store.introduce(&config))
+        .map_err(RedeemInviteError::DataStoreIntroduction)?;
 
     log::info!("Changing keys and waiting 5s for server's WireGuard interface to transition.",);
     DeviceUpdate::new()

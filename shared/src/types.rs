@@ -891,6 +891,13 @@ impl Hostname {
     pub fn is_valid(name: &str) -> bool {
         name.len() < 64 && HOSTNAME_REGEX.is_match(name)
     }
+
+    /// The placeholder name of the peer with `public_key`, for a record that a client makes before
+    /// the coordination server names the peer. A base64 public key always ends in "=", so the
+    /// placeholder is never a valid hostname, and never written to the hosts file.
+    pub fn placeholder(public_key: &str) -> Self {
+        Self(public_key.to_string())
+    }
 }
 
 impl FromStr for Hostname {

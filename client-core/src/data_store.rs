@@ -1,6 +1,7 @@
 use anyhow::{bail, Error};
 use innernet_shared::{
-    chmod, ensure_dirs_exist, Cidr, IoErrorContext, Peer, State, WrappedIoError,
+    chmod, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, Hostname, IoErrorContext,
+    Peer, PeerContents, State, WrappedIoError,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +9,7 @@ use std::{
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
 };
-use wireguard_control::InterfaceName;
+use wireguard_control::{InterfaceName, Key};
 
 /// File-backed storage of [`Peer`]s and [`Cidr`]s.
 ///
@@ -79,6 +80,26 @@ impl DataStore {
         interface: &InterfaceName,
     ) -> Result<Self, WrappedIoError> {
         Self::_open(data_dir, interface, true)
+    }
+
+    /// Records the coordinator and this client as the interface config introduces them, and
+    /// writes the data store. This is the introduction, when an invitation is redeemed, so the
+    /// data store must be new.
+    ///
+    /// The interface config, which the invitation produced, is the authority on both, so their
+    /// (IP, PublicKey) tuples are pinned before the coordination server reports anything. Each
+    /// record is named by its public key until a fetch replaces it with the server's record.
+    pub fn introduce(&mut self, config: &InterfaceConfig) -> Result<(), Error> {
+        let peers = match &mut self.contents {
+            Contents::V1 { ref mut peers, .. } => peers,
+        };
+        if !peers.is_empty() {
+            bail!("the data store to introduce peers into is not new.");
+        }
+        peers.extend(introduced_peers(config)?);
+        self.write()?;
+
+        Ok(())
     }
 
     /// Merges the peers of `state` into the data store, replaces its CIDRs with those of `state`,
@@ -167,6 +188,52 @@ impl DataStore {
             .write_all(serde_json::to_string_pretty(&self.contents)?.as_bytes())?;
         Ok(())
     }
+}
+
+/// The ID of the record of the coordinator from the interface config. Server IDs are positive, so
+/// it never collides with the ID of a fetched peer.
+const INTRODUCED_COORDINATOR_ID: i64 = -1;
+/// The ID of the record of this client from the interface config.
+const INTRODUCED_SELF_ID: i64 = -2;
+
+/// The coordinator and this client, as the interface config introduces them. Each record is named
+/// by its public key, and has no CIDR.
+fn introduced_peers(config: &InterfaceConfig) -> Result<[Peer; 2], Error> {
+    let introduced = |id, ip, public_key: String, endpoint| Peer {
+        id,
+        contents: PeerContents {
+            name: Hostname::placeholder(&public_key),
+            ip,
+            cidr_id: -1,
+            public_key,
+            endpoint,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        },
+    };
+    // The server's key is compared as the string that the server reports, as the config holds it.
+    let server_key = config.server.public_key.clone();
+    let own_key = Key::from_base64(&config.interface.private_key)?
+        .get_public()
+        .to_base64();
+    Ok([
+        introduced(
+            INTRODUCED_COORDINATOR_ID,
+            config.server.internal_endpoint.ip(),
+            server_key,
+            Some(config.server.external_endpoint.clone()),
+        ),
+        introduced(
+            INTRODUCED_SELF_ID,
+            config.interface.address.addr(),
+            own_key,
+            None,
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -286,5 +353,69 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(store.peers(), &new_peers);
+    }
+
+    /// The coordinator of [`introducing_config`], as the server reports it.
+    static COORDINATOR: Lazy<Peer> = Lazy::new(|| {
+        let mut coordinator = BASE_PEERS[0].clone();
+        coordinator.contents.public_key =
+            "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string();
+        coordinator
+    });
+
+    fn introducing_config(own_key: &wireguard_control::KeyPair) -> InterfaceConfig {
+        serde_json::from_value(serde_json::json!({
+            "interface": {
+                "network-name": "wg0",
+                "address": "10.0.0.2/16",
+                "private-key": own_key.private.to_base64(),
+            },
+            "server": {
+                "public-key": COORDINATOR.public_key,
+                "external-endpoint": "203.0.113.1:51820",
+                "internal-endpoint": "10.0.0.1:51820",
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_introduce() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_key = wireguard_control::KeyPair::generate();
+        let config = introducing_config(&own_key);
+        let path = dir.path().join("peer_store.json");
+
+        // A new data store pins the coordinator and this client, named by their public keys.
+        let mut store = DataStore::open_with_path(&path, true).unwrap();
+        store.introduce(&config).unwrap();
+        let peers = store.peers();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].ip, COORDINATOR.ip);
+        assert_eq!(peers[0].public_key, COORDINATOR.public_key);
+        assert_eq!(*peers[0].name, COORDINATOR.public_key);
+        assert_eq!(peers[1].ip, "10.0.0.2".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(peers[1].public_key, own_key.public.to_base64());
+        assert!(!Hostname::is_valid(&peers[0].name));
+
+        // The coordinator can't be reported at another IP, nor another key at its IP.
+        let mut moved = [COORDINATOR.clone()];
+        moved[0].contents.ip = "10.0.0.3".parse().unwrap();
+        assert!(store.update_peers(&moved).is_err());
+        let mut replaced = [COORDINATOR.clone()];
+        replaced[0].contents.public_key =
+            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        assert!(store.update_peers(&replaced).is_err());
+
+        // The server's record of the coordinator replaces the introduced one.
+        store
+            .update_peers(std::slice::from_ref(&*COORDINATOR))
+            .unwrap();
+        assert_eq!(store.peers()[0], *COORDINATOR);
+        assert_eq!(store.peers().len(), 2);
+
+        // Only a new data store is introduced.
+        assert!(store.introduce(&config).is_err());
+        assert_eq!(store.peers().len(), 2);
     }
 }
