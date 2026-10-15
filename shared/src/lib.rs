@@ -162,20 +162,8 @@ pub fn update_hosts_file(
     }
 
     let mut hosts_builder = HostsBuilder::new(format!("innernet {interface}"));
-    for peer in peers {
-        let peer = peer.as_ref();
-        // A peer without a name has no hosts entry.
-        let Some(name) = &peer.contents.name else {
-            continue;
-        };
-        match peer_hostname(interface, opts.host_suffix.as_deref(), name) {
-            Some(peer_hostname) => hosts_builder.add_hostname(peer.contents.ip, peer_hostname),
-            None => log::warn!(
-                "omitting peer {} from the hosts file, since without a host suffix its name is \
-                 not a single-label domain.",
-                name
-            ),
-        }
+    for (ip, hostname) in hosts_entries(interface, opts.host_suffix.as_deref(), peers) {
+        hosts_builder.add_hostname(ip, hostname);
     }
     match hosts_builder
         .write_to(opts.hosts_path.as_path())
@@ -192,6 +180,36 @@ pub fn update_hosts_file(
     };
 
     Ok(())
+}
+
+/// The hosts file entries of `peers`, each an address and a hostname.
+///
+/// A peer without a name has no entry, and neither has a peer that offers a nameserver, which
+/// answers for its name instead.
+fn hosts_entries(
+    interface: &InterfaceName,
+    host_suffix: Option<&str>,
+    peers: impl IntoIterator<Item = impl AsRef<Peer>>,
+) -> Vec<(IpAddr, String)> {
+    let mut entries = vec![];
+    for peer in peers {
+        let peer = peer.as_ref();
+        let Some(name) = &peer.contents.name else {
+            continue;
+        };
+        if peer.contents.announced_dns().is_some() {
+            continue;
+        }
+        match peer_hostname(interface, host_suffix, name) {
+            Some(peer_hostname) => entries.push((peer.contents.ip, peer_hostname)),
+            None => log::warn!(
+                "omitting peer {} from the hosts file, since without a host suffix its name is \
+                 not a single-label domain.",
+                name
+            ),
+        }
+    }
+    entries
 }
 
 /// The hostname of the peer `name` in the hosts file, or `None` if the peer must be omitted.
@@ -236,5 +254,56 @@ mod tests {
         );
         assert_eq!(hostname(Some(""), "08"), None);
         assert_eq!(hostname(Some(""), "a.0x7f000001"), None);
+    }
+
+    #[test]
+    fn test_hosts_entries_omit_peers_offering_dns() {
+        let interface: InterfaceName = "wg0".parse().unwrap();
+        let peer = |name: Option<&str>, ip: &str, nameserver: Option<&str>| {
+            let mut peer: Peer = serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "name": name,
+                "ip": ip,
+                "cidr_id": 1,
+                "public_key": wireguard_control::KeyPair::generate().public.to_base64(),
+                "endpoint": null,
+                "persistent_keepalive_interval": null,
+                "is_admin": false,
+                "is_disabled": false,
+                "is_redeemed": true,
+                "invite_expires": null,
+            }))
+            .unwrap();
+            peer.contents.announcement = Some(announcement::SignedAnnouncement {
+                announcement: announcement::Announcement {
+                    timestamp: 1,
+                    endpoint: None,
+                    candidates: vec![],
+                    allow_observed: false,
+                    delegations: vec![],
+                    dns: nameserver.map(|nameserver| announcement::DnsAnnouncement {
+                        nameserver: nameserver.parse().unwrap(),
+                        zone: "example.com".into(),
+                    }),
+                    extensions: vec![],
+                },
+                signature: vec![],
+            });
+            peer
+        };
+        let peers = [
+            peer(Some("plain"), "10.0.0.2", None),
+            peer(None, "10.0.0.3", None),
+            peer(Some("dns"), "10.0.0.4", Some("10.0.0.4:53")),
+            // A nameserver that isn't accepted leaves the entry in place.
+            peer(Some("elsewhere"), "10.0.0.5", Some("192.0.2.1:53")),
+        ];
+        assert_eq!(
+            hosts_entries(&interface, None, &peers),
+            [
+                ("10.0.0.2".parse().unwrap(), "plain.wg0.wg".to_string()),
+                ("10.0.0.5".parse().unwrap(), "elsewhere.wg0.wg".to_string()),
+            ]
+        );
     }
 }
