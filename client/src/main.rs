@@ -1261,8 +1261,61 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
                 print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
             }
         }
+        if !short {
+            print_pins(&store, 1);
+        }
     }
     Ok(())
+}
+
+/// Prints what the data store pins without routing it: disabled peers, which keep their IP pinned
+/// to their key, and withdrawn delegations, which stay pinned to the key they were delegated to.
+fn print_pins(store: &DataStore, level: usize) {
+    let pad = level * 2;
+    let disabled: Vec<_> = store.peers().iter().filter(|p| p.is_disabled).collect();
+    let withdrawn: Vec<_> = store
+        .delegation_pins()
+        .into_iter()
+        .filter(|pin| pin.withdrawn)
+        .collect();
+    if disabled.is_empty() && withdrawn.is_empty() {
+        return;
+    }
+
+    println!();
+    println_pad!(pad, "{}", "pinned, not routed".bold());
+    for peer in disabled {
+        println_pad!(
+            pad,
+            "  {}: {} ({}) at {}",
+            "disabled peer".bold(),
+            peer.display_name().yellow(),
+            format!("{}…", &peer.public_key[..10]).dimmed(),
+            peer.ip,
+        );
+    }
+    for pin in withdrawn {
+        let name = store
+            .peers()
+            .iter()
+            .find(|p| p.public_key == pin.public_key)
+            .map_or_else(
+                || format!("{}…", &pin.public_key[..10]),
+                |p| p.display_name().to_string(),
+            );
+        println_pad!(
+            pad,
+            "  {}: {} from {}",
+            "withdrawn delegation".bold(),
+            pin.prefix,
+            name.yellow(),
+        );
+    }
+    println_pad!(
+        pad,
+        "  {}",
+        "`innernet forget-peer` and `innernet forget-delegation` un-pin them.".dimmed()
+    );
 }
 
 fn print_tree(

@@ -312,6 +312,10 @@ expect_not_routed a b "$b_key" "$prefix"
 expect_routed a b "$b_key" "$b_ip/32"
 withdrawn a | grep -qx "$b_key $prefix" || fail "a doesn't keep $prefix pinned to b: $(withdrawn a)"
 pass "a keeps $prefix pinned to b"
+client a show e2e 2>&1 | sed 's/\x1b\[[0-9;]*m//g' >"$work/a.show.log"
+grep -qF "withdrawn delegation: $prefix from b" "$work/a.show.log" ||
+    { cat "$work/a.show.log" >&2; fail "a's show doesn't list $prefix as withdrawn from b"; }
+pass "a's show lists $prefix as withdrawn from b"
 
 step "reassign it to c"
 server add-delegation e2e --name c --prefix "$prefix" --yes >/dev/null
