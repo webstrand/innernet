@@ -16,6 +16,7 @@ pub mod interface_config;
 #[cfg(target_os = "linux")]
 mod netlink;
 pub mod peer;
+pub mod prefix_set;
 pub mod prompts;
 pub mod tls;
 pub mod types;

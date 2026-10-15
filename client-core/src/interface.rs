@@ -11,7 +11,7 @@ use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_shared::{
     announcement::{self, Announcement, AnnouncementSigner, Received},
-    get_local_addrs, update_hosts_file,
+    get_local_addrs, prefix_set, update_hosts_file,
     wg::{self, DeviceExt as _},
     Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
@@ -322,7 +322,16 @@ pub fn fetch(
         // Fails before anything is sent if the private key doesn't match the interface.
         let signer = AnnouncementSigner::new(&config.interface.private_key, &own_public_key)
             .context(interface.to_string())?;
-        report_endpoints(&rest_client, nat, listen_port, &config, &signer, &network)?;
+        let delegations = own_peer.map_or(&[][..], |peer| &peer.delegations[..]);
+        report_announcement(
+            &rest_client,
+            nat,
+            listen_port,
+            &config,
+            delegations,
+            &signer,
+            &network,
+        )?;
     }
 
     if nat.no_nat_traversal {
@@ -569,13 +578,15 @@ fn warn_about_server_endpoint_override(
     }
 }
 
-/// Signs and reports the endpoints this peer can be reached at: its override from the local
-/// config and its local interface addresses as NAT traversal candidates.
-fn report_endpoints(
+/// Signs and reports this peer's announcement: the endpoints it can be reached at, which are its
+/// override from the local config and its local interface addresses as NAT traversal
+/// candidates, and the parts of `delegations`, its own, that the local config selects.
+fn report_announcement(
     rest_client: &RestClient,
     nat: &NatOpts,
     listen_port: u16,
     config: &InterfaceConfig,
+    delegations: &[IpNet],
     signer: &AnnouncementSigner,
     network: &Key,
 ) -> Result<(), Error> {
@@ -594,7 +605,7 @@ fn report_endpoints(
             endpoint,
             candidates,
             allow_observed,
-            delegations: vec![],
+            delegations: prefix_set::select(delegations, &config.interface.announce_delegations()),
             extensions: vec![],
         },
     )?;

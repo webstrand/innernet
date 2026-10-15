@@ -1,4 +1,7 @@
-use crate::{chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, Peer, WrappedIoError};
+use crate::{
+    chmod, ensure_dirs_exist, prefix_set::PrefixSelector, Endpoint, Error, IoErrorContext, Peer,
+    WrappedIoError,
+};
 use indoc::writedoc;
 use ipnet::IpNet;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
@@ -83,6 +86,13 @@ pub struct InterfaceInfo {
     /// brought down or the address is removed by hand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_addresses: Vec<IpAddr>,
+
+    /// The parts of this peer's delegations that it announces it accepts traffic for: prefixes
+    /// to include and, written `!prefix`, prefixes to exclude, in any order. Peers route to this
+    /// peer only the parts it announces. When absent, every delegation is announced whole, as
+    /// `["0.0.0.0/0", "::/0"]` would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce_delegations: Option<Vec<PrefixSelector>>,
 }
 
 impl InterfaceInfo {
@@ -94,7 +104,15 @@ impl InterfaceInfo {
             listen_port: None,
             external_endpoint: None,
             extra_addresses: vec![],
+            announce_delegations: None,
         }
+    }
+
+    /// The selection of the delegations that this peer announces.
+    pub fn announce_delegations(&self) -> Vec<PrefixSelector> {
+        self.announce_delegations
+            .clone()
+            .unwrap_or_else(PrefixSelector::all)
     }
 }
 
@@ -378,5 +396,38 @@ mod tests {
             reloaded.interface.extra_addresses,
             config.interface.extra_addresses
         );
+    }
+
+    #[test]
+    fn test_announce_delegations() {
+        let config = config("");
+        assert_eq!(config.interface.announce_delegations, None);
+        assert_eq!(
+            config.interface.announce_delegations(),
+            PrefixSelector::all()
+        );
+        assert!(!config.as_toml().contains("announce-delegations"));
+
+        let with = |value: &str| {
+            toml::from_str::<InterfaceConfig>(&config.as_toml().replace(
+                "[interface]\n",
+                &format!("[interface]\nannounce-delegations = {value}\n"),
+            ))
+        };
+        let config = with(r#"["10.0.0.32/28", "!10.0.0.40/31", "fd00::/64"]"#).unwrap();
+        assert_eq!(
+            config.interface.announce_delegations(),
+            ["10.0.0.32/28", "!10.0.0.40/31", "fd00::/64"]
+                .map(|s| s.parse::<PrefixSelector>().unwrap())
+        );
+        let reloaded: InterfaceConfig = toml::from_str(&config.as_toml()).unwrap();
+        assert_eq!(
+            reloaded.interface.announce_delegations,
+            config.interface.announce_delegations
+        );
+
+        // An empty list announces nothing, and a malformed entry is refused.
+        assert_eq!(with("[]").unwrap().interface.announce_delegations(), vec![]);
+        assert!(with(r#"["10.0.0.40"]"#).is_err());
     }
 }
