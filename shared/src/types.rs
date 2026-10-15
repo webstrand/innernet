@@ -744,6 +744,12 @@ pub fn check_delegation(
 }
 
 impl PeerContents {
+    /// The public key of the peer in the URL-safe base64 alphabet, padding included, by which a
+    /// path of the admin API names the peer.
+    pub fn api_path_segment(&self) -> String {
+        self.public_key.replace('+', "-").replace('/', "_")
+    }
+
     /// The name of the peer for display, or "[unnamed]" if it has none.
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("[unnamed]")
@@ -776,7 +782,7 @@ fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
         .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
 }
 
-/// The body of `POST /admin/peers/delegations/{id}`.
+/// The body of `POST /admin/peers/delegations/{peer}`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DelegationContents {
     pub prefix: IpNet,
@@ -1034,14 +1040,14 @@ pub struct State {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
-    /// Whether the server supports `DELETE /admin/peers/permanent/{id}`.
+    /// Whether the server supports `DELETE /admin/peers/permanent/{peer}`.
     #[serde(default)]
     pub permanent_peer_delete: bool,
     /// Whether the server supports `PUT /user/announcement`.
     #[serde(default)]
     pub signed_announcements: bool,
-    /// Whether the server supports `POST /admin/peers/delegations/{id}` and
-    /// `DELETE /admin/peers/delegations/{id}/{prefix}`.
+    /// Whether the server supports `POST /admin/peers/delegations/{peer}` and
+    /// `DELETE /admin/peers/delegations/{peer}/{prefix}`.
     #[serde(default)]
     pub delegations: bool,
 }

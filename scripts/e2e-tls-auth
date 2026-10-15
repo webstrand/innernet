@@ -164,6 +164,15 @@ client adm add-peer e2e --name new --auto-ip --cidr peers --admin false \
 [ "$(invitation "$work/new.toml" server public-key)" = "$server_key" ] ||
     fail "adm's invitation names another server key"
 pass "adm's invitation names the server's key"
+client adm rename-peer e2e --name new --new-name renamed --yes >/dev/null ||
+    fail "rename-peer as adm"
+client adm disable-peer e2e --name renamed --yes >/dev/null || fail "disable-peer as adm"
+db "SELECT is_disabled FROM peers WHERE name = 'renamed'" | grep -qx 1 ||
+    fail "adm didn't rename and disable the new peer"
+client adm delete-peer e2e --name renamed --yes >/dev/null 2>&1 || fail "delete-peer as adm"
+[ -z "$(db "SELECT id FROM peers WHERE name = 'renamed'")" ] ||
+    fail "adm didn't delete the new peer"
+pass "adm renames, disables and deletes peers by key"
 
 step "something else on a peer's machine, without its key"
 expect_plain a GET /v1/user/state 401

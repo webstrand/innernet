@@ -12,6 +12,38 @@ use innernet_shared::{DelegationContents, PeerContents};
 use ipnet::IpNet;
 use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
+/// A peer as a path segment of the admin API names it: by its ID, or by its public key in the
+/// URL-safe base64 alphabet. Servers that predate public keys in paths answer 404 to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerRef {
+    Id(i64),
+    PublicKey(Key),
+}
+
+impl PeerRef {
+    fn parse(segment: &str) -> Result<Self, ServerError> {
+        if let Ok(id) = segment.parse() {
+            return Ok(Self::Id(id));
+        }
+        let key = segment.replace('-', "+").replace('_', "/");
+        Key::from_base64(&key)
+            .map(Self::PublicKey)
+            .map_err(|_| ServerError::NotFound)
+    }
+
+    fn get(&self, conn: &rusqlite::Connection) -> Result<DatabasePeer, ServerError> {
+        Ok(match self {
+            Self::Id(id) => DatabasePeer::get(conn, *id)?,
+            Self::PublicKey(key) => DatabasePeer::get_from_public_key(conn, key)?,
+        })
+    }
+}
+
+/// Parses the next path segment as a [`PeerRef`].
+fn next_peer(components: &mut VecDeque<String>) -> Result<PeerRef, ServerError> {
+    PeerRef::parse(&components.pop_front().ok_or(ServerError::NotFound)?)
+}
+
 pub async fn routes(
     req: Request<Body>,
     mut components: VecDeque<String>,
@@ -23,44 +55,35 @@ pub async fn routes(
             let form = form_body(req).await?;
             handlers::create(form, session).await
         },
-        (&Method::PUT, Some(id)) => {
-            let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
+        (&Method::PUT, Some(peer)) => {
+            let peer = PeerRef::parse(peer)?;
             let form = form_body(req).await?;
-            handlers::update(id, form, session).await
+            handlers::update(peer, form, session).await
         },
         // Deliberately not `/peers/{id}/permanent`: servers without this endpoint would
         // route that to `delete` (disable) and report success.
         (&Method::DELETE, Some("permanent")) => {
-            let id: i64 = components
-                .pop_front()
-                .and_then(|id| id.parse().ok())
-                .ok_or(ServerError::NotFound)?;
-            handlers::delete_permanently(id, session).await
+            let peer = next_peer(&mut components)?;
+            handlers::delete_permanently(peer, session).await
         },
         // Likewise not under `/peers/{id}/`, so that older servers answer 404.
         (&Method::POST, Some("delegations")) => {
-            let id: i64 = components
-                .pop_front()
-                .and_then(|id| id.parse().ok())
-                .ok_or(ServerError::NotFound)?;
+            let peer = next_peer(&mut components)?;
             let form = form_body(req).await?;
-            handlers::add_delegation(id, form, session).await
+            handlers::add_delegation(peer, form, session).await
         },
         // The prefix ends the path, as in `/peers/delegations/{id}/10.42.1.32/28`.
         (&Method::DELETE, Some("delegations")) => {
-            let id: i64 = components
-                .pop_front()
-                .and_then(|id| id.parse().ok())
-                .ok_or(ServerError::NotFound)?;
+            let peer = next_peer(&mut components)?;
             let prefix: IpNet = Vec::from(components)
                 .join("/")
                 .parse()
                 .map_err(|_| ServerError::InvalidQuery)?;
-            handlers::remove_delegation(id, prefix, session).await
+            handlers::remove_delegation(peer, prefix, session).await
         },
-        (&Method::DELETE, Some(id)) => {
-            let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
-            handlers::delete(id, session).await
+        (&Method::DELETE, Some(peer)) => {
+            let peer = PeerRef::parse(peer)?;
+            handlers::delete(peer, session).await
         },
         _ => Err(ServerError::NotFound),
     }
@@ -92,12 +115,12 @@ mod handlers {
     }
 
     pub async fn update(
-        id: i64,
+        peer: PeerRef,
         form: PeerContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut peer = DatabasePeer::get(&conn, id)?;
+        let mut peer = peer.get(&conn)?;
         peer.update(&conn, form)?;
 
         status_response(StatusCode::NO_CONTENT)
@@ -114,21 +137,21 @@ mod handlers {
         json_response(&peers)
     }
 
-    pub async fn delete(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
+    pub async fn delete(peer: PeerRef, session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        DatabasePeer::disable(&conn, id)?;
+        DatabasePeer::disable(&conn, peer.get(&conn)?.id)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
 
     /// Permanently deletes a disabled peer, freeing its name and IP for reuse.
     pub async fn delete_permanently(
-        id: i64,
+        peer: PeerRef,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let peer = DatabasePeer::get(&conn, id)?;
-        DatabasePeer::delete(&conn, id)?;
+        let peer = peer.get(&conn)?;
+        DatabasePeer::delete(&conn, peer.id)?;
         log::info!("permanently deleted peer {}", *peer);
 
         if cfg!(not(test)) {
@@ -147,12 +170,12 @@ mod handlers {
 
     /// Delegates a prefix of its CIDR to a peer, as if it were that many more peers.
     pub async fn add_delegation(
-        id: i64,
+        peer: PeerRef,
         form: DelegationContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut peer = DatabasePeer::get(&conn, id)?;
+        let mut peer = peer.get(&conn)?;
         peer.add_delegation(&conn, form.prefix)?;
         log::info!("delegated {} to peer {}", form.prefix, *peer);
 
@@ -165,12 +188,12 @@ mod handlers {
 
     /// Withdraws a prefix delegated to a peer.
     pub async fn remove_delegation(
-        id: i64,
+        peer: PeerRef,
         prefix: IpNet,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut peer = DatabasePeer::get(&conn, id)?;
+        let mut peer = peer.get(&conn)?;
         peer.remove_delegation(&conn, prefix)?;
         log::info!("withdrew {} from peer {}", prefix, *peer);
 
@@ -629,6 +652,91 @@ mod tests {
             };
             peer.update(&conn, contents)?;
             assert_eq!(DatabasePeer::get(&conn, id)?.name, None);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_peer_ref_parse() {
+        assert_eq!(PeerRef::parse("12").unwrap(), PeerRef::Id(12));
+
+        // A key whose standard base64 holds both '+' and '/'.
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_mut(3) {
+            chunk.copy_from_slice(&[0xfb, 0xff, 0xbf][..chunk.len()]);
+        }
+        let key = Key(bytes);
+        let contents = PeerContents {
+            public_key: key.to_base64(),
+            ..test::peer_contents("peer", "10.80.64.9", test::DEVELOPER_CIDR_ID, false).unwrap()
+        };
+        let segment = contents.api_path_segment();
+        assert!(contents.public_key.contains('+') && contents.public_key.contains('/'));
+        assert!(!segment.contains('/'));
+        assert_eq!(PeerRef::parse(&segment).unwrap(), PeerRef::PublicKey(key));
+
+        assert!(PeerRef::parse("nonsense").is_err());
+        assert!(PeerRef::parse("").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_routes_by_public_key() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let peer = |id| DatabasePeer::get(&server.db().lock(), id).unwrap();
+        let developer1 = peer(test::DEVELOPER1_PEER_ID).api_path_segment();
+        let user1 = peer(test::USER1_PEER_ID).api_path_segment();
+
+        let change = PeerContents {
+            name: Some("new-peer-name".parse().unwrap()),
+            ..peer(test::DEVELOPER1_PEER_ID).contents.clone()
+        };
+        let path = format!("/v1/admin/peers/{developer1}");
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            peer(test::DEVELOPER1_PEER_ID).name.as_deref(),
+            Some("new-peer-name")
+        );
+
+        let form = DelegationContents {
+            prefix: test::DELEGATION.parse()?,
+        };
+        let path = format!("/v1/admin/peers/delegations/{developer1}");
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", &path, &form)
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(
+            delegations(&server, test::DEVELOPER1_PEER_ID),
+            [test::DELEGATION]
+        );
+        let path = format!(
+            "/v1/admin/peers/delegations/{developer1}/{}",
+            test::DELEGATION
+        );
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(delegations(&server, test::DEVELOPER1_PEER_ID).is_empty());
+
+        let path = format!("/v1/admin/peers/{user1}");
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(peer(test::USER1_PEER_ID).is_disabled);
+        let path = format!("/v1/admin/peers/permanent/{user1}");
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(DatabasePeer::get(&server.db().lock(), test::USER1_PEER_ID).is_err());
+
+        // A key that no peer has, and a segment that is neither an ID nor a key.
+        for segment in [user1.as_str(), "nonsense"] {
+            let path = format!("/v1/admin/peers/{segment}");
+            let res = server
+                .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+                .await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
         }
 
         Ok(())
