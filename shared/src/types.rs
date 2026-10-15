@@ -782,6 +782,15 @@ fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
         .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
 }
 
+/// The endpoint and candidates stored for a peer, the body of `GET` and
+/// `PUT /admin/peers/{peer}/endpoints`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PeerEndpoints {
+    pub endpoint: Option<Endpoint>,
+    #[serde(default)]
+    pub candidates: Vec<Endpoint>,
+}
+
 /// The body of `POST /admin/peers/delegations/{peer}`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DelegationContents {

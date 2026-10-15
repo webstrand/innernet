@@ -8,7 +8,7 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::{DelegationContents, PeerContents};
+use innernet_shared::{DelegationContents, PeerContents, PeerEndpoints};
 use ipnet::IpNet;
 use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
 
@@ -44,6 +44,16 @@ fn next_peer(components: &mut VecDeque<String>) -> Result<PeerRef, ServerError> 
     PeerRef::parse(&components.pop_front().ok_or(ServerError::NotFound)?)
 }
 
+/// Takes the next path segment, which must be the last.
+fn last_segment(components: &mut VecDeque<String>) -> Result<Option<String>, ServerError> {
+    let segment = components.pop_front();
+    if components.is_empty() {
+        Ok(segment)
+    } else {
+        Err(ServerError::NotFound)
+    }
+}
+
 pub async fn routes(
     req: Request<Body>,
     mut components: VecDeque<String>,
@@ -55,10 +65,28 @@ pub async fn routes(
             let form = form_body(req).await?;
             handlers::create(form, session).await
         },
+        // Clients name the peer by its key before `/endpoints`, since a server that predates it
+        // routes `PUT /peers/{id}/endpoints` to `update`, but answers 404 to a key.
+        (&Method::GET, Some(peer)) => {
+            let peer = PeerRef::parse(peer)?;
+            match last_segment(&mut components)?.as_deref() {
+                Some("endpoints") => handlers::endpoints(peer, session).await,
+                _ => Err(ServerError::NotFound),
+            }
+        },
         (&Method::PUT, Some(peer)) => {
             let peer = PeerRef::parse(peer)?;
-            let form = form_body(req).await?;
-            handlers::update(peer, form, session).await
+            match last_segment(&mut components)?.as_deref() {
+                None => {
+                    let form = form_body(req).await?;
+                    handlers::update(peer, form, session).await
+                },
+                Some("endpoints") => {
+                    let form = form_body(req).await?;
+                    handlers::set_endpoints(peer, form, session).await
+                },
+                _ => Err(ServerError::NotFound),
+            }
         },
         // Deliberately not `/peers/{id}/permanent`: servers without this endpoint would
         // route that to `delete` (disable) and report success.
@@ -83,6 +111,9 @@ pub async fn routes(
         },
         (&Method::DELETE, Some(peer)) => {
             let peer = PeerRef::parse(peer)?;
+            if last_segment(&mut components)?.is_some() {
+                return Err(ServerError::NotFound);
+            }
             handlers::delete(peer, session).await
         },
         _ => Err(ServerError::NotFound),
@@ -122,6 +153,35 @@ mod handlers {
         let conn = session.context.db.lock();
         let mut peer = peer.get(&conn)?;
         peer.update(&conn, form)?;
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
+    /// The endpoint and candidates stored for a peer, without the endpoint that the server
+    /// observes, so that they can be written back as they are read.
+    pub async fn endpoints(peer: PeerRef, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let peer = peer.get(&conn)?;
+        json_response(&PeerEndpoints {
+            endpoint: peer.endpoint.clone(),
+            candidates: peer.candidates.clone(),
+        })
+    }
+
+    /// Sets the endpoint and candidates of a peer on its behalf.
+    pub async fn set_endpoints(
+        peer: PeerRef,
+        form: PeerEndpoints,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        if form.candidates.len() > 10 {
+            return status_response(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let conn = session.context.db.lock();
+        let mut peer = peer.get(&conn)?;
+        peer.set_endpoint(&conn, form.endpoint)?;
+        peer.set_candidates(&conn, form.candidates)?;
+        log::info!("set the endpoints of peer {}", *peer);
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -417,6 +477,65 @@ mod tests {
         assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
         assert_eq!(new_peer.endpoint, old_peer.endpoint);
         assert_eq!(new_peer.candidates, old_peer.candidates);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_endpoints() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let segment =
+            DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.api_path_segment();
+        let path = format!("/v1/admin/peers/{segment}/endpoints");
+        let get = || async {
+            let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = hyper::body::aggregate(res).await.unwrap();
+            serde_json::from_reader::<_, PeerEndpoints>(body.reader()).unwrap()
+        };
+        assert_eq!(get().await, PeerEndpoints::default());
+
+        let endpoints = PeerEndpoints {
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            candidates: vec!["198.51.100.2:51820".parse().unwrap()],
+        };
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &endpoints)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(get().await, endpoints);
+
+        // Non-admins can't, and too many candidates are refused.
+        let res = server
+            .form_request(test::DEVELOPER1_PEER_IP, "PUT", &path, &endpoints)
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let too_many = PeerEndpoints {
+            endpoint: None,
+            candidates: vec!["198.51.100.2:51820".parse().unwrap(); 11],
+        };
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &too_many)
+            .await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(get().await, endpoints);
+
+        // Any other path under a peer is not found, rather than routed to the peer itself.
+        let change = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?
+            .contents
+            .clone();
+        for path in [
+            format!("/v1/admin/peers/{segment}/other"),
+            format!("/v1/admin/peers/{segment}/endpoints/other"),
+        ] {
+            let res = server
+                .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+                .await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+            let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
+        assert!(!DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_disabled);
+
         Ok(())
     }
 
