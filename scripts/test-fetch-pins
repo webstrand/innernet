@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Can a compromised coordination server put its own key on a client's WireGuard interface, in
+# place of a peer that the client has pinned?
+#
+# Usage: [KEEP=1] scripts/test-fetch-pins <dir containing innernet and innernet-server>
+#
+# Exit status: 0 if the attacker's key never reaches the client's interface, 1 if it does, 2 if
+# the test itself fails to set up. KEEP=1 keeps the work directory (configs, databases, logs).
+#
+# Everything runs unprivileged in network namespaces on one bridge:
+#   coordination-server  1.1.1.1  innernet-server, compromised
+#   alice                2.2.2.2  the client under test
+#   bob                  7.7.7.7  a genuine peer, which alice pins
+#   mallory              6.6.6.6  the attacker's WireGuard endpoint
+#
+# Requires: unshare, ip, wg, sqlite3, and the kernel WireGuard module.
+set -euo pipefail
+
+# Re-run inside a private user, mount and network namespace.
+if [ -z "${INSIDE:-}" ]; then
+    bin=$(realpath "${1:?usage: [KEEP=1] $0 <dir containing innernet and innernet-server>}")
+    exec unshare --user --map-root-user --mount --net env INSIDE=1 BIN="$bin" "$0"
+fi
+
+trap 'echo "SETUP FAILED: $BASH_COMMAND" >&2; exit 2' ERR
+work=$(mktemp -d "${TMPDIR:-/tmp}/innernet-repro.XXXXXX")
+trap 'kill $(jobs -p) 2>/dev/null; [ "${KEEP:-}" = 1 ] && echo "kept $work" || rm -rf "$work"' EXIT
+mount -t tmpfs tmpfs /run
+
+ns() { local name=$1; shift; ip netns exec "$name" "$@"; }
+coordination_server() {
+    ns coordination-server "$BIN/innernet-server" \
+        -c "$work/coordination-server/conf" -d "$work/coordination-server/data" "$@"
+}
+client() { local peer=$1; shift; ns "$peer" "$BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" "$@"; }
+db() { sqlite3 "$work/coordination-server/data/e2e.db" "$@"; }
+
+echo "testing $BIN"
+
+# --- Setup: a coordination server, and two peers alice and bob that know each other. ------------
+
+ip link set lo up
+ip link add br0 type bridge
+ip link set br0 up
+n=0
+for host in coordination-server=1.1.1.1 alice=2.2.2.2 bob=7.7.7.7 mallory=6.6.6.6; do
+    name=${host%=*} address=${host#*=} n=$((n + 1))
+    ip netns add "$name"
+    ns "$name" ip link set lo up
+    ip link add "veth$n" type veth peer name eth0 netns "$name"
+    ip link set "veth$n" master br0 up
+    ns "$name" ip addr add "$address/32" dev eth0
+    ns "$name" ip link set eth0 up
+    # Every other host is reachable directly on the bridge.
+    ns "$name" ip route add default dev eth0
+done
+
+mkdir -p "$work/coordination-server" "$work/alice" "$work/bob"
+coordination_server new --network-name e2e --network-cidr 10.66.0.0/16 \
+    --external-endpoint 1.1.1.1:51820 --listen-port 51820 >/dev/null
+coordination_server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
+for peer in alice bob; do
+    coordination_server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin false \
+        --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
+done
+coordination_server serve e2e --no-write-hosts >"$work/coordination-server.log" 2>&1 &
+sleep 1
+for peer in alice bob; do
+    client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 \
+        --delete-invite --no-write-hosts >/dev/null 2>&1
+done
+for peer in alice bob; do
+    client "$peer" fetch e2e --no-write-hosts >/dev/null 2>&1
+done
+
+# Mallory's endpoint: its own key, bob's innernet IP, and alice as its only peer.
+alice_ip=$(db "SELECT ip FROM peers WHERE name = 'alice'")
+alice_key=$(db "SELECT public_key FROM peers WHERE name = 'alice'")
+bob_ip=$(db "SELECT ip FROM peers WHERE name = 'bob'")
+bob_key=$(db "SELECT public_key FROM peers WHERE name = 'bob'")
+coordination_server_key=$(db "SELECT public_key FROM peers WHERE ip = '10.66.0.1'")
+mallory_private=$(wg genkey)
+mallory_key=$(echo "$mallory_private" | wg pubkey)
+ns mallory ip link add wg0 type wireguard
+ns mallory wg set wg0 private-key <(echo "$mallory_private") listen-port 51820 \
+    peer "$alice_key" allowed-ips "$alice_ip/32" endpoint 2.2.2.2:51820
+ns mallory ip addr add "$bob_ip/16" dev wg0
+ns mallory ip link set wg0 up
+
+# Shows each peer on alice's interface: its key, labelled by its owner, the endpoint that alice
+# sends to, and the innernet IPs that alice routes to it.
+show_alice_interface() {
+    printf '    %-20s %-16s %s\n' key endpoint "routed IPs"
+    ns alice wg show e2e dump | tail -n +2 |
+        sed -e "s|$coordination_server_key|coordination-server|" -e "s|$bob_key|bob|" \
+            -e "s|$mallory_key|mallory|" |
+        awk -F '\t' '{ printf "    %-20s %-16s %s\n", $1, $3, $4 }'
+}
+
+cat <<EOF
+
+bob's IP is $bob_ip.
+  bob     = $bob_key  (bob's genuine key)
+  mallory = $mallory_key  (the attacker's key)
+
+--- Before the attack ---------------------------------------------------------------------------
+
+alice's interface:
+$(show_alice_interface)
+
+--- The coordination server replaces bob's key and endpoint with mallory's, and alice fetches -----
+
+EOF
+db "UPDATE peers SET public_key = '$mallory_key', endpoint = '6.6.6.6:51820' WHERE name = 'bob'"
+fetch_status=0
+client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
+echo "    (fetch exited with status $fetch_status)"
+# Sends traffic to bob's IP, which goes to whichever key alice's interface routes it to.
+ns alice ping -c2 -W2 "$bob_ip" >/dev/null 2>&1 || true
+
+cat <<EOF
+
+--- After the attack ----------------------------------------------------------------------------
+
+alice's interface:
+$(show_alice_interface)
+mallory received $(ns mallory wg show wg0 transfer | awk '{ print $2 }') bytes from alice.
+
+EOF
+
+if ns alice wg show e2e allowed-ips | grep -q "^$mallory_key"; then
+    echo "VULNERABLE: alice's interface sends bob's traffic to mallory's key, although alice pins bob's key."
+    exit 1
+fi
+echo "NOT VULNERABLE: mallory's key never reached alice's interface."
