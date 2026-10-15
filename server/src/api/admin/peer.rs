@@ -395,6 +395,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_leaves_peer_owned_fields() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let old_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+
+        // An admin's update that also carries an endpoint and candidates, as a listing of the
+        // peer with its observed endpoint injected does.
+        let change = PeerContents {
+            name: Some("new-peer-name".parse().unwrap()),
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            candidates: vec!["198.51.100.2:51820".parse().unwrap()],
+            ..old_peer.contents.clone()
+        };
+        let path = format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID);
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
+        assert_eq!(new_peer.endpoint, old_peer.endpoint);
+        assert_eq!(new_peer.candidates, old_peer.candidates);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_promotion_requires_tls() -> Result<(), Error> {
         let server = test::Server::new()?;
         let promote = || async {

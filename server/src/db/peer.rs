@@ -1,8 +1,8 @@
 use super::DatabaseCidr;
 use crate::ServerError;
 use innernet_shared::{
-    announcement::SignedAnnouncement, check_delegation, xeddsa, IpNetExt, Peer, PeerContents,
-    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    announcement::SignedAnnouncement, check_delegation, xeddsa, Endpoint, IpNetExt, Peer,
+    PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
 use rusqlite::{params, types::Type, Connection};
@@ -203,13 +203,10 @@ impl DatabasePeer {
             .is_ok_and(|key| xeddsa::is_valid_public_key(&key) && key.to_base64() == public_key)
     }
 
-    /// Update self with new contents, validating them and updating the backend in the process.
+    /// Applies the changes an admin may make to the peer: its name, whether it is an admin, and
+    /// whether it is disabled. The other fields of `contents` are ignored. The peer alone sets its
+    /// endpoint and candidates, and its IP, public key and CIDR never change.
     pub fn update(&mut self, conn: &Connection, contents: PeerContents) -> Result<(), ServerError> {
-        // We will only allow updates of certain fields at this point, disregarding any requests
-        // for changes of IP address, public key, or parent CIDR, for security reasons.
-        //
-        // In the future, we may allow re-assignments of peers to new CIDRs, but it's easiest to
-        // disregard that case for now to prevent possible attacks.
         if contents.is_admin && !self.is_admin && !self.requires_tls {
             log::warn!(
                 "refusing to make {} an admin before it connects over TLS.",
@@ -217,38 +214,47 @@ impl DatabasePeer {
             );
             return Err(ServerError::PromotionRequiresTls);
         }
-        let new_contents = PeerContents {
-            name: contents.name,
-            endpoint: contents.endpoint,
-            is_admin: contents.is_admin,
-            is_disabled: contents.is_disabled,
-            candidates: contents.candidates,
-            ..self.contents.clone()
-        };
-
-        let new_candidates = serde_json::to_string(&new_contents.candidates)?;
         conn.execute(
-            "UPDATE peers SET
-                name = ?2,
-                endpoint = ?3,
-                is_admin = ?4,
-                is_disabled = ?5,
-                candidates = ?6
-            WHERE id = ?1",
+            "UPDATE peers SET name = ?2, is_admin = ?3, is_disabled = ?4 WHERE id = ?1",
             params![
                 self.id,
-                new_contents.name.as_deref(),
-                new_contents
-                    .endpoint
-                    .as_ref()
-                    .map(|endpoint| endpoint.to_string()),
-                new_contents.is_admin,
-                new_contents.is_disabled,
-                new_candidates,
+                contents.name.as_deref(),
+                contents.is_admin,
+                contents.is_disabled,
             ],
         )?;
 
-        self.contents = new_contents;
+        self.contents.name = contents.name;
+        self.contents.is_admin = contents.is_admin;
+        self.contents.is_disabled = contents.is_disabled;
+        Ok(())
+    }
+
+    /// Sets the endpoint that the peer reports for itself.
+    pub fn set_endpoint(
+        &mut self,
+        conn: &Connection,
+        endpoint: Option<Endpoint>,
+    ) -> Result<(), ServerError> {
+        conn.execute(
+            "UPDATE peers SET endpoint = ?2 WHERE id = ?1",
+            params![self.id, endpoint.as_ref().map(|e| e.to_string())],
+        )?;
+        self.contents.endpoint = endpoint;
+        Ok(())
+    }
+
+    /// Sets the candidates that the peer reports for itself.
+    pub fn set_candidates(
+        &mut self,
+        conn: &Connection,
+        candidates: Vec<Endpoint>,
+    ) -> Result<(), ServerError> {
+        conn.execute(
+            "UPDATE peers SET candidates = ?2 WHERE id = ?1",
+            params![self.id, serde_json::to_string(&candidates)?],
+        )?;
+        self.contents.candidates = candidates;
         Ok(())
     }
 
