@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use innernet_shared::{
-    interface_config::{InterfaceConfig, InterfaceInfo, ServerInfo},
+    interface_config::{InterfaceConfig, InterfaceInfo},
     CidrTree,
 };
 use std::path::Path;
@@ -44,8 +44,16 @@ pub fn create_peer(
         .expect("Peer's IpNet address to be valid because the peer was created successfully.");
     let interface_info = InterfaceInfo::new(interface, &keypair, *address);
 
-    let server_peer = existing_peers.iter().find(|p| p.id == 1).unwrap();
-    let server_info = ServerInfo::new(server_peer, interface_config.server.internal_endpoint);
+    // The coordinator is the peer with the key of the interface config, which authenticated the
+    // server. Its record holds its current endpoint, if it has one.
+    let mut server_info = interface_config.server.clone();
+    if let Some(endpoint) = existing_peers
+        .iter()
+        .find(|p| p.public_key == server_info.public_key)
+        .and_then(|p| p.endpoint.clone())
+    {
+        server_info.external_endpoint = endpoint;
+    }
 
     Ok((peer, PeerInvitation::new(interface_info, server_info)))
 }
