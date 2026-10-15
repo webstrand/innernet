@@ -199,6 +199,17 @@ pub fn add_peer(
     if let Some((new_peer_info, target_path)) =
         innernet_shared::prompts::gather_new_peer_info(&peers, &cidr_tree, &opts)?
     {
+        // The server's own peer is the one with the public key of its private key.
+        let public_key = wireguard_control::Key::from_base64(&config.private_key)?
+            .get_public()
+            .to_base64();
+        let server_peer = peers
+            .iter()
+            .find(|peer| peer.public_key == public_key)
+            .ok_or_else(|| anyhow!("the server's own peer, with key {public_key}, is missing"))?;
+        let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
+        let server_info = ServerInfo::new(server_peer, internal_endpoint);
+
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
         let peer = DatabasePeer::create(&conn, peer_contents)?;
@@ -216,10 +227,6 @@ pub fn add_peer(
             .ip_net_for(peer.ip)
             .expect("Peer's IpNet address to be valid because the peer was created successfully.");
         let interface_info = InterfaceInfo::new(interface, &keypair, address);
-
-        let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_peer = DatabasePeer::get(&conn, 1)?;
-        let server_info = ServerInfo::new(&server_peer, internal_endpoint);
 
         let invitation = PeerInvitation::new(interface_info, server_info);
         invitation.save_new(target_path)?;
