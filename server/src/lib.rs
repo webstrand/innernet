@@ -519,6 +519,7 @@ pub async fn serve(
         .iter_mut()
         .find(|peer| peer.public_key == public_key.to_base64())
         .expect("Couldn't find server peer in peer list.");
+    myself.set_candidates(&conn, candidates.clone())?;
     myself.update(
         &conn,
         PeerContents {

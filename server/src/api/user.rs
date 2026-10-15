@@ -8,8 +8,7 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Endpoint, EndpointContents, PeerContents, RedeemContents, ServerCapabilities, State,
-    REDEEM_TRANSITION_WAIT,
+    Endpoint, EndpointContents, RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
 
@@ -152,13 +151,7 @@ mod handlers {
         }
         let conn = session.context.db.lock();
         let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
-        selected_peer.update(
-            &conn,
-            PeerContents {
-                candidates: contents,
-                ..selected_peer.contents.clone()
-            },
-        )?;
+        selected_peer.set_candidates(&conn, contents)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -170,13 +163,7 @@ mod handlers {
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
-        selected_peer.update(
-            &conn,
-            PeerContents {
-                endpoint: contents.into(),
-                ..selected_peer.contents.clone()
-            },
-        )?;
+        selected_peer.set_endpoint(&conn, contents.into())?;
 
         status_response(StatusCode::NO_CONTENT)
     }

@@ -95,7 +95,7 @@ mod tests {
     use super::*;
     use crate::test;
     use bytes::Buf;
-    use innernet_shared::{Error, Peer};
+    use innernet_shared::{Endpoint, Error, Peer};
 
     #[tokio::test]
     async fn test_add_peer() -> Result<(), Error> {
@@ -251,6 +251,44 @@ mod tests {
 
         let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
         assert_eq!(&*new_peer.name, "new-peer-name");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_peer_keeps_endpoint() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let endpoint: Endpoint = "1.1.1.1:51820".parse().unwrap();
+        let candidate: Endpoint = "192.168.0.2:51820".parse().unwrap();
+        {
+            let conn = server.db.lock();
+            let mut peer = DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?;
+            peer.set_endpoint(&conn, Some(endpoint.clone()))?;
+            peer.set_candidates(&conn, vec![candidate.clone()])?;
+        }
+        let old_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+
+        // An admin client sends back the peer as it listed it, with the endpoint that the server
+        // observed in place of the one that the peer set.
+        let change = PeerContents {
+            name: "new-peer-name".parse().unwrap(),
+            endpoint: Some("2.2.2.2:51820".parse().unwrap()),
+            candidates: vec![],
+            ..old_peer.contents.clone()
+        };
+        let res = server
+            .form_request(
+                test::ADMIN_PEER_IP,
+                "PUT",
+                &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
+                &change,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+        assert_eq!(&*new_peer.name, "new-peer-name");
+        assert_eq!(new_peer.endpoint, Some(endpoint));
+        assert_eq!(new_peer.candidates, vec![candidate]);
         Ok(())
     }
 
