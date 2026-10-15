@@ -211,10 +211,13 @@ impl DeviceExt for Device {
             }
         });
 
-        // Remove any peers on the interface that aren't in the server's peer list any more.
+        // Remove any peers on the interface that aren't enabled in the peer list any more.
         let removals = existing_peers.iter().filter_map(|existing| {
             let public_key = existing.config.public_key.to_base64();
-            if peers.iter().any(|p| p.public_key == public_key) {
+            if peers
+                .iter()
+                .any(|p| !p.is_disabled && p.public_key == public_key)
+            {
                 None
             } else {
                 PeerDiff::new(Some(existing), None).unwrap()
