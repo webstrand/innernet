@@ -1,8 +1,8 @@
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_shared::{Endpoint, IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
-use once_cell::sync::Lazy;
-use regex::Regex;
+use innernet_shared::{
+    Endpoint, Hostname, IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+};
 use rusqlite::{params, types::Type, Connection};
 use std::{
     net::IpAddr,
@@ -41,10 +41,6 @@ pub static COLUMNS: &[&str] = &[
     "invite_expires",
     "candidates",
 ];
-
-/// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
-/// Note that the full length also must be maximum 63 characters, which this regex does not check.
-static PEER_NAME_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([a-z0-9]-?)*[a-z0-9]$").unwrap());
 
 #[derive(Debug)]
 pub struct DatabasePeer {
@@ -147,7 +143,7 @@ impl DatabasePeer {
     }
 
     fn is_valid_name(name: &str) -> bool {
-        name.len() < 64 && PEER_NAME_REGEX.is_match(name)
+        Hostname::is_valid(name)
     }
 
     /// Applies the changes an admin may make to the peer: its name, whether it is an admin, and

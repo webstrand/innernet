@@ -5,8 +5,6 @@ use clap::{
     Args,
 };
 use ipnet::{IpNet, PrefixLenError};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{
     fmt::{self, Display, Formatter},
@@ -33,7 +31,7 @@ impl FromStr for Interface {
     type Err = InvalidInterfaceName;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        if !Hostname::is_valid(name) {
+        if !innernet_domain::is_canonical_label(name) {
             Err(InvalidInterfaceName::InvalidChars)
         } else {
             Ok(Self {
@@ -992,20 +990,16 @@ impl From<Timestring> for Duration {
 /// The name of a peer. The hosts file names the peer by this name, followed by the host suffix
 /// unless the operator sets an empty one.
 ///
-/// A parsed name, such as one from the command line, must match [`Hostname::is_valid`]. A
-/// deserialized name, such as one from the coordination server, must be a single canonical label.
-/// Either may be a number, since a suffix usually follows it.
+/// A parsed or deserialized name must match [`Hostname::is_valid`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Hostname(String);
 
-/// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
-/// Note that the full length also must be maximum 63 characters, which this regex does not check.
-static HOSTNAME_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([a-z0-9]-?)*[a-z0-9]$").unwrap());
-
 impl Hostname {
+    /// Whether `name` is a single canonical label, which may be a number, since a suffix usually
+    /// follows it in the hosts file.
     pub fn is_valid(name: &str) -> bool {
-        name.len() < 64 && HOSTNAME_REGEX.is_match(name)
+        innernet_domain::is_canonical_label(name)
     }
 
     /// The placeholder name of the peer with `public_key`, for a record that a client makes before
@@ -1029,7 +1023,7 @@ impl FromStr for Hostname {
         if Self::is_valid(name) {
             Ok(Self(name.to_string()))
         } else {
-            Err("invalid hostname string (only alphanumeric with dashes)")
+            Err("invalid hostname string (only lowercase alphanumeric with dashes)")
         }
     }
 }
@@ -1038,7 +1032,7 @@ impl TryFrom<String> for Hostname {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
-        if innernet_domain::is_canonical_label(&name) {
+        if Self::is_valid(&name) {
             Ok(Self(name))
         } else {
             Err(format!("invalid hostname {name:?}"))
@@ -1295,8 +1289,10 @@ mod tests {
         assert_eq!(*deserialize("peer-1").unwrap(), *"peer-1");
         // A suffix usually follows a peer name, so it may be a number.
         assert_eq!(*deserialize("08").unwrap(), *"08");
-        assert!(deserialize("").is_err());
+        assert_eq!("08".parse::<Hostname>(), Ok(deserialize("08").unwrap()));
         assert!(deserialize("a.b").is_err());
+        assert!("a.b".parse::<Hostname>().is_err());
+        assert!(deserialize("").is_err());
         assert!(deserialize("Peer").is_err());
         assert!(deserialize("peer\n10.0.0.1 example.com").is_err());
         assert!(deserialize(&"a".repeat(64)).is_err());
