@@ -11,6 +11,7 @@ use std::{
 };
 use wireguard_control::InterfaceName;
 
+pub mod cbor;
 pub mod interface_config;
 #[cfg(target_os = "linux")]
 mod netlink;

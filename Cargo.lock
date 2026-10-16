@@ -150,6 +150,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
+name = "cbor-core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f70473b5194d5f6e3c271dc6d0f63f6b17cc5d004af959e9ed0be8c1dadcdb"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +857,7 @@ dependencies = [
  "anyhow",
  "atty",
  "base64 0.22.1",
+ "cbor-core",
  "clap",
  "colored",
  "curve25519-dalek",

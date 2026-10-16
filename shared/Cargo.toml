@@ -21,6 +21,7 @@ version = "2.0.0"
 anyhow = "1"
 atty = "0.2"
 base64 = "0.22"
+cbor-core = { version = "0.10", features = ["serde"] }
 clap = { version = "4.3", features = ["derive", "wrap_help"] }
 colored.workspace = true
 curve25519-dalek = "4"
