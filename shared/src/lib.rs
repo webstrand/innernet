@@ -15,12 +15,14 @@ pub mod interface_config;
 #[cfg(target_os = "linux")]
 mod netlink;
 pub mod peer;
+pub mod prefix;
 pub mod prompts;
 pub mod types;
 pub mod wg;
 pub mod xeddsa;
 
 pub use anyhow::Error;
+pub use prefix::{check_delegations, hosts_fallback, Prefix};
 pub use types::*;
 
 pub const REDEEM_TRANSITION_WAIT: Duration = Duration::from_secs(5);
