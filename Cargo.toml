@@ -30,3 +30,9 @@ netlink-packet-route = "0.31"
 netlink-packet-wireguard = "0.4"
 netlink-sys = "0.8.5"
 rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+
+# A server whose client verifier requires raw public keys must accept clients that offer no
+# client certificate type, when client authentication is optional, so that tools such as curl
+# can reach the public routes. Until rustls accepts the change, it comes from a fork.
+[patch.crates-io]
+rustls = { git = "https://github.com/webstrand/rustls", branch = "innernet-0.23.46" }

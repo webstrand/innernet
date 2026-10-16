@@ -1445,8 +1445,7 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+source = "git+https://github.com/webstrand/rustls?branch=innernet-0.23.46#ec7651643a28745e4636ecf1236b4d266b3485f4"
 dependencies = [
  "log",
  "once_cell",
