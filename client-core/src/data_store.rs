@@ -1018,7 +1018,7 @@ mod tests {
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.contents.ip = "10.0.0.2".parse().unwrap();
         new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
-        new_peer.contents.name = serde_json::from_str(r#""peer\n10.0.0.1 example.com""#).unwrap();
+        new_peer.contents.name = Hostname::unchecked("peer\n10.0.0.1 example.com".into());
         invalid.push(new_peer);
         let dropped = store.update_peers(&invalid);
         assert_eq!(dropped.len(), 1);
@@ -1027,7 +1027,7 @@ mod tests {
 
         // A stored peer renamed to an invalid name keeps its record, and stays enabled.
         let mut renamed = BASE_PEERS.clone();
-        renamed[0].contents.name = serde_json::from_str(r#""Blah""#).unwrap();
+        renamed[0].contents.name = Hostname::unchecked("Blah".into());
         assert_eq!(store.update_peers(&renamed).len(), 1);
         assert_eq!(store.peers(), &*BASE_PEERS);
     }

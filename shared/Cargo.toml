@@ -27,6 +27,7 @@ curve25519-dalek = "4"
 dialoguer.workspace = true
 hostsfile = { version = "2.0.0", path = "../hostsfile" }
 indoc = "2.0.1"
+innernet-domain = { version = "2.0.0", path = "../domain" }
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
 ipnet = { version = "2.4", features = ["serde"] }
 libc = "0.2"
@@ -51,6 +52,7 @@ netlink-sys.workspace = true
 nix = "0.26"
 
 [dev-dependencies]
+serde_json = "1"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control", features = ["test-util"] }
 
 [features]

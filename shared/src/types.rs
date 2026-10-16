@@ -989,7 +989,14 @@ impl From<Timestring> for Duration {
     }
 }
 
+/// The name of a peer. The hosts file names the peer by this name, followed by the host suffix
+/// unless the operator sets an empty one.
+///
+/// A parsed name, such as one from the command line, must match [`Hostname::is_valid`]. A
+/// deserialized name, such as one from the coordination server, must be a single canonical label.
+/// Either may be a number, since a suffix usually follows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Hostname(String);
 
 /// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
@@ -1008,7 +1015,8 @@ impl Hostname {
         Self(public_key.to_string())
     }
 
-    /// The name as it was stored, without validating it, as deserializing doesn't either.
+    /// The name as the data store holds it, without validating it, since a placeholder is not a
+    /// valid hostname.
     pub fn unchecked(name: String) -> Self {
         Self(name)
     }
@@ -1022,6 +1030,18 @@ impl FromStr for Hostname {
             Ok(Self(name.to_string()))
         } else {
             Err("invalid hostname string (only alphanumeric with dashes)")
+        }
+    }
+}
+
+impl TryFrom<String> for Hostname {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if innernet_domain::is_canonical_label(&name) {
+            Ok(Self(name))
+        } else {
+            Err(format!("invalid hostname {name:?}"))
         }
     }
 }
@@ -1265,5 +1285,44 @@ mod tests {
         assert_eq!(deserialize(PUBKEY.trim_end_matches('=')).unwrap(), PUBKEY);
         assert!(deserialize("abc").is_err());
         assert!(deserialize("").is_err());
+    }
+
+    #[test]
+    fn test_deserialize_hostname() {
+        use serde::de::value::{Error, StrDeserializer};
+        let deserialize = |name| Hostname::deserialize(StrDeserializer::<Error>::new(name));
+
+        assert_eq!(*deserialize("peer-1").unwrap(), *"peer-1");
+        // A suffix usually follows a peer name, so it may be a number.
+        assert_eq!(*deserialize("08").unwrap(), *"08");
+        assert!(deserialize("").is_err());
+        assert!(deserialize("a.b").is_err());
+        assert!(deserialize("Peer").is_err());
+        assert!(deserialize("peer\n10.0.0.1 example.com").is_err());
+        assert!(deserialize(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_state_drops_peers_with_invalid_names() {
+        // A peer whose name fails to deserialize is dropped from the state, but its key is kept,
+        // so that the client keeps the peer's record as it was.
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        let peer = serde_json::json!({
+            "id": 1,
+            "name": "peer\n10.0.0.1 example.com",
+            "ip": "10.0.0.1",
+            "cidr_id": 1,
+            "public_key": PUBKEY,
+            "endpoint": null,
+            "persistent_keepalive_interval": null,
+            "is_admin": false,
+            "is_disabled": false,
+            "is_redeemed": true,
+            "invite_expires": null,
+        });
+        let state: State =
+            serde_json::from_value(serde_json::json!({ "peers": [peer], "cidrs": [] })).unwrap();
+        assert!(state.peers.is_empty());
+        assert_eq!(state.invalid_peer_keys, [PUBKEY]);
     }
 }
