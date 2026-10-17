@@ -330,6 +330,23 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_removes_peer_not_listed() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let device = device_with_peer(ip);
+
+        // A peer that is no longer in the list is removed from the device.
+        let diffs = device.diff(&[], &BTreeMap::new());
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].new.is_none());
+
+        // The device's own peer is never added to it.
+        let mut device = device_with_peer(ip);
+        device.public_key = Some(Key::from_base64(PUBKEY).unwrap());
+        device.peers.clear();
+        assert!(device.diff(&[peer(ip)], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
     fn test_diff_endpoint_override() {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let device = device_with_peer(ip);

@@ -7,22 +7,23 @@ use indoc::printdoc;
 use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
-    prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
-    EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
-    PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
+    prompts, update_hosts_file,
+    wg::{self, DeviceExt},
+    AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, Error,
+    HostsOpts, Interface, IoErrorContext, NetworkOpts, PeerContents, RenameCidrOpts,
+    RenamePeerOpts, INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::TryInto,
     env,
     fs::{File, OpenOptions},
     io::prelude::*,
     net::{IpAddr, SocketAddr, TcpListener},
-    ops::Deref,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -214,11 +215,7 @@ pub fn add_peer(
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
         let peer = DatabasePeer::create(&conn, peer_contents)?;
         if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
-            // Update the current WireGuard interface with the new peers.
-            DeviceUpdate::new()
-                .add_peer(PeerConfigBuilder::from(&*peer))
-                .apply(interface, network.backend)
-                .map_err(|_| ServerError::WireGuard)?;
+            reconcile_interface(&conn, interface, network.backend)?;
 
             println!("adding to WireGuard interface: {}", *peer);
         }
@@ -284,19 +281,8 @@ pub fn enable_or_disable_peer(
             },
         )?;
 
-        if enable {
-            DeviceUpdate::new()
-                .add_peer(db_peer.deref().into())
-                .apply(interface, network.backend)
-                .map_err(|_| ServerError::WireGuard)?;
-        } else {
-            let public_key =
-                Key::from_base64(&peer.public_key).map_err(|_| ServerError::WireGuard)?;
-
-            DeviceUpdate::new()
-                .remove_peer_by_key(&public_key)
-                .apply(interface, network.backend)
-                .map_err(|_| ServerError::WireGuard)?;
+        if Device::get(interface, network.backend).is_ok() {
+            reconcile_interface(&conn, interface, network.backend)?;
         }
     } else {
         log::info!("exiting without enabling or disabling peer.");
@@ -435,14 +421,46 @@ fn spawn_endpoint_refresher(interface: InterfaceName, network: NetworkOpts) -> E
     endpoints
 }
 
-fn spawn_expired_invite_sweeper(db: Db) {
+/// Brings the peers of the WireGuard interface in line with the database, which is their source of
+/// truth: every enabled peer of the database is added to the interface or updated on it, and every
+/// other peer, disabled or no longer in the database, is removed from it. The server's own peer is
+/// left as it is.
+pub(crate) fn reconcile_interface(
+    conn: &Connection,
+    interface: &InterfaceName,
+    backend: Backend,
+) -> Result<(), ServerError> {
+    let device = Device::get(interface, backend).map_err(|_| ServerError::WireGuard)?;
+    let peers = DatabasePeer::list(conn)?
+        .into_iter()
+        .map(|peer| peer.inner)
+        .collect::<Vec<_>>();
+    let updates = device
+        .diff(&peers, &BTreeMap::new())
+        .into_iter()
+        .map(PeerConfigBuilder::from)
+        .collect::<Vec<_>>();
+    if !updates.is_empty() {
+        DeviceUpdate::new()
+            .add_peers(&updates)
+            .apply(interface, backend)
+            .map_err(|_| ServerError::WireGuard)?;
+    }
+    Ok(())
+}
+
+fn spawn_expired_invite_sweeper(db: Db, interface: InterfaceName, backend: Backend) {
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            match DatabasePeer::delete_expired_invites(&db.lock()) {
+            let conn = db.lock();
+            match DatabasePeer::delete_expired_invites(&conn) {
                 Ok(deleted) if deleted > 0 => {
-                    log::info!("Deleted {} expired peer invitations.", deleted)
+                    log::info!("Deleted {} expired peer invitations.", deleted);
+                    if let Err(e) = reconcile_interface(&conn, &interface, backend) {
+                        log::error!("Failed to remove expired peer invitations: {}", e);
+                    }
                 },
                 Err(e) => log::error!("Failed to delete expired peer invitations: {}", e),
                 _ => {},
@@ -487,13 +505,6 @@ pub async fn serve(
     log::debug!("opening database connection...");
     let conn = open_database_connection(&interface, conf)?;
 
-    let mut peers = DatabasePeer::list(&conn)?;
-    log::debug!("peers listed...");
-    let peer_configs = peers
-        .iter()
-        .map(|peer| peer.deref().into())
-        .collect::<Vec<PeerConfigBuilder>>();
-
     log::info!("bringing up interface.");
     wg::up(
         &interface,
@@ -504,17 +515,17 @@ pub async fn serve(
         &network,
     )?;
 
-    DeviceUpdate::new()
-        .add_peers(&peer_configs)
-        .apply(&interface, network.backend)?;
-
-    log::info!("{} peers added to wireguard interface.", peers.len());
+    // The interface may be left over from an earlier run, with peers that have since been
+    // disabled or deleted.
+    reconcile_interface(&conn, &interface, network.backend)?;
+    log::info!("wireguard interface reconciled with the database.");
 
     let candidates: Vec<Endpoint> = get_local_addrs()?
         .map(|addr| SocketAddr::from((addr, config.listen_port)).into())
         .collect();
     let num_candidates = candidates.len();
     let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
+    let mut peers = DatabasePeer::list(&conn)?;
     let myself = peers
         .iter_mut()
         .find(|peer| peer.public_key == public_key.to_base64())
@@ -535,7 +546,7 @@ pub async fn serve(
 
     let db = Arc::new(Mutex::new(conn));
     let endpoints = spawn_endpoint_refresher(interface, network);
-    spawn_expired_invite_sweeper(db.clone());
+    spawn_expired_invite_sweeper(db.clone(), interface, network.backend);
 
     if !hosts_opts.no_write_hosts {
         spawn_hostfile_writer(db.clone(), interface, hosts_opts);

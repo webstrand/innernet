@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::{DatabaseCidr, DatabasePeer},
+    reconcile_interface,
     util::{form_body, json_response, status_response},
     Context, ServerError, Session,
 };
@@ -10,7 +11,6 @@ use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
     Endpoint, EndpointContents, RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
-use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
 
 pub async fn routes(
     req: Request<Body>,
@@ -100,15 +100,15 @@ mod handlers {
         let conn = session.context.db.lock();
         let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
 
-        let old_public_key = wireguard_control::Key::from_base64(&selected_peer.public_key)
-            .map_err(|_| ServerError::WireGuard)?;
-
         selected_peer.redeem(&conn, &form.public_key)?;
 
         if cfg!(not(test)) {
             let Context {
-                interface, backend, ..
-            } = session.context;
+                db,
+                interface,
+                backend,
+                ..
+            } = session.context.clone();
 
             // If we were to modify the WireGuard interface immediately, the HTTP response wouldn't
             // get through. Instead, we need to wait a reasonable amount for the HTTP response to
@@ -125,16 +125,12 @@ mod handlers {
             tokio::task::spawn(async move {
                 tokio::time::sleep(REDEEM_TRANSITION_WAIT).await;
                 log::info!(
-                    "WireGuard: adding new peer {}, removing old pubkey {}",
-                    *selected_peer,
-                    old_public_key.to_base64()
+                    "WireGuard: replacing the invitation's key with {}'s",
+                    *selected_peer
                 );
-                DeviceUpdate::new()
-                    .remove_peer_by_key(&old_public_key)
-                    .add_peer(PeerConfigBuilder::from(&*selected_peer))
-                    .apply(&interface, backend)
-                    .map_err(|e| log::error!("{:?}", e))
-                    .ok();
+                if let Err(e) = reconcile_interface(&db.lock(), &interface, backend) {
+                    log::error!("{:?}", e);
+                }
             });
         }
         status_response(StatusCode::NO_CONTENT)

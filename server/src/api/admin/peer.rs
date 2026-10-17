@@ -3,12 +3,12 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::DatabasePeer,
+    reconcile_interface,
     util::{form_body, json_response, json_status_response, status_response},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::PeerContents;
-use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
 
 pub async fn routes(
     req: Request<Body>,
@@ -48,11 +48,7 @@ mod handlers {
         log::info!("adding peer {}", *peer);
 
         if cfg!(not(test)) {
-            // Update the current WireGuard interface with the new peers.
-            DeviceUpdate::new()
-                .add_peer(PeerConfigBuilder::from(&*peer))
-                .apply(&session.context.interface, session.context.backend)
-                .map_err(|_| ServerError::WireGuard)?;
+            reconcile_interface(&conn, &session.context.interface, session.context.backend)?;
             log::info!("updated WireGuard interface, adding {}", *peer);
         }
 
@@ -67,6 +63,11 @@ mod handlers {
         let conn = session.context.db.lock();
         let mut peer = DatabasePeer::get(&conn, id)?;
         peer.update(&conn, form)?;
+
+        // The update may have enabled or disabled the peer.
+        if cfg!(not(test)) {
+            reconcile_interface(&conn, &session.context.interface, session.context.backend)?;
+        }
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -85,6 +86,10 @@ mod handlers {
     pub async fn delete(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         DatabasePeer::disable(&conn, id)?;
+
+        if cfg!(not(test)) {
+            reconcile_interface(&conn, &session.context.interface, session.context.backend)?;
+        }
 
         status_response(StatusCode::NO_CONTENT)
     }
