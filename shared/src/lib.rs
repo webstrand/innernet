@@ -1,10 +1,12 @@
+#![feature(ip)]
+
 use colored::Colorize;
 use hostsfile::HostsBuilder;
 use ipnet::IpNet;
 use std::{
     fs::{self, File, Permissions},
     io,
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     os::unix::fs::PermissionsExt,
     path::Path,
     time::Duration,
@@ -117,21 +119,10 @@ pub fn _get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::
 pub use netlink::get_local_addrs as _get_local_addrs;
 
 pub fn get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::Error> {
-    // `Ipv6Addr::is_unicast_global` is unstable (rust-lang/rust#27709), and CI builds on stable.
-    fn is_unicast_global(ip: &Ipv6Addr) -> bool {
-        !(ip.is_multicast()
-            || ip.is_loopback()
-            || ip.is_unspecified()
-            || ((ip.segments()[0] == 0x2001) && (ip.segments()[1] == 0xdb8)) // documentation
-            || ip.is_unicast_link_local()
-            || ip.is_unique_local())
-    }
-
     Ok(_get_local_addrs()?
-        .filter(|ip| {
-            ip.is_ipv4()
-                || matches!(ip,
-            IpAddr::V6(v6) if is_unicast_global(v6))
+        .filter(|ip| match ip {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(v6) => v6.is_unicast_global(),
         })
         .take(10))
 }
