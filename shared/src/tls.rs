@@ -232,10 +232,17 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// The only signature algorithm of handshakes, the one that both verifiers advertise. rustls leaves
+/// it to a verifier to refuse a signature of a scheme that it didn't advertise, which the
+/// provider's whole table would map to an algorithm.
+static ED25519_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+    all: &[webpki::ring::ED25519],
+    mapping: &[(SignatureScheme::ED25519, &[webpki::ring::ED25519])],
+};
+
 /// Verifies the handshake signature `dss` of `message` under the key of the SubjectPublicKeyInfo
-/// `spki`.
+/// `spki`, refusing any scheme but Ed25519.
 fn verify_signature(
-    algorithms: &WebPkiSupportedAlgorithms,
     message: &[u8],
     spki: &[u8],
     dss: &DigitallySignedStruct,
@@ -244,7 +251,7 @@ fn verify_signature(
         message,
         &SubjectPublicKeyInfoDer::from(spki),
         dss,
-        algorithms,
+        &ED25519_ALGORITHMS,
     )
 }
 
@@ -260,7 +267,6 @@ fn tls12_unsupported() -> Result<HandshakeSignatureValid, rustls::Error> {
 #[derive(Debug)]
 struct ServerKeyVerifier {
     server_public_key: Key,
-    algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for ServerKeyVerifier {
@@ -297,7 +303,7 @@ impl ServerCertVerifier for ServerKeyVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         let spki = certificate_spki(cert).ok_or(CertificateError::BadEncoding)?;
-        verify_signature(&self.algorithms, message, &spki, dss)
+        verify_signature(message, &spki, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -308,9 +314,7 @@ impl ServerCertVerifier for ServerKeyVerifier {
 /// Accepts any well-formed WireGuard key; whether it belongs to a peer is up to the server,
 /// which reads it back with [`peer_public_key`].
 #[derive(Debug)]
-struct PeerKeyVerifier {
-    algorithms: WebPkiSupportedAlgorithms,
-}
+struct PeerKeyVerifier;
 
 impl ClientCertVerifier for PeerKeyVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -344,7 +348,7 @@ impl ClientCertVerifier for PeerKeyVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_signature(&self.algorithms, message, cert, dss)
+        verify_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -361,13 +365,9 @@ impl ClientCertVerifier for PeerKeyVerifier {
 /// own, as a raw public key. Sessions are never resumed and early data is refused, so every
 /// connection is authenticated afresh.
 pub fn server_config(private_key: &str) -> Result<Arc<ServerConfig>, Error> {
-    let provider = provider();
-    let verifier = PeerKeyVerifier {
-        algorithms: provider.signature_verification_algorithms,
-    };
-    let mut config = ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(Arc::new(verifier))
+        .with_client_cert_verifier(Arc::new(PeerKeyVerifier))
         .with_cert_resolver(Arc::new(ServerCertificate(
             XEdDsaKey::new(private_key)?.certified_by_itself(),
         )));
@@ -385,12 +385,8 @@ pub fn client_config(
 ) -> Result<Arc<ClientConfig>, Error> {
     let server_public_key = Key::from_base64(server_public_key)
         .map_err(|_| anyhow!("the server's public key is invalid"))?;
-    let provider = provider();
-    let verifier = ServerKeyVerifier {
-        server_public_key,
-        algorithms: provider.signature_verification_algorithms,
-    };
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let verifier = ServerKeyVerifier { server_public_key };
+    let mut config = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
@@ -473,6 +469,132 @@ mod tests {
         ));
     }
 
+    /// Signs with XEdDSA, as [`XEdDsaKey`] does, but labels its signatures with a scheme that no
+    /// verifier advertises, whatever it is offered.
+    struct MislabeledKey(XEdDsaKey);
+
+    impl fmt::Debug for MislabeledKey {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("MislabeledKey")
+        }
+    }
+
+    impl SigningKey for MislabeledKey {
+        fn choose_scheme(&self, _offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            Some(Box::new(MislabeledSigner(self.0.private_key.clone())))
+        }
+
+        fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+            self.0.public_key()
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::ED25519
+        }
+    }
+
+    struct MislabeledSigner(Arc<PrivateKey>);
+
+    impl fmt::Debug for MislabeledSigner {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("MislabeledSigner")
+        }
+    }
+
+    impl Signer for MislabeledSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+            Ok(self.0.sign(&[message]).to_vec())
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            SignatureScheme::ECDSA_NISTP256_SHA256
+        }
+    }
+
+    /// A client's TLS configuration, as [`client_config`] makes it, but presenting `key`.
+    fn client_config_presenting(
+        key: Arc<CertifiedKey>,
+        server_public_key: &Key,
+    ) -> Result<Arc<ClientConfig>, Error> {
+        let verifier = ServerKeyVerifier {
+            server_public_key: server_public_key.clone(),
+        };
+        let config = ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(key)));
+        Ok(Arc::new(config))
+    }
+
+    #[test]
+    fn test_server_refuses_a_key_signed_by_another() -> Result<(), Error> {
+        // A client that presents another peer's key, but can only sign with its own, fails the
+        // handshake: the signature is checked under the key that the client presents.
+        let (server, victim, impostor) = (
+            KeyPair::generate(),
+            KeyPair::generate(),
+            KeyPair::generate(),
+        );
+        let victim_spki = CertificateDer::from(XEdDsaKey::new(&private(&victim))?.spki);
+        let key = Arc::new(CertifiedKey::new(
+            vec![victim_spki],
+            Arc::new(XEdDsaKey::new(&private(&impostor))?),
+        ));
+        let result = handshake(
+            client_config_presenting(key, &server.public)?,
+            server_config(&private(&server))?,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(rustls::Error::InvalidCertificate(
+                    CertificateError::BadSignature
+                ))
+            ),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unadvertised_schemes_are_refused() -> Result<(), Error> {
+        // Both sides advertise only Ed25519, and refuse a handshake signed under another scheme,
+        // rather than verifying it under the algorithm of that scheme.
+        let unadvertised = |result: Result<Option<Key>, rustls::Error>| {
+            matches!(
+                result,
+                Err(rustls::Error::PeerMisbehaved(
+                    rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme
+                ))
+            )
+        };
+        let (server, client) = (KeyPair::generate(), KeyPair::generate());
+        let mislabeled = MislabeledKey(XEdDsaKey::new(&private(&client))?);
+        let spki = CertificateDer::from(mislabeled.0.spki.clone());
+        let key = Arc::new(CertifiedKey::new(vec![spki], Arc::new(mislabeled)));
+        let result = handshake(
+            client_config_presenting(key, &server.public)?,
+            server_config(&private(&server))?,
+        );
+        assert!(unadvertised(result.clone()), "{result:?}");
+
+        // The server's signature, as a client checks it.
+        let mislabeled = MislabeledKey(XEdDsaKey::new(&private(&server))?);
+        let certificate = CertificateDer::from(server_certificate(&mislabeled.0.private_key));
+        let key = Arc::new(CertifiedKey::new(vec![certificate], Arc::new(mislabeled)));
+        let config = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(Arc::new(PeerKeyVerifier))
+            .with_cert_resolver(Arc::new(ServerCertificate(key)));
+        let result = handshake(
+            client_config(&private(&client), &server.public.to_base64())?,
+            Arc::new(config),
+        );
+        assert!(unadvertised(result.clone()), "{result:?}");
+        Ok(())
+    }
+
     #[test]
     fn test_server_certificate() {
         for _ in 0..16 {
@@ -511,7 +633,6 @@ mod tests {
         let private_key = PrivateKey::from_base64(&private(&keypair)).unwrap();
         let verifier = ServerKeyVerifier {
             server_public_key: keypair.public.clone(),
-            algorithms: provider().signature_verification_algorithms,
         };
         let verify = |certificate: Vec<u8>| {
             let name = ServerName::IpAddress(std::net::Ipv4Addr::new(10, 0, 0, 1).into());
