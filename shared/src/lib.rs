@@ -117,14 +117,14 @@ pub fn _get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::
 pub use netlink::get_local_addrs as _get_local_addrs;
 
 pub fn get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::Error> {
-    // TODO(jake): this is temporary pending the stabilization of rust-lang/rust#27709
+    // `Ipv6Addr::is_unicast_global` is unstable (rust-lang/rust#27709), and CI builds on stable.
     fn is_unicast_global(ip: &Ipv6Addr) -> bool {
-        !((ip.segments()[0] & 0xff00) == 0xff00 // multicast
+        !(ip.is_multicast()
             || ip.is_loopback()
             || ip.is_unspecified()
             || ((ip.segments()[0] == 0x2001) && (ip.segments()[1] == 0xdb8)) // documentation
-            || (ip.segments()[0] & 0xffc0) == 0xfe80 // unicast link local
-            || (ip.segments()[0] & 0xfe00) == 0xfc00) // unicast local
+            || ip.is_unicast_link_local()
+            || ip.is_unique_local())
     }
 
     Ok(_get_local_addrs()?

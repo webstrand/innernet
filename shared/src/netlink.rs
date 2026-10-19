@@ -4,8 +4,8 @@ use netlink_packet_core::{
     NLM_F_REQUEST,
 };
 use netlink_packet_route::{
-    address::{self, AddressHeader, AddressMessage},
-    link::{self, LinkFlags, LinkHeader, LinkMessage, State},
+    address::{self, AddressHeader, AddressHeaderFlags, AddressMessage},
+    link::{self, LinkFlags, LinkHeader, LinkMessage},
     route::{self, RouteHeader, RouteMessage},
     AddressFamily, RouteNetlinkMessage,
 };
@@ -115,7 +115,31 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
     }
 }
 
-fn get_links() -> Result<Vec<String>, io::Error> {
+/// Whether a link's flags make its addresses worth offering to other peers: the link is up and has
+/// a carrier, and is neither a loopback nor a point-to-point link, such as a WireGuard or other
+/// tunnel interface, whose addresses are reached only through the tunnel. The operational state
+/// isn't consulted, since many drivers, virtual ones in particular, report it as unknown.
+fn is_offered_link(flags: LinkFlags) -> bool {
+    flags.contains(LinkFlags::Up | LinkFlags::LowerUp)
+        && !flags.intersects(LinkFlags::Loopback | LinkFlags::Pointopoint)
+}
+
+/// Whether an address's header makes it worth offering to other peers. A temporary IPv6 address,
+/// flagged as secondary, is left out, since it rotates and would change what the host announces
+/// every time; so are addresses that are deprecated, or not yet or never usable after duplicate
+/// address detection. An IPv4 address flagged as secondary is an ordinary address and is kept.
+fn is_offered_address(header: &AddressHeader) -> bool {
+    let unusable = AddressHeaderFlags::Deprecated
+        | AddressHeaderFlags::Tentative
+        | AddressHeaderFlags::Dadfailed;
+    header.scope == address::AddressScope::Universe
+        && !header.flags.intersects(unusable)
+        && !(header.family == AddressFamily::Inet6
+            && header.flags.contains(AddressHeaderFlags::Secondary))
+}
+
+/// The indices of the links whose addresses are worth offering, as [`is_offered_link`] decides.
+fn get_offered_links() -> Result<Vec<u32>, io::Error> {
     let link_responses = netlink_request_rtnl(
         RouteNetlinkMessage::GetLink(LinkMessage::default()),
         Some(NLM_F_DUMP | NLM_F_REQUEST),
@@ -127,35 +151,18 @@ fn get_links() -> Result<Vec<String>, io::Error> {
             NetlinkMessage {
                 payload: NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)),
                 ..
-            } => Some(link),
+            } => Some(link.header),
             _ => None,
         })
-        // Filter out loopback links
-        .filter_map(|link| {
-            if !link.header.flags.contains(LinkFlags::Loopback) {
-                Some(link.attributes)
-            } else {
-                None
-            }
-        })
-        // Find and filter out addresses for interfaces
-        .filter(|nlas| {
-            nlas.iter()
-                .any(|nla| nla == &link::LinkAttribute::OperState(State::Up))
-        })
-        .filter_map(|nlas| {
-            nlas.iter().find_map(|nla| match nla {
-                link::LinkAttribute::IfName(name) => Some(name.clone()),
-                _ => None,
-            })
-        })
+        .filter(|header| is_offered_link(header.flags))
+        .map(|header| header.index)
         .collect::<Vec<_>>();
 
     Ok(links)
 }
 
 pub fn get_local_addrs() -> Result<impl Iterator<Item = IpAddr>, io::Error> {
-    let links = get_links()?;
+    let links = get_offered_links()?;
     let addr_responses = netlink_request_rtnl(
         RouteNetlinkMessage::GetAddress(AddressMessage::default()),
         Some(NLM_F_DUMP | NLM_F_REQUEST),
@@ -170,21 +177,10 @@ pub fn get_local_addrs() -> Result<impl Iterator<Item = IpAddr>, io::Error> {
             } => Some(addr),
             _ => None,
         })
-        // Filter out non-global-scoped addresses
-        .filter_map(|link| {
-            if link.header.scope == address::AddressScope::Universe {
-                Some(link.attributes)
-            } else {
-                None
-            }
-        })
-        // Only select addresses for helpful links
-        .filter(move |nlas| {
-            nlas.iter().any(|nla| {
-                matches!(nla, address::AddressAttribute::Label(label) if links.contains(label))
-                    || matches!(nla, address::AddressAttribute::Address(IpAddr::V6(_addr)))
-            })
-        })
+        // Only select usable addresses of helpful links. The link is matched by its index, since
+        // only IPv4 addresses carry the link's name as a label.
+        .filter(move |addr| links.contains(&addr.header.index) && is_offered_address(&addr.header))
+        .map(|addr| addr.attributes)
         .filter_map(|nlas| {
             nlas.iter().find_map(|nla| match nla {
                 address::AddressAttribute::Address(IpAddr::V4(addr)) => Some(IpAddr::V4(*addr)),
@@ -203,5 +199,55 @@ mod tests {
     fn test_local_addrs() {
         let addrs = get_local_addrs().unwrap();
         println!("{:?}", addrs.collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_is_offered_link() {
+        let ethernet = LinkFlags::Up | LinkFlags::LowerUp | LinkFlags::Broadcast;
+        assert!(is_offered_link(ethernet));
+        assert!(is_offered_link(ethernet | LinkFlags::Running));
+        // Down, or without a carrier.
+        assert!(!is_offered_link(LinkFlags::LowerUp | LinkFlags::Broadcast));
+        assert!(!is_offered_link(LinkFlags::Up | LinkFlags::Broadcast));
+        // A WireGuard interface, and the loopback.
+        assert!(!is_offered_link(
+            LinkFlags::Up | LinkFlags::LowerUp | LinkFlags::Pointopoint | LinkFlags::Noarp
+        ));
+        assert!(!is_offered_link(
+            LinkFlags::Up | LinkFlags::LowerUp | LinkFlags::Loopback
+        ));
+    }
+
+    #[test]
+    fn test_is_offered_address() {
+        let header = |family, flags| AddressHeader {
+            family,
+            flags,
+            scope: address::AddressScope::Universe,
+            ..Default::default()
+        };
+        let permanent = AddressHeaderFlags::Permanent;
+        assert!(is_offered_address(&header(AddressFamily::Inet, permanent)));
+        assert!(is_offered_address(&header(AddressFamily::Inet6, permanent)));
+        // A secondary IPv4 address is kept, a temporary IPv6 address isn't.
+        let secondary = AddressHeaderFlags::Secondary;
+        assert!(is_offered_address(&header(AddressFamily::Inet, secondary)));
+        assert!(!is_offered_address(&header(
+            AddressFamily::Inet6,
+            secondary
+        )));
+        for unusable in [
+            AddressHeaderFlags::Deprecated,
+            AddressHeaderFlags::Tentative,
+            AddressHeaderFlags::Dadfailed,
+        ] {
+            assert!(!is_offered_address(&header(AddressFamily::Inet, unusable)));
+            assert!(!is_offered_address(&header(AddressFamily::Inet6, unusable)));
+        }
+        let link_local = AddressHeader {
+            scope: address::AddressScope::Link,
+            ..header(AddressFamily::Inet6, permanent)
+        };
+        assert!(!is_offered_address(&link_local));
     }
 }
