@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# Builds the client and the server with cargo in release mode, and wraps the binaries into binary
+# RPMs, without a source tarball or an SRPM. Every argument is passed on to `cargo build`, for
+# example:
+#
+#   rpm/assemble.sh --offline
+#
+# Usage: rpm/assemble.sh [CARGO_BUILD_ARGS...]
+#
+# The binaries are found wherever cargo builds them, so --target and --target-dir work. The RPMs
+# land in target/rpm/RPMS/<arch>/.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+TOPDIR="$REPO/target/rpm"
+mkdir -p "$TOPDIR/tmp"
+# openSUSE's brp-99-pesign hashes kernel modules for signing into the default %_topdir, outside
+# TOPDIR; an empty list of files to sign skips it.
+export BRP_PESIGN_FILES=
+
+# cargo reports each executable that it builds; the diagnostics go to stderr as usual.
+artifacts="$TOPDIR/tmp/artifacts.json"
+cargo build --manifest-path "$REPO/Cargo.toml" --release -p innernet -p innernet-server \
+  --message-format=json-render-diagnostics "$@" >"$artifacts"
+mapfile -t executables < <(
+  python3 -I -c '
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("reason") == "compiler-artifact" and message.get("executable"):
+        print(message["executable"])
+' <"$artifacts"
+)
+
+for package in innernet innernet-server; do
+  binary=""
+  for executable in "${executables[@]}"; do
+    [[ "$(basename "$executable")" == "$package" ]] && binary="$executable"
+  done
+  if [[ -z "$binary" ]]; then
+    echo "cargo built no $package binary." >&2
+    exit 1
+  fi
+
+  version="$(cargo pkgid --offline --manifest-path "$REPO/Cargo.toml" -p "$package" | cut -d '@' -f 2)"
+
+  rpmbuild -bb "$REPO/rpm/$package.spec" \
+    --define "_topdir $TOPDIR" \
+    --define "_tmppath $TOPDIR/tmp" \
+    --define "repo $REPO" \
+    --define "bin_dir $(dirname "$binary")" \
+    --define "pkg_version $version"
+done
+
+ls "$TOPDIR"/RPMS/*/
