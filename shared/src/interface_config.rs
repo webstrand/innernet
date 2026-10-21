@@ -87,7 +87,16 @@ pub struct ServerInfo {
 
     /// An internal endpoint in the WireGuard network that hosts the coordination API.
     pub internal_endpoint: SocketAddr,
+
+    /// What the server supports, as the invitation states it, such as [`FEATURE_TLS`]. A client
+    /// reads it only when it redeems the invitation, and ignores features that it doesn't know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
+
+/// The feature of a server that speaks TLS. A client that redeems an invitation stating it never
+/// falls back to plain HTTP for the server.
+pub const FEATURE_TLS: &str = "tls";
 
 impl ServerInfo {
     pub fn new(server_peer: &Peer, internal_endpoint: SocketAddr) -> Self {
@@ -98,7 +107,13 @@ impl ServerInfo {
                 .expect("The innernet server should have a WireGuard endpoint"),
             internal_endpoint,
             public_key: server_peer.public_key.clone(),
+            features: vec![],
         }
+    }
+
+    /// Whether the invitation states that the server supports `feature`.
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
     }
 }
 
@@ -231,5 +246,42 @@ impl PeerInvitation {
         file.write_all(self.interface_config.as_toml().as_bytes())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INVITATION: &str = r#"
+        [interface]
+        network-name = "test"
+        address = "10.0.0.2/24"
+        private-key = "kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM="
+
+        [server]
+        public-key = "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g="
+        external-endpoint = "203.0.113.1:51820"
+        internal-endpoint = "10.0.0.1:51820"
+    "#;
+
+    #[test]
+    fn test_features() {
+        // An invitation from a server that predates features states none, and is written back
+        // without them.
+        let config: InterfaceConfig = toml::from_str(INVITATION).unwrap();
+        assert!(config.server.features.is_empty());
+        assert!(!config.server.has_feature(FEATURE_TLS));
+        assert!(!toml::to_string(&config).unwrap().contains("features"));
+
+        // Features that the client doesn't know are kept but ignored.
+        let invitation = INVITATION.replace(
+            "[server]",
+            "[server]\nfeatures = [\"tls\", \"from-the-future\"]",
+        );
+        let config: InterfaceConfig = toml::from_str(&invitation).unwrap();
+        assert!(config.server.has_feature(FEATURE_TLS));
+        let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.server.features, ["tls", "from-the-future"]);
     }
 }

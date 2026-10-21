@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use innernet_shared::{
-    interface_config::{InterfaceConfig, InterfaceInfo},
+    interface_config::{InterfaceConfig, InterfaceInfo, FEATURE_TLS},
     CidrTree,
 };
 use std::path::Path;
@@ -46,8 +46,14 @@ pub async fn create_peer(
     let interface_info = InterfaceInfo::new(interface, &keypair, *address);
 
     // The coordinator is the peer with the key of the interface config, which authenticated the
-    // server. Its record holds its current endpoint, if it has one.
+    // server. Its record holds its current endpoint, if it has one. The invitation states that
+    // the server speaks TLS only if the server answered this client over TLS.
     let mut server_info = interface_config.server.clone();
+    server_info.features = if rest_client.speaks_tls() {
+        vec![FEATURE_TLS.to_string()]
+    } else {
+        vec![]
+    };
     if let Some(endpoint) = existing_peers
         .iter()
         .find(|p| p.public_key == server_info.public_key)

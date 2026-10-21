@@ -16,7 +16,8 @@ use innernet_node::{
     store,
 };
 use innernet_shared::{
-    wg, Endpoint, Peer, PeerChange, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    interface_config::FEATURE_TLS, wg, Endpoint, Peer, PeerChange, RedeemContents, State,
+    REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
 use thiserror::Error;
@@ -141,7 +142,7 @@ async fn update_keypair(
         "Registering keypair with server (at {}).",
         config.server.internal_endpoint
     );
-    let rest_client = RestClient::new(&config, false)?;
+    let rest_client = RestClient::new(&config, config.server.has_feature(FEATURE_TLS))?;
     rest_client
         .http_form::<_, ()>(
             "POST",

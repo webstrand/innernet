@@ -12,7 +12,7 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    interface_config::{DnsInfo, InterfaceInfo, PeerInvitation, ServerInfo},
+    interface_config::{DnsInfo, InterfaceInfo, PeerInvitation, ServerInfo, FEATURE_TLS},
     prompts, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Error,
     HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts, PeerContents, RenameCidrOpts,
     RenamePeerOpts,
@@ -191,7 +191,10 @@ pub fn add_peer(
         let server_key = Key::from_base64(&config.private_key)?.get_public();
         let server_peer = DatabasePeer::own(&conn, &server_key)?;
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_info = ServerInfo::new(&server_peer, internal_endpoint);
+        let server_info = ServerInfo {
+            features: vec![FEATURE_TLS.to_string()],
+            ..ServerInfo::new(&server_peer, internal_endpoint)
+        };
 
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
