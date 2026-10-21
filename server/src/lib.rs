@@ -209,16 +209,10 @@ pub fn add_peer(
     if let Some((new_peer_info, target_path)) =
         innernet_shared::prompts::gather_new_peer_info(&peers, &cidr_tree, &opts)?
     {
-        // The server's own peer is the one with the public key of its private key.
-        let public_key = wireguard_control::Key::from_base64(&config.private_key)?
-            .get_public()
-            .to_base64();
-        let server_peer = peers
-            .iter()
-            .find(|peer| peer.public_key == public_key)
-            .ok_or_else(|| anyhow!("the server's own peer, with key {public_key}, is missing"))?;
+        let server_key = Key::from_base64(&config.private_key)?.get_public();
+        let server_peer = DatabasePeer::own(&conn, &server_key)?;
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_info = ServerInfo::new(server_peer, internal_endpoint);
+        let server_info = ServerInfo::new(&server_peer, internal_endpoint);
 
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
@@ -507,6 +501,7 @@ pub async fn serve(
     let config = ConfigFile::from_file(conf.config_path(&interface))?;
     log::debug!("opening database connection...");
     let conn = open_database_connection(&interface, conf)?;
+    let public_key = check_database_matches_config(&conn, &config)?;
 
     log::info!("bringing up interface.");
     wg::up(
@@ -527,20 +522,8 @@ pub async fn serve(
         .map(|addr| SocketAddr::from((addr, config.listen_port)).into())
         .collect();
     let num_candidates = candidates.len();
-    let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
-    let mut peers = DatabasePeer::list(&conn)?;
-    let myself = peers
-        .iter_mut()
-        .find(|peer| peer.public_key == public_key.to_base64())
-        .expect("Couldn't find server peer in peer list.");
-    myself.set_candidates(&conn, candidates.clone())?;
-    myself.update(
-        &conn,
-        PeerContents {
-            candidates,
-            ..myself.contents.clone()
-        },
-    )?;
+    let mut myself = DatabasePeer::own(&conn, &public_key)?;
+    myself.set_candidates(&conn, candidates)?;
 
     log::info!(
         "{} local candidates added to server peer config.",
@@ -583,6 +566,21 @@ pub async fn serve(
     server.await?;
 
     Ok(())
+}
+
+/// Checks, before the server starts anything, that the database holds the server's own peer, the
+/// one with the public key of the config's private key, and returns that key. Without it, the
+/// database and the config belong to different networks, or one of them was edited by hand.
+fn check_database_matches_config(conn: &Connection, config: &ConfigFile) -> Result<Key, Error> {
+    let public_key = Key::from_base64(&config.private_key)?.get_public();
+    if DatabasePeer::own(conn, &public_key).is_err() {
+        bail!(
+            "the database and the config don't match: the database holds no peer with the key \
+             {} of the config's private key",
+            public_key.to_base64()
+        );
+    }
+    Ok(public_key)
 }
 
 /// This function differs per OS, because different operating systems have
@@ -695,6 +693,23 @@ mod tests {
         let server = test::Server::new()?;
 
         assert!(Path::new(&server.wg_conf_path()).exists());
+
+        // The server's own peer has the key of the config.
+        let config = ConfigFile::from_file(server.wg_conf_path())?;
+        let key = Key::from_base64(&config.private_key)?.get_public();
+        let own = DatabasePeer::own(&server.db().lock(), &key)?;
+        assert_eq!(&*own.name, "innernet-server");
+
+        // A config whose key no peer has doesn't match the database.
+        assert_eq!(
+            check_database_matches_config(&server.db().lock(), &config)?,
+            key
+        );
+        let other = ConfigFile {
+            private_key: Key::generate_private().to_base64(),
+            ..config
+        };
+        assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
         Ok(())
     }

@@ -11,6 +11,7 @@ use std::{
     ops::{Deref, DerefMut},
     time::SystemTime,
 };
+use wireguard_control::Key;
 
 /// A peer of the coordinator's database, with the ID by which the API of plain HTTP names it, as
 /// [`DatabasePeer::list`] numbers them, and the ID of its CIDR, the smallest CIDR that holds its
@@ -189,6 +190,11 @@ impl DatabasePeer {
         Ok(Self::list(conn)?
             .into_iter()
             .find(|peer| key_to_bytes(&peer.public_key).ok() == Some(*key)))
+    }
+
+    /// The server's own peer, the one with the public key `key` of the server's config.
+    pub fn own(conn: &Connection, key: &Key) -> Result<Self, ServerError> {
+        Self::get_by_key(conn, &key.0)?.ok_or(ServerError::NotFound)
     }
 
     /// The peer at `ip`, as the pins of the node find it.
