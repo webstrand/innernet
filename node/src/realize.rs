@@ -1,15 +1,21 @@
 //! The output adapters, which realize a [`Snapshot`]: a [`TunnelBackend`], which configures the
-//! tunnel, and a [`NamePublisher`], which publishes the names. Each is a trait; [`WireGuard`]
-//! implements the tunnel, and another backend, such as an in-process WireGuard without a network
-//! device, implements the same trait.
+//! tunnel, and a [`NamePublisher`], which publishes the names. Each is a trait, implemented by
+//! [`WireGuard`] and [`DnsServer`]; another backend, such as an in-process WireGuard without a
+//! network device, or another publisher, implements the same trait.
 
 use crate::{
+    dns::{Names, Server},
     events::{poll_wireguard, EventSource, TunnelEvents},
     nat::NatTraverse,
     snapshot::Snapshot,
 };
-use innernet_shared::{wg::DeviceExt as _, Endpoint, Error, Peer, PeerChange};
-use std::{collections::BTreeMap, net::IpAddr};
+use innernet_shared::{
+    interface_config::DnsInfo, wg::DeviceExt as _, Endpoint, Error, Peer, PeerChange,
+};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
 
 /// What a tunnel backend changed of a peer when it realized a snapshot.
@@ -97,5 +103,98 @@ impl TunnelBackend for WireGuard {
         self.events.subscribe(|source| {
             tokio::spawn(poll_wireguard(interface, backend, source));
         })
+    }
+}
+
+/// The names published by a DNS server, each under the hostname that the host suffix gives it, as
+/// [`Names::of`] makes them.
+pub struct DnsServer {
+    pub interface: InterfaceName,
+    pub host_suffix: Option<String>,
+    pub server: Server,
+}
+
+impl NamePublisher for DnsServer {
+    fn publish(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
+        self.server.set_names(Names::of(
+            &self.interface,
+            self.host_suffix.as_deref(),
+            snapshot,
+        ));
+        Ok(())
+    }
+}
+
+/// The DNS server of a node's interface, as the `[dns]` table of its config wants it: running at
+/// the listen address of the table, publishing the names of the node's snapshot, or stopped.
+pub struct DnsService {
+    pub interface: InterfaceName,
+    pub host_suffix: Option<String>,
+    /// The running server, with the listen address of the table that started it, which may differ
+    /// from the address that it listens at in its port.
+    running: Option<(SocketAddr, DnsServer)>,
+}
+
+impl DnsService {
+    pub fn new(interface: InterfaceName, host_suffix: Option<String>) -> Self {
+        Self {
+            interface,
+            host_suffix,
+            running: None,
+        }
+    }
+
+    /// Brings the server in line with `dns`, the `[dns]` table of the config, if it has one, and
+    /// publishes the names of `snapshot`: a server without a table is stopped, as is one whose
+    /// listen address changed, which then starts again at the new address. A server that fails to
+    /// start is warned of and tried again at the next update.
+    pub async fn update(&mut self, dns: Option<&DnsInfo>, snapshot: &Snapshot) {
+        let name = self.interface.as_str_lossy().to_string();
+        if let Some((listen, running)) = self.running.take() {
+            if dns.is_some_and(|dns| dns.listen == listen) {
+                self.running = Some((listen, running));
+            } else {
+                log::info!(
+                    "{name}: stopping the DNS server at {}.",
+                    running.server.listen
+                );
+                running.server.stop().await;
+            }
+        }
+        let Some(DnsInfo { listen }) = dns else {
+            return;
+        };
+        if let Some((_, running)) = &mut self.running {
+            // Publishing to a running server never fails.
+            let _ = running.publish(snapshot);
+            return;
+        }
+        let names = Names::of(&self.interface, self.host_suffix.as_deref(), snapshot);
+        match Server::spawn(*listen, names) {
+            Ok(server) => {
+                log::info!(
+                    "{name}: answering DNS for the names of peers at {}.",
+                    server.listen
+                );
+                let published = DnsServer {
+                    interface: self.interface,
+                    host_suffix: self.host_suffix.clone(),
+                    server,
+                };
+                self.running = Some((*listen, published));
+            },
+            Err(e) => log::warn!("{name}: failed to start the DNS server at {listen}: {e}"),
+        }
+    }
+
+    /// The listen address of the table that started the running server, if one runs.
+    pub fn listen(&self) -> Option<SocketAddr> {
+        self.running.as_ref().map(|(listen, _)| *listen)
+    }
+
+    pub async fn stop(&mut self) {
+        if let Some((_, running)) = self.running.take() {
+            running.server.stop().await;
+        }
     }
 }

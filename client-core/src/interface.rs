@@ -10,7 +10,7 @@ use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_node::{
     events::EventSource,
-    realize::{Realized, WireGuard},
+    realize::{DnsService, Realized, WireGuard},
     runtime::{self, Link, Node, Round},
     snapshot::{self, Snapshot},
     store,
@@ -197,16 +197,26 @@ pub async fn fetch(
         nat,
         interface,
         bring_up_interface,
-        &EventSource::default(),
+        &mut NodeState::default(),
     )
     .await?;
     runtime::settle(round).await
 }
 
+/// What the node of an interface keeps from one round to the next.
+#[derive(Default)]
+pub struct NodeState {
+    /// The source of the events of the interface.
+    pub events: EventSource,
+    /// The DNS server of the interface, which a node that runs rounds runs while the config has a
+    /// `[dns]` table, and a node that runs one round doesn't.
+    pub dns: Option<DnsService>,
+}
+
 /// Runs a round of the node of `interface`: reads its config, brings the interface up if
-/// `bring_up_interface` allows it and it isn't up, and runs the round of the node through its link
-/// to the coordinator, with `events`, the source of the events of the interface, which a node that
-/// runs rounds keeps from one to the next.
+/// `bring_up_interface` allows it and it isn't up, runs the round of the node through its link to
+/// the coordinator, and publishes the names of the round's snapshot to the DNS server of `state`,
+/// what the node keeps from one round to the next.
 #[allow(clippy::too_many_arguments)]
 pub async fn round(
     config_dir: &Path,
@@ -216,7 +226,7 @@ pub async fn round(
     nat: &NatOpts,
     interface: &InterfaceName,
     bring_up_interface: bool,
-    events: &EventSource,
+    state: &mut NodeState,
 ) -> Result<Round, Error> {
     hosts_opts.warn_of_hosts_file_options();
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
@@ -274,9 +284,8 @@ pub async fn round(
             interface: *interface,
             backend: network_opts.backend,
             endpoint_overrides: config.peer_endpoint_overrides().clone(),
-            events: events.clone(),
+            events: state.events.clone(),
         }),
-        names: None,
     };
     let mut link = RemoteLink {
         interface: *interface,
@@ -285,6 +294,9 @@ pub async fn round(
         fetched: false,
     };
     let round = node.round(&mut link).await?;
+    if let Some(dns) = &mut state.dns {
+        dns.update(config.dns.as_ref(), &round.snapshot).await;
+    }
 
     let peers = link.store.peers()?;
     for realized in &round.realized {

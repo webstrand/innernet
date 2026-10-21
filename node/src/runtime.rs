@@ -1,7 +1,8 @@
 //! The runtime of a node: the rounds that every node runs, whatever its role, and the loop that
 //! runs them. A round brings the node's store up to date through its [`Link`] to the coordinator,
-//! configures the tunnel and publishes the names of what the store holds, reports the node's
-//! candidates, and starts the NAT traversal of the peers that it changed.
+//! configures the tunnel from what the store holds, reports the node's candidates, and starts the
+//! NAT traversal of the peers that it changed. The host publishes the names of the round's
+//! snapshot.
 //!
 //! A round runs when the coordinator signals a change of the store through [`StoreChanged`], when
 //! the host's addresses change, and, for a node that polls its coordinator, at its interval. The
@@ -14,7 +15,7 @@ use crate::{
     addresses,
     events::{TunnelEvent, TunnelEvents},
     nat::{NatTraverse, STEP_INTERVAL},
-    realize::{NamePublisher, Realized, TunnelBackend},
+    realize::{Realized, TunnelBackend},
     snapshot::Snapshot,
 };
 use anyhow::Error;
@@ -55,7 +56,7 @@ pub trait Link {
     async fn report_candidates(&mut self, candidates: Vec<Endpoint>) -> Result<(), Error>;
 }
 
-/// A node: its tunnel, the publisher of its names, and what decides its candidates.
+/// A node: its tunnel, and what decides its candidates.
 pub struct Node {
     pub interface: InterfaceName,
     /// The port at which the tunnel listens, at which the other addresses of the host are the
@@ -64,7 +65,6 @@ pub struct Node {
     /// Which addresses of the host are no candidates, and whether the node traverses NATs.
     pub nat: NatOpts,
     pub tunnel: Box<dyn TunnelBackend + Send>,
-    pub names: Option<Box<dyn NamePublisher + Send>>,
 }
 
 pub struct Round {
@@ -77,20 +77,15 @@ pub struct Round {
 }
 
 impl Node {
-    /// Runs a round through `link`: brings the store up to date, configures the tunnel and
-    /// publishes the names of its snapshot, reports the node's candidates, and starts the NAT
-    /// traversal of the peers that it changed. A failure to report the candidates is logged and
-    /// fails nothing, so that the node keeps what it has configured.
+    /// Runs a round through `link`: brings the store up to date, configures the tunnel from its
+    /// snapshot, reports the node's candidates, and starts the NAT traversal of the peers that it
+    /// changed. A failure to report the candidates is logged and fails nothing, so that the node
+    /// keeps what it has configured.
     pub async fn round(&mut self, link: &mut impl Link) -> Result<Round, Error> {
         link.sync().await?;
         let snapshot = link.snapshot()?;
         let events = self.tunnel.events();
         let realized = self.tunnel.realize(&snapshot)?;
-        if let Some(names) = &mut self.names {
-            if let Err(e) = names.publish(&snapshot) {
-                log::warn!("failed to publish the names of the peers: {e:#}");
-            }
-        }
         let candidates = self.candidates()?;
         log::info!(
             "reporting {} interface address{} as NAT traversal candidates",

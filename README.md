@@ -149,6 +149,31 @@ or unset the port and use a randomized port with
 sudo innernet set-listen-port -u <interface>
 ```
 
+### DNS
+
+Each node can run a DNS server that resolves the names of the enabled peers, such as `<peer>.<interface>.wg`, to their addresses. It is authoritative for its zone, `<interface>.wg` or the host suffix: any other name of the zone, a disabled peer's or one under a peer's name included, doesn't exist, and it refuses queries for names outside the zone. A `[dns]` table in the config enables it, in `/etc/innernet/<interface>.conf` on a client running `innernet up --daemon`, and in `/etc/innernet-server/<interface>.conf` on the server:
+
+```toml
+[dns]
+listen = "127.0.0.55:53"
+```
+
+The listen address should be a loopback address with a port below 1024. The operator must point the system resolver at it. With systemd-resolved 258 or later, a file such as `/etc/systemd/dns-delegate.d/innernet.dns-delegate` does so, once the operator runs `systemctl reload systemd-resolved`:
+
+```ini
+[Delegate]
+DNS=127.0.0.55:53
+Domains=~<interface>.wg
+```
+
+With dnsmasq, the line `server=/<interface>.wg/127.0.0.55` does so. `--host-suffix` names the peers under another suffix in place of `<interface>.wg`, which must not be empty.
+
+### What Wakes a Node
+
+A node configures its interface in rounds: it brings what it holds of the network up to date, configures its tunnel and its DNS server, reports its NAT traversal candidates, and starts NAT traversal of the peers that changed, whose steps follow five seconds apart. `innernet up --daemon` runs a round of each interface at its `--interval` and whenever the host's addresses change; the server runs one whenever its coordinator changes the network and whenever the host's addresses change. On Linux, the kernel reports changes of the addresses as they happen. The node reads its tunnel every ten seconds for the endpoints at which it reaches its peers and the handshakes that complete: the server reports to each peer the endpoints at which its tunnel reaches the others, and the NAT traversal of a peer ends once a handshake with it completes, which each step of the traversal also checks.
+
+The commands of `innernet-server` that change the network write its database; a running server's node picks the change up when it next starts.
+
 ### Remove Network
 
 To permanently uninstall a created network, use

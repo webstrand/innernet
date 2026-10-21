@@ -587,24 +587,20 @@ pub struct HostsOpts {
     #[clap(long = "no-write-hosts", hide = true)]
     pub no_write_hosts: bool,
 
-    /// Use a different suffix for hosts, than 'INTERFACE.wg' , ex.
-    /// --host-suffix 'evilnet' names peers: PEER.evilnet
+    /// Use a different suffix for the hostnames of peers that the DNS server answers for, than
+    /// 'INTERFACE.wg', ex. --host-suffix 'evilnet' names peers: PEER.evilnet
     #[clap(long = "host-suffix", value_parser = parse_host_suffix)]
     pub host_suffix: Option<String>,
 }
 
 impl HostsOpts {
-    /// Warns of the options of the hosts file, which innernet no longer writes, and of a host
-    /// suffix, since nothing publishes the names of the peers.
+    /// Warns of the options of the hosts file, which innernet no longer writes.
     pub fn warn_of_hosts_file_options(&self) {
         if self.hosts_path.is_some() || self.no_write_hosts {
             log::warn!(
                 "innernet no longer writes a hosts file, so --hosts-path and --no-write-hosts \
                  have no effect."
             );
-        }
-        if self.host_suffix.is_some() {
-            log::warn!("nothing publishes the names of the peers, so --host-suffix has no effect.");
         }
     }
 }

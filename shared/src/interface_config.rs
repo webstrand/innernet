@@ -23,11 +23,29 @@ pub struct InterfaceConfig {
     /// The necessary contact information for the server.
     pub server: ServerInfo,
 
+    /// The DNS server for the names of the peers of this interface, which `innernet up --daemon`
+    /// runs while this table is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsInfo>,
+
     /// A configurable map of peer IP addresses to Endpoints which should
     /// be used as the WireGuard endpoint for that peer.
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
+}
+
+/// The `[dns]` table of the config: a DNS server that answers queries for the hostnames of the
+/// peers, with their addresses, and refuses queries for any other name. innernet doesn't
+/// configure the system resolver to use it.
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DnsInfo {
+    /// The address at which the server answers queries, over both UDP and TCP, such as
+    /// `127.0.0.55:53`; `0.0.0.0` or `[::]` listens at every address. It should be a loopback
+    /// address, and its port one that only a privileged user may bind, since a local user who
+    /// binds it while the server doesn't answers for the names of peers.
+    pub listen: SocketAddr,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -89,6 +107,7 @@ impl InterfaceConfig {
         InterfaceConfig {
             interface,
             server,
+            dns: None,
             peer_endpoint_overrides: BTreeMap::new(),
         }
     }

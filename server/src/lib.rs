@@ -7,12 +7,12 @@ use indoc::printdoc;
 use innernet_node::{
     addresses,
     events::{EventSource, TunnelEvent, TunnelEvents},
-    realize::{TunnelBackend as _, WireGuard},
+    realize::{DnsService, TunnelBackend as _, WireGuard},
     runtime::{self, Node, StoreChanged, Triggers},
     Store,
 };
 use innernet_shared::{
-    interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
+    interface_config::{DnsInfo, InterfaceInfo, PeerInvitation, ServerInfo},
     prompts, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Error,
     HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts, PeerContents, RenameCidrOpts,
     RenamePeerOpts,
@@ -66,6 +66,11 @@ pub struct ConfigFile {
 
     /// The CIDR prefix of the WireGuard network
     pub network_cidr_prefix: u8,
+
+    /// The DNS server that the server runs, as every node runs it, at the address of the
+    /// table, or `None` if the server runs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsInfo>,
 }
 
 impl ConfigFile {
@@ -406,8 +411,8 @@ pub async fn serve(
             no_nat_candidates: false,
         },
         tunnel: Box::new(tunnel),
-        names: None,
     };
+    let mut dns = DnsService::new(interface, hosts_opts.host_suffix.clone());
     let mut link = LocalLink {
         db: db.clone(),
         key: public_key.clone(),
@@ -419,7 +424,11 @@ pub async fn serve(
             .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
             .ok(),
     };
-    let node_loop = runtime::run(triggers, async || node.round(&mut link).await);
+    let node_loop = runtime::run(triggers, async || {
+        let round = node.round(&mut link).await?;
+        dns.update(config.dns.as_ref(), &round.snapshot).await;
+        Ok(round)
+    });
 
     log::info!("innernet-server {} starting.", VERSION);
     let coordinator = Coordinator::spawn(

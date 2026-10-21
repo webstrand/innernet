@@ -9,13 +9,14 @@
 //! - [`accept`] is the input port: every source of the records of peers hands them to
 //!   [`Store::accept`] and gets back what was accepted, or why each was refused.
 //! - [`snapshot`] is the output: what the node configures, as a snapshot of what it recorded,
-//!   which the adapters of [`realize`] realize.
+//!   which the adapters of [`realize`] realize, the tunnel and the DNS server of [`dns`].
 //! - [`runtime`] runs the rounds of a node through its link to the coordinator, on the events of
 //!   [`addresses`] and [`events`], with the NAT traversal of [`nat`].
 
 pub mod accept;
 pub mod addresses;
 pub mod db;
+pub mod dns;
 pub mod events;
 pub mod nat;
 pub mod realize;

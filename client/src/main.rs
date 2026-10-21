@@ -6,7 +6,7 @@ use dialoguer::{Confirm, Input};
 use indoc::eprintdoc;
 use innernet_client_core::{
     data_store::DataStore,
-    interface::{fetch, redeem_invite, round},
+    interface::{fetch, redeem_invite, round, NodeState},
     peer::create_peer,
     rest_client::{RestClient, RestError},
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
@@ -14,6 +14,7 @@ use innernet_client_core::{
 use innernet_node::{
     addresses,
     events::EventSource,
+    realize::DnsService,
     runtime::{self, Triggers},
 };
 use innernet_shared::{
@@ -465,7 +466,10 @@ async fn up(
             let (hosts, nat) = (hosts_opts.clone(), nat_opts.clone());
             let name = interface.to_string();
             let task = tokio::task::spawn_local(async move {
-                let events = EventSource::default();
+                let mut state = NodeState {
+                    events: EventSource::default(),
+                    dns: Some(DnsService::new(*interface, hosts.host_suffix.clone())),
+                };
                 let triggers = Triggers {
                     changed: None,
                     interval: Some(interval),
@@ -482,7 +486,7 @@ async fn up(
                         &nat,
                         &interface,
                         true,
-                        &events,
+                        &mut state,
                     )
                     .await
                 })
