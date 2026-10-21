@@ -1,14 +1,14 @@
-//! The coordinator of a network, as a service of the node that it runs beside: it serves the API
-//! and keeps what it assigns the peers in its annex to the node's database. It runs on what it is
-//! handed: its key, the database that it shares with its node, a listener that the host has
-//! bound, and the hooks through which it tells the node of a change and learns where the node's
-//! tunnel observes the peers.
+//! The coordinator of a network, as a service of the node that it runs beside: it serves the API,
+//! in TLS and, for clients that predate TLS, in plain HTTP, and keeps what it assigns the peers in
+//! its annex to the node's database. It runs on what it is handed: its key, the database that it
+//! shares with its node, a listener that the host has bound, and the hooks through which it tells
+//! the node of a change and learns where the node's tunnel observes the peers.
 
 use crate::{api, db::DatabasePeer, ServerError};
-use anyhow::Error;
-use hyper::{http, server::conn::AddrStream, Body, Request, Response};
+use anyhow::{anyhow, Error};
+use hyper::{http, service::service_fn, Body, Request, Response};
 use innernet_node::{runtime::StoreChanged, Store};
-use innernet_shared::INNERNET_PUBKEY_HEADER;
+use innernet_shared::{tls, INNERNET_PUBKEY_HEADER};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, VecDeque},
@@ -18,12 +18,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 use subtle::ConstantTimeEq;
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{net::TcpStream, sync::Notify, task::JoinHandle, time::timeout};
+use tokio_rustls::{rustls, TlsAcceptor};
 use wireguard_control::Key;
 
 /// The sockets at which the coordinator serves its API, which the host binds.
 pub struct Sockets {
-    /// The TCP listener of the API, in plain HTTP.
+    /// The TCP listener of the API, in TLS and in plain HTTP.
     pub api: TcpListener,
 }
 
@@ -41,9 +42,10 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Starts the coordinator, whose peer has the public key `public_key`, on `db`, the database
-    /// that it shares with its node, in the current Tokio runtime.
-    pub fn spawn(public_key: Key, db: Db, sockets: Sockets, hooks: Hooks) -> Result<Self, Error> {
+    /// Starts the coordinator with the private key `private_key`, in base64, on `db`, the
+    /// database that it shares with its node, in the current Tokio runtime.
+    pub fn spawn(private_key: &str, db: Db, sockets: Sockets, hooks: Hooks) -> Result<Self, Error> {
+        let public_key = Key::from_base64(private_key)?.get_public();
         let context = Context {
             db: db.clone(),
             endpoints: hooks.endpoints,
@@ -52,19 +54,10 @@ impl Coordinator {
             invitations: Arc::default(),
         };
         spawn_invitation_sweeper(db, hooks.changed, context.invitations.clone());
+        let tls_config = tls::server_config(private_key)?;
         sockets.api.set_nonblocking(true)?;
-        let make_svc = hyper::service::make_service_fn(move |socket: &AddrStream| {
-            let remote_addr = socket.remote_addr();
-            let context = context.clone();
-            async move {
-                Ok::<_, http::Error>(hyper::service::service_fn(move |req: Request<Body>| {
-                    log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
-                    hyper_service(req, context.clone(), remote_addr)
-                }))
-            }
-        });
-        let server = hyper::Server::from_tcp(sockets.api)?.serve(make_svc);
-        let task = tokio::spawn(async move { Ok(server.await?) });
+        let listener = tokio::net::TcpListener::from_std(sockets.api)?;
+        let task = tokio::spawn(serve_api(listener, context, tls_config));
         Ok(Self { task })
     }
 
@@ -153,10 +146,76 @@ impl Session {
     }
 }
 
+/// How long a client may take to send its first byte, and then to complete a TLS handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serves the API in TLS and, for clients that predate it, in plain HTTP on the same port.
+pub(crate) async fn serve_api(
+    listener: tokio::net::TcpListener,
+    context: Context,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Result<(), Error> {
+    let acceptor = TlsAcceptor::from(tls_config);
+    loop {
+        let (stream, remote_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Such as running out of file descriptors, which may pass.
+                log::warn!("failed to accept a connection: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            },
+        };
+        let (context, acceptor) = (context.clone(), acceptor.clone());
+        tokio::spawn(async move {
+            if let Err(e) = serve_connection(stream, remote_addr, context, acceptor).await {
+                log::debug!("{remote_addr} - connection failed: {e}");
+            }
+        });
+    }
+}
+
+/// Serves one connection, in TLS if it starts with a TLS handshake record, which no HTTP request
+/// does, and in plain HTTP otherwise.
+async fn serve_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    context: Context,
+    acceptor: TlsAcceptor,
+) -> Result<(), Error> {
+    let mut first_byte = [0u8; 1];
+    if timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first_byte)).await?? == 0 {
+        return Ok(());
+    }
+    let mut http = hyper::server::conn::Http::new();
+    http.http1_only(true);
+
+    if first_byte[0] == tls::TLS_HANDSHAKE_RECORD {
+        let stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await??;
+        let client_key = tls::peer_public_key(stream.get_ref().1.peer_certificates())
+            .ok_or_else(|| anyhow!("the client presented no usable key"))?;
+        let service = service_fn(move |req: Request<Body>| {
+            log::debug!("{} (TLS) - {} {}", remote_addr, req.method(), req.uri());
+            hyper_service(req, context.clone(), remote_addr, Some(client_key.clone()))
+        });
+        http.serve_connection(stream, service).await?;
+    } else {
+        let service = service_fn(move |req: Request<Body>| {
+            log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
+            hyper_service(req, context.clone(), remote_addr, None)
+        });
+        http.serve_connection(stream, service).await?;
+    }
+    Ok(())
+}
+
+/// Serves a request from `remote_addr`. `client_key` is the key the client authenticated with
+/// over TLS, if it connected that way.
 pub(crate) async fn hyper_service(
     req: Request<Body>,
     context: Context,
     remote_addr: SocketAddr,
+    client_key: Option<Key>,
 ) -> Result<Response<Body>, http::Error> {
     // Break the path into components.
     let components: VecDeque<_> = req
@@ -167,7 +226,7 @@ pub(crate) async fn hyper_service(
         .map(String::from)
         .collect();
 
-    routes(req, context, remote_addr, components)
+    routes(req, context, remote_addr, client_key, components)
         .await
         .or_else(TryInto::try_into)
 }
@@ -176,13 +235,14 @@ async fn routes(
     req: Request<Body>,
     context: Context,
     remote_addr: SocketAddr,
+    client_key: Option<Key>,
     mut components: VecDeque<String>,
 ) -> Result<Response<Body>, ServerError> {
     // Must be "/v1/[something]"
     if components.pop_front().as_deref() != Some("v1") {
         Err(ServerError::NotFound)
     } else {
-        let session = get_session(&req, context, remote_addr.ip())?;
+        let session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
         let component = components.pop_front();
         match component.as_deref() {
             Some("user") => api::user::routes(req, components, session).await,
@@ -192,10 +252,14 @@ async fn routes(
     }
 }
 
+/// Identifies the peer making a request: by the key it authenticated with over TLS if it did,
+/// otherwise by its source IP, which anything on the peer's machine can send from. Peers that have
+/// once connected over TLS are refused the latter from then on.
 fn get_session(
     req: &Request<Body>,
     context: Context,
     addr: IpAddr,
+    client_key: Option<&Key>,
 ) -> Result<Session, ServerError> {
     let pubkey = req
         .headers()
@@ -203,20 +267,234 @@ fn get_session(
         .ok_or(ServerError::Unauthorized)?;
     let pubkey = pubkey.to_str().map_err(|_| ServerError::Unauthorized)?;
     let pubkey = Key::from_base64(pubkey).map_err(|_| ServerError::Unauthorized)?;
-    if pubkey
-        .as_bytes()
-        .ct_eq(context.public_key.as_bytes())
-        .into()
-    {
-        let peer = DatabasePeer::get_from_ip(&context.db.lock(), addr).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => ServerError::Unauthorized,
-            e => ServerError::Database(e),
-        })?;
-
-        if !peer.is_disabled {
-            return Ok(Session { context, peer });
-        }
+    if !bool::from(pubkey.as_bytes().ct_eq(context.public_key.as_bytes())) {
+        return Err(ServerError::Unauthorized);
     }
 
-    Err(ServerError::Unauthorized)
+    let not_found_is_unauthorized = |e| match e {
+        rusqlite::Error::QueryReturnedNoRows => ServerError::Unauthorized,
+        e => ServerError::Database(e),
+    };
+    let peer = {
+        let store = context.db.lock();
+        let mut peer = match client_key {
+            Some(key) => DatabasePeer::get_from_public_key(&store, key),
+            None => DatabasePeer::get_from_ip(&store, addr),
+        }
+        .map_err(not_found_is_unauthorized)?;
+
+        // WireGuard only delivers the peer's traffic from its own IP, so anything else means the
+        // connection didn't come through the tunnel.
+        if peer.ip != addr {
+            log::warn!("refusing {} connecting from {addr}.", *peer);
+            return Err(ServerError::Unauthorized);
+        }
+        if client_key.is_none() && peer.requires_tls {
+            log::warn!("refusing {} connecting without TLS.", *peer);
+            return Err(ServerError::TlsRequired);
+        }
+
+        if peer.is_disabled {
+            return Err(ServerError::Unauthorized);
+        }
+        if client_key.is_some() && !peer.requires_tls {
+            log::info!("{} connected over TLS, and is now required to.", *peer);
+            peer.set_requires_tls(&store)?;
+        }
+        peer
+    };
+
+    Ok(Session { context, peer })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test;
+    use hyper::StatusCode;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use wireguard_control::KeyPair;
+
+    fn requires_tls(server: &test::Server, id: i64) -> bool {
+        DatabasePeer::get(&server.db.lock(), id)
+            .unwrap()
+            .requires_tls
+    }
+
+    fn server_key(server: &test::Server) -> String {
+        server.context().public_key.to_base64()
+    }
+
+    #[tokio::test]
+    async fn test_tls_latch() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        server.predate_tls(test::DEVELOPER1_PEER_ID);
+        server.predate_tls(test::DEVELOPER2_PEER_ID);
+        let ip = test::DEVELOPER1_PEER_IP;
+
+        // A peer from before TLS that has never connected over TLS is identified by its IP...
+        assert!(!requires_tls(&server, test::DEVELOPER1_PEER_ID));
+        let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!requires_tls(&server, test::DEVELOPER1_PEER_ID));
+
+        // ...until it does, after which it must always.
+        let res = server.request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(requires_tls(&server, test::DEVELOPER1_PEER_ID));
+
+        let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("TLS"));
+
+        // Other peers are unaffected.
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peers_require_tls_from_creation() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        for (id, ip, path) in [
+            (test::ADMIN_PEER_ID, test::ADMIN_PEER_IP, "/v1/admin/peers"),
+            (
+                test::DEVELOPER1_PEER_ID,
+                test::DEVELOPER1_PEER_IP,
+                "/v1/user/state",
+            ),
+        ] {
+            assert!(requires_tls(&server, id));
+            let res = server.plain_request(ip, "GET", path).await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            let res = server.request(ip, "GET", path).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_key_must_match_peer_and_ip() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let admin_key = {
+            let admin = DatabasePeer::get(&server.db.lock(), test::ADMIN_PEER_ID)?;
+            Key::from_base64(&admin.public_key)?
+        };
+        let request = || {
+            let path = if cfg!(feature = "v6-test") {
+                format!("http://[{}]/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            } else {
+                format!("http://{}/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            };
+            Request::builder()
+                .uri(path)
+                .header(INNERNET_PUBKEY_HEADER, server_key(&server))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // The admin's key from another peer's IP.
+        let res = server
+            .raw_request_as(test::USER1_PEER_IP, Some(admin_key.clone()), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // An unknown key from the admin's IP.
+        let unknown = KeyPair::generate().public;
+        let res = server
+            .raw_request_as(test::ADMIN_PEER_IP, Some(unknown), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = server
+            .raw_request_as(test::ADMIN_PEER_IP, Some(admin_key), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // A user peer connecting over TLS gains nothing beyond its own rights.
+        let res = server
+            .request(test::USER1_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Sends a request on a raw stream and returns the response's status line.
+    async fn status_line<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        server_key: &str,
+    ) -> String {
+        let request = format!(
+            "GET /v1/user/state HTTP/1.1\r\nHost: innernet\r\n{INNERNET_PUBKEY_HEADER}: \
+             {server_key}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_serves_tls_and_plain_http_on_one_port() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let server_tls_key = KeyPair::generate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(serve_api(
+            listener,
+            server.context(),
+            tls::server_config(&server_tls_key.private.to_base64())?,
+        ));
+
+        // A peer whose private key is known, at an IP other than the loopback's.
+        let peer_key = KeyPair::generate();
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:9"
+        } else {
+            "10.80.64.9"
+        };
+        let mut contents = test::developer_peer_contents("developer3", ip)?;
+        contents.public_key = peer_key.public.to_base64();
+        let id = DatabasePeer::create(&server.db.lock(), contents)?.id;
+        server.predate_tls(id);
+
+        let header_key = server_key(&server);
+        let connect_tls = |client: &KeyPair, pinned: &Key| {
+            let config = tls::client_config(&client.private.to_base64(), &pinned.to_base64());
+            let connector = tokio_rustls::TlsConnector::from(config.unwrap());
+            async move {
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+                connector.connect(name, stream).await
+            }
+        };
+
+        // Plain HTTP is still served; nothing is at the loopback's IP.
+        let plain = TcpStream::connect(addr).await?;
+        assert_eq!(
+            status_line(plain, &header_key).await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+
+        // TLS is served on the same port. The peer's key is accepted by the handshake, but not
+        // from an IP other than its own, and that doesn't latch it.
+        let tls = connect_tls(&peer_key, &server_tls_key.public).await?;
+        assert_eq!(
+            status_line(tls, &header_key).await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+        assert!(!requires_tls(&server, id));
+
+        // A client pinning another server key refuses the handshake.
+        let wrong = KeyPair::generate().public;
+        assert!(connect_tls(&peer_key, &wrong).await.is_err());
+        Ok(())
+    }
 }

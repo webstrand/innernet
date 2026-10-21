@@ -28,7 +28,11 @@ CREATE TABLE peers (
   -- Whether the peer is redeemed; a peer that isn't is an invitation.
   is_redeemed                   INTEGER NOT NULL DEFAULT 1 CHECK (is_redeemed IN (0, 1)),
   invite_expires                INTEGER, -- UNIX time in seconds
-  persistent_keepalive_interval INTEGER CHECK (persistent_keepalive_interval BETWEEN 0 AND 65535)
+  persistent_keepalive_interval INTEGER CHECK (persistent_keepalive_interval BETWEEN 0 AND 65535),
+  -- Whether the peer speaks TLS, which the node sets on authenticated evidence and never clears:
+  -- a client never falls back to plain HTTP with a coordinator that has answered over TLS, and a
+  -- coordinator never again identifies a peer that has authenticated over TLS by its address.
+  tls                           INTEGER NOT NULL DEFAULT 0 CHECK (tls IN (0, 1))
 ) STRICT, WITHOUT ROWID;
 
 -- No name belongs to two peers.

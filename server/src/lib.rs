@@ -415,7 +415,7 @@ pub async fn serve(
     let mut dns = DnsService::new(interface, hosts_opts.host_suffix.clone());
     let mut link = LocalLink {
         db: db.clone(),
-        key: public_key.clone(),
+        key: public_key,
     };
     let triggers = Triggers {
         changed: Some(changed.clone()),
@@ -432,7 +432,7 @@ pub async fn serve(
 
     log::info!("innernet-server {} starting.", VERSION);
     let coordinator = Coordinator::spawn(
-        public_key,
+        &config.private_key,
         db,
         Sockets {
             api: get_listener((config.address, config.listen_port).into(), &interface)?,

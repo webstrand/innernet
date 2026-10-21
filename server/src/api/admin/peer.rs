@@ -93,6 +93,7 @@ mod tests {
     use crate::test;
     use bytes::Buf;
     use innernet_shared::{Endpoint, Error, Peer};
+    use wireguard_control::Key;
 
     #[tokio::test]
     async fn test_add_peer() -> Result<(), Error> {
@@ -311,6 +312,58 @@ mod tests {
         assert_eq!(&*new_peer.name, "new-peer-name");
         assert_eq!(new_peer.endpoint, Some(endpoint));
         assert_eq!(new_peer.candidates, vec![candidate]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_promotion_requires_tls() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        server.predate_tls(test::DEVELOPER1_PEER_ID);
+        let promote = || async {
+            let peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID).unwrap();
+            let change = PeerContents {
+                is_admin: true,
+                ..peer.contents.clone()
+            };
+            server
+                .form_request(
+                    test::ADMIN_PEER_IP,
+                    "PUT",
+                    &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
+                    &change,
+                )
+                .await
+        };
+
+        // The peer predates TLS, and has only been seen in plain HTTP.
+        assert_eq!(promote().await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_admin);
+
+        // Once it has connected over TLS, it can be.
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(promote().await.status(), StatusCode::NO_CONTENT);
+        assert!(DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_admin);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_with_invalid_key() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:3"
+        } else {
+            "10.80.64.4"
+        };
+        let mut peer = test::developer_peer_contents("developer3", ip)?;
+        // A low-order point.
+        peer.public_key = Key([0; 32]).to_base64();
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         Ok(())
     }
 

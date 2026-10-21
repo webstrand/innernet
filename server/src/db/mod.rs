@@ -71,7 +71,8 @@ fn is_origin(conn: &Connection) -> Result<bool, Error> {
 /// key that isn't base64 or a peer whose CIDR isn't the smallest that holds its IP, rolls the
 /// transaction back; an endpoint or candidates that the server couldn't read are dropped with a
 /// warning, as the server ignored them. The IDs of the peers, the CIDRs and the associations
-/// aren't kept: the API of plain HTTP numbers them by position.
+/// aren't kept: the API of plain HTTP numbers them by position. The invitations not yet redeemed
+/// are latched to TLS.
 fn rebuild(
     conn: &mut Connection,
     path: &Path,
@@ -234,6 +235,10 @@ fn rebuild(
         has_server,
         "no peer has the public key {server_key} of the server's config"
     );
+    // A redeemed peer keeps using plain HTTP until it first connects over TLS. An invitation not
+    // yet redeemed is latched, as one that the server issues is, so that only a client that speaks
+    // TLS may redeem it.
+    tx.execute("UPDATE peers SET tls = 1 WHERE is_redeemed = 0", [])?;
 
     tx.execute_batch(
         "DROP TABLE origin_associations;
@@ -327,13 +332,29 @@ mod tests {
             &server,
             &[(7, "alice", "10.0.1.2", 3, r#"["198.51.100.1:51820"]"#)],
         );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO peers (id, name, ip, public_key, cidr_id, is_redeemed)
+                 VALUES (8, 'invited', '10.0.1.3', ?1, 3, 0)",
+                [Key::generate_private().get_public().to_base64()],
+            )
+            .unwrap();
 
         let store = open(&path, network(), &server).unwrap();
         let peers = load_peers(&store).unwrap();
-        assert_eq!(peers.len(), 2);
+        assert_eq!(peers.len(), 3);
         assert_eq!(peers[0].public_key, server.to_base64());
         assert_eq!(peers[1].name.to_string(), "alice");
         assert_eq!(peers[1].candidates, ["198.51.100.1:51820".parse().unwrap()]);
+
+        // Only the invitation is latched to TLS.
+        let latched: Vec<bool> = DatabasePeer::list(&store)
+            .unwrap()
+            .iter()
+            .map(|peer| peer.requires_tls)
+            .collect();
+        assert_eq!(latched, [false, false, true]);
 
         // The infra CIDR is marked, and the association joins the CIDRs that it joined.
         let infra: Vec<String> = store::load_cidrs(&store)
@@ -353,7 +374,7 @@ mod tests {
         assert!(node_db::has_column(&copy, "peers", "id").unwrap());
         drop(store);
         let store = open(&path, network(), &server).unwrap();
-        assert_eq!(load_peers(&store).unwrap().len(), 2);
+        assert_eq!(load_peers(&store).unwrap().len(), 3);
         assert!(!dir.path().join("wg0.db.v2.0.0.1").exists());
     }
 
