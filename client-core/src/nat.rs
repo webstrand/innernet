@@ -7,9 +7,10 @@ use innernet_shared::interface_config::InterfaceConfig;
 use std::time::{Duration, Instant};
 
 use anyhow::Error;
+use innernet_node::realize::Realized;
 use innernet_shared::{
     wg::{DeviceExt, PeerInfoExt},
-    Endpoint, Peer, PeerDiff,
+    Endpoint, Peer,
 };
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
@@ -26,12 +27,12 @@ impl<'a> NatTraverse<'a> {
         interface: &'a InterfaceName,
         interface_config: &InterfaceConfig,
         backend: Backend,
-        diffs: &[PeerDiff],
+        realized: &[Realized],
     ) -> Result<Self, Error> {
         // Filter out removed peers from diffs list.
-        let mut remaining: Vec<_> = diffs
+        let mut remaining: Vec<_> = realized
             .iter()
-            .filter_map(|diff| diff.new)
+            .filter_map(|realized| realized.new.as_ref())
             // Don't attempt NAT traversal for peers with an overridden endpoint.
             .filter(|peer| {
                 !interface_config

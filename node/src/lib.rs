@@ -8,9 +8,13 @@
 //!   the host.
 //! - [`accept`] is the input port: every source of the records of peers hands them to
 //!   [`Store::accept`] and gets back what was accepted, or why each was refused.
+//! - [`snapshot`] is the output: what the node configures, as a snapshot of what it recorded,
+//!   which the adapters of [`realize`] realize.
 
 pub mod accept;
 pub mod db;
+pub mod realize;
+pub mod snapshot;
 pub mod store;
 
 pub use db::Store;

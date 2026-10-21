@@ -9,14 +9,16 @@ use crate::{
 };
 use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
+use innernet_node::{
+    realize::{HostsFile, NamePublisher as _, Realized, TunnelBackend as _, WireGuard},
+    snapshot, store,
+};
 use innernet_shared::{
-    get_local_addrs, update_hosts_file,
-    wg::{self, DeviceExt as _},
-    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    get_local_addrs, wg, Endpoint, Peer, PeerChange, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
-use wireguard_control::{Backend, Device, DeviceUpdate, PeerConfigBuilder};
+use wireguard_control::{Backend, Device, DeviceUpdate};
 
 #[derive(Debug, Error)]
 pub enum RedeemInviteError {
@@ -251,8 +253,8 @@ pub fn fetch(
         }
     }
 
-    // The interface is configured from the enabled peers of the data store, with the local peer
-    // endpoint overrides applied.
+    // The interface is configured from the snapshot that the node makes of the data store: the
+    // enabled peers, with the local peer endpoint overrides applied.
     for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
         log::debug!(
             "overriding peer IP {} with endpoint {}",
@@ -260,31 +262,26 @@ pub fn fetch(
             endpoint_override
         );
     }
-    let peers = store.peers()?;
+    let snapshot = snapshot::snapshot(store::load_peers(store.store())?);
 
     let device = Device::get(interface, network_opts.backend)?;
-    let modifications = device.diff(&peers, config.peer_endpoint_overrides());
+    let mut tunnel = WireGuard {
+        interface: *interface,
+        backend: network_opts.backend,
+        endpoint_overrides: config.peer_endpoint_overrides().clone(),
+    };
+    let modifications = tunnel.realize(&snapshot).context(interface.to_string())?;
+    let peers = store.peers()?;
+    for realized in &modifications {
+        print_peer_diff(&peers, realized);
+    }
 
-    let updates = modifications
-        .iter()
-        .inspect(|diff| print_peer_diff(&peers, diff))
-        .cloned()
-        .map(PeerConfigBuilder::from)
-        .collect::<Vec<_>>();
-
-    if !updates.is_empty() || !interface_up {
-        DeviceUpdate::new()
-            .add_peers(&updates)
-            .apply(interface, network_opts.backend)
-            .context(interface.to_string())?;
-
-        if !hosts_opts.no_write_hosts {
-            update_hosts_file(
-                interface,
-                hosts_opts,
-                peers.iter().filter(|peer| !peer.is_disabled),
-            )?;
+    if !modifications.is_empty() || !interface_up {
+        HostsFile {
+            interface: *interface,
+            opts: hosts_opts.clone(),
         }
+        .publish(&snapshot)?;
 
         println!();
         log::info!("updated interface {}\n", interface.as_str_lossy().yellow());
@@ -340,29 +337,28 @@ impl ChangeAction {
     }
 }
 
-fn print_peer_diff(peers: &[Peer], diff: &PeerDiff) {
-    let public_key = diff.public_key().to_base64();
+fn print_peer_diff(peers: &[Peer], diff: &Realized) {
+    let public_key = &diff.public_key;
 
-    let change_action = match (diff.old, diff.new) {
-        (None, Some(_)) => ChangeAction::Added,
-        (Some(_), Some(_)) => ChangeAction::Modified,
-        (Some(_), None) => ChangeAction::Removed,
-        _ => unreachable!("PeerDiff can't be None -> None"),
+    let change_action = match (diff.existed, &diff.new) {
+        (false, _) => ChangeAction::Added,
+        (true, Some(_)) => ChangeAction::Modified,
+        (true, None) => ChangeAction::Removed,
     };
 
     // Grab the peer name from either the new data, or the historical data (if the peer is removed).
-    let peer_hostname = match diff.new {
+    let peer_hostname = match &diff.new {
         Some(peer) => Some(peer.name.clone()),
         None => peers
             .iter()
-            .find(|p| p.public_key == public_key)
+            .find(|p| &p.public_key == public_key)
             .map(|p| p.name.clone()),
     };
     let peer_name = peer_hostname.as_deref().unwrap_or("[unknown]");
 
     if change_action == ChangeAction::Modified
         && diff
-            .changes()
+            .changes
             .iter()
             .all(|c| *c == PeerChange::NatTraverseReattempt)
     {
@@ -378,7 +374,7 @@ fn print_peer_diff(peers: &[Peer], diff: &PeerDiff) {
         change_action.colored_output(),
     );
 
-    for change in diff.changes() {
+    for change in &diff.changes {
         if let PeerChange::Endpoint { .. } = change {
             log::info!("    {}", change);
         } else {
