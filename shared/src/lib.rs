@@ -18,6 +18,7 @@ mod netlink;
 pub mod peer;
 pub mod prefix;
 pub mod prompts;
+pub mod tls;
 pub mod types;
 pub mod wg;
 pub mod xeddsa;
