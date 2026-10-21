@@ -1,4 +1,4 @@
-use anyhow::{bail, Context as _, Error};
+use anyhow::{bail, ensure, Context as _, Error};
 use innernet_node::{
     db::CreateHook,
     store::{self, StoredCidr},
@@ -9,6 +9,7 @@ use innernet_shared::{
     IoErrorContext, Peer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
+use rusqlite::OptionalExtension as _;
 use serde::Deserialize;
 use std::{
     fs::OpenOptions,
@@ -242,6 +243,32 @@ impl DataStore {
                 }
             })
             .collect())
+    }
+
+    /// Whether the peer with `public_key` is known to speak TLS.
+    pub fn speaks_tls(&self, public_key: &str) -> Result<bool, Error> {
+        let speaks_tls = self
+            .store
+            .query_row(
+                "SELECT tls FROM peers WHERE public_key = ?1",
+                [store::key_to_bytes(public_key)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(speaks_tls.unwrap_or(false))
+    }
+
+    /// Records for good that the peer with `public_key` speaks TLS. The peer must be recorded.
+    pub fn latch_tls(&mut self, public_key: &str) -> Result<(), Error> {
+        let updated = self.store.execute(
+            "UPDATE peers SET tls = 1 WHERE public_key = ?1",
+            [store::key_to_bytes(public_key)?],
+        )?;
+        ensure!(
+            updated == 1,
+            "no peer with the public key {public_key} is recorded"
+        );
+        Ok(())
     }
 
     /// The CIDRs, ordered by prefix and numbered from 1, each with the smallest CIDR that holds it
@@ -740,6 +767,27 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn test_tls_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+        let key = &BASE_PEERS[0].public_key;
+        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+
+        // A peer isn't known to speak TLS until it is latched, which only a recorded peer can be.
+        assert!(!store.speaks_tls(key).unwrap());
+        assert!(!store.speaks_tls(unknown).unwrap());
+        assert!(store.latch_tls(unknown).is_err());
+        store.latch_tls(key).unwrap();
+        assert!(store.speaks_tls(key).unwrap());
+
+        // The latch survives updates of the peer and reopening the data store.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        let store = open(dir.path(), false).unwrap();
+        assert!(store.speaks_tls(key).unwrap());
     }
 
     #[test]
