@@ -793,12 +793,12 @@ dependencies = [
  "anyhow",
  "colored",
  "env_logger",
+ "innernet-node",
  "innernet-shared",
  "ipnet",
  "log",
  "once_cell",
  "rusqlite",
- "rusqlite_migration",
  "serde",
  "serde_json",
  "tempfile",
@@ -812,6 +812,19 @@ name = "innernet-domain"
 version = "2.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "innernet-node"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "innernet-shared",
+ "ipnet",
+ "log",
+ "rusqlite",
+ "rusqlite_migration",
+ "wireguard-control",
 ]
 
 [[package]]

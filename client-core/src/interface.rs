@@ -12,7 +12,7 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
@@ -222,7 +222,7 @@ pub fn fetch(
     let state = match rest_client.http::<State>("GET", "/user/state") {
         Ok(state) => Some(state),
         Err(e) if e.is_transport_error() => {
-            if store.peers().is_empty() {
+            if store.peers()?.is_empty() {
                 bail!(
                     "Could not connect to the innernet server and there are no cached peers, \
                      exiting."
@@ -260,14 +260,14 @@ pub fn fetch(
             endpoint_override
         );
     }
-    let peers = store.peers();
+    let peers = store.peers()?;
 
     let device = Device::get(interface, network_opts.backend)?;
-    let modifications = device.diff(peers, config.peer_endpoint_overrides());
+    let modifications = device.diff(&peers, config.peer_endpoint_overrides());
 
     let updates = modifications
         .iter()
-        .inspect(|diff| print_peer_diff(&store, diff))
+        .inspect(|diff| print_peer_diff(&peers, diff))
         .cloned()
         .map(PeerConfigBuilder::from)
         .collect::<Vec<_>>();
@@ -340,7 +340,7 @@ impl ChangeAction {
     }
 }
 
-fn print_peer_diff(store: &DataStore, diff: &PeerDiff) {
+fn print_peer_diff(peers: &[Peer], diff: &PeerDiff) {
     let public_key = diff.public_key().to_base64();
 
     let change_action = match (diff.old, diff.new) {
@@ -353,8 +353,7 @@ fn print_peer_diff(store: &DataStore, diff: &PeerDiff) {
     // Grab the peer name from either the new data, or the historical data (if the peer is removed).
     let peer_hostname = match diff.new {
         Some(peer) => Some(peer.name.clone()),
-        None => store
-            .peers()
+        None => peers
             .iter()
             .find(|p| p.public_key == public_key)
             .map(|p| p.name.clone()),

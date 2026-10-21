@@ -565,13 +565,14 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
     let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
 
+    let cidrs = data_store.cidrs()?;
     if tree {
-        let cidr_tree = CidrTree::new(data_store.cidrs());
+        let cidr_tree = CidrTree::new(&cidrs);
         colored::control::set_override(false);
         print_tree(&cidr_tree, &[], 0, false, &config);
         colored::control::unset_override();
     } else {
-        for cidr in data_store.cidrs() {
+        for cidr in &cidrs {
             println!("{} {}", cidr.cidr, cidr.name);
         }
     }
@@ -824,7 +825,7 @@ fn override_peer_endpoint(
     let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
 
     if let Some((peer, endpoint_opt)) = prompts::override_peer_endpoint_prompt(
-        data_store.peers(),
+        &data_store.peers()?,
         config.peer_endpoint_overrides(),
         &sub_opts,
     )? {
@@ -962,8 +963,8 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
             },
         };
 
-        let peers = store.peers();
-        let cidrs = store.cidrs();
+        let peers = store.peers()?;
+        let cidrs = store.cidrs()?;
         let me = peers
             .iter()
             .find(|p| p.public_key == public_key)
@@ -993,7 +994,7 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
         let verbose = opts.verbose > 0;
 
         if tree {
-            let cidr_tree = CidrTree::new(cidrs);
+            let cidr_tree = CidrTree::new(&cidrs);
             print_tree(&cidr_tree, &peer_states, 1, verbose, &interface_config);
         } else {
             for peer_state in peer_states {

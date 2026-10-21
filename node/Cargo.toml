@@ -1,0 +1,20 @@
+[package]
+authors = ["webstrand <webstrand@gmail.com>"]
+categories = ["network-programming"]
+description = "The core that every innernet peer runs: what it stores of the other peers of its network."
+edition = "2021"
+keywords.workspace = true
+license = "MIT"
+name = "innernet-node"
+publish = false
+repository = "https://github.com/tonarino/innernet"
+version = "2.0.0"
+
+[dependencies]
+anyhow = "1"
+innernet-shared = { version = "2.0.0", path = "../shared" }
+ipnet = "2.4"
+log = "0.4"
+rusqlite.workspace = true
+rusqlite_migration = "2.6.0"
+wireguard-control = { version = "2.0.0", path = "../wireguard-control" }

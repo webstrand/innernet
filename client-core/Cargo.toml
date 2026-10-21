@@ -20,11 +20,11 @@ version = "2.0.0"
 [dependencies]
 anyhow = "1"
 colored.workspace = true
+innernet-node = { version = "2.0.0", path = "../node" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = "2.4"
 log = "0.4"
 rusqlite.workspace = true
-rusqlite_migration = "2.6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
