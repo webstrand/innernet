@@ -141,7 +141,8 @@ async fn update_keypair(
         "Registering keypair with server (at {}).",
         config.server.internal_endpoint
     );
-    RestClient::new(&config.server)
+    let rest_client = RestClient::new(&config, false)?;
+    rest_client
         .http_form::<_, ()>(
             "POST",
             "/user/redeem",
@@ -150,6 +151,9 @@ async fn update_keypair(
             },
         )
         .await?;
+    // The server authenticated with the key of the invitation if it answered over TLS.
+    let speaks_tls = rest_client.speaks_tls();
+    drop(rest_client);
 
     config.interface.private_key = keypair.private.to_base64();
     config
@@ -161,7 +165,13 @@ async fn update_keypair(
     );
 
     DataStore::open_or_create(data_dir, interface, &config)
-        .and_then(|mut store| store.introduce(&config))
+        .and_then(|mut store| {
+            store.introduce(&config)?;
+            if speaks_tls {
+                store.latch_tls(&config.server.public_key)?;
+            }
+            Ok(())
+        })
         .map_err(RedeemInviteError::DataStoreIntroduction)?;
 
     log::info!("Changing keys and waiting 5s for server's WireGuard interface to transition.",);
@@ -287,10 +297,11 @@ pub async fn round(
             events: state.events.clone(),
         }),
     };
+    let store = DataStore::open_or_create(data_dir, interface, &config)?;
     let mut link = RemoteLink {
         interface: *interface,
-        store: DataStore::open_or_create(data_dir, interface, &config)?,
-        rest_client: RestClient::new(&config.server),
+        store,
+        rest_client: RestClient::for_interface(&config, data_dir, interface)?,
         fetched: false,
     };
     let round = node.round(&mut link).await?;

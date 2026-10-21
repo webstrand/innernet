@@ -550,10 +550,9 @@ async fn add_cidr(
     opts: &Opts,
     sub_opts: AddCidrOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     log::info!("Fetching CIDRs");
-    let rest_client = RestClient::new(&server);
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
     let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
 
     if let Some(cidr_request) = prompts::add_cidr(&cidrs, &sub_opts)? {
@@ -583,9 +582,8 @@ async fn rename_cidr(
     opts: &Opts,
     sub_opts: RenameCidrOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
@@ -615,10 +613,9 @@ async fn delete_cidr(
     opts: &Opts,
     sub_opts: DeleteCidrOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     println!("Fetching eligible CIDRs");
-    let rest_client = RestClient::new(&server);
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
 
@@ -657,9 +654,8 @@ async fn add_peer(
     opts: &Opts,
     sub_opts: AddPeerOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching CIDRs");
     let cidrs = rest_client.get_cidrs().await?;
@@ -671,8 +667,15 @@ async fn add_peer(
         prompts::gather_new_peer_info(&peers, &cidr_tree, &sub_opts)?
     {
         log::info!("Creating peer...");
-        let (peer, invitation) =
-            create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info).await?;
+        let (peer, invitation) = create_peer(
+            &opts.config_dir,
+            &opts.data_dir,
+            interface,
+            &cidrs,
+            &peers,
+            new_peer_info,
+        )
+        .await?;
 
         invitation.save_new(&target_path)?;
         prompts::print_invitation_info(&peer, &target_path);
@@ -688,9 +691,8 @@ async fn rename_peer(
     opts: &Opts,
     sub_opts: RenamePeerOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching peers");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
@@ -722,9 +724,8 @@ async fn enable_or_disable_peer(
     sub_opts: EnableDisablePeerOpts,
     enable: bool,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching peers.");
     let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
@@ -747,9 +748,8 @@ async fn add_association(
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
@@ -791,9 +791,8 @@ async fn delete_association(
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
 ) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
@@ -814,9 +813,8 @@ async fn delete_association(
 }
 
 async fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::new(&server);
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
@@ -878,7 +876,7 @@ async fn override_endpoint(
     let endpoint_contents = if sub_opts.unset {
         prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
     } else {
-        let server_capabilities = get_server_capabilities(&config).await?;
+        let server_capabilities = get_server_capabilities(&config, opts, interface).await?;
         let port = match config.interface.listen_port {
             Some(port) => port,
             None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
@@ -889,7 +887,7 @@ async fn override_endpoint(
 
     if let Some(contents) = endpoint_contents {
         log::info!("requesting endpoint update...");
-        RestClient::new(&config.server)
+        RestClient::for_interface(&config, &opts.data_dir, interface)?
             .http_form::<_, ()>("PUT", "/user/endpoint", contents)
             .await?;
         log::info!(
@@ -989,8 +987,12 @@ fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, E
         || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
 }
 
-async fn get_server_capabilities(config: &InterfaceConfig) -> Result<ServerCapabilities, Error> {
-    let rest_client = RestClient::new(&config.server);
+async fn get_server_capabilities(
+    config: &InterfaceConfig,
+    opts: &Opts,
+    interface: &InterfaceName,
+) -> Result<ServerCapabilities, Error> {
+    let rest_client = RestClient::for_interface(config, &opts.data_dir, interface)?;
     let maybe_info: Result<ServerCapabilities, RestError> =
         rest_client.http("GET", "/user/capabilities").await;
     match maybe_info {

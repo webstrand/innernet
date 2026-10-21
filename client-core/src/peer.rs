@@ -25,6 +25,7 @@ pub enum CreatePeerError {
 /// Create a new innernet [`Peer`] and a [`PeerInvitation`] they can use to join the network.
 pub async fn create_peer(
     config_dir: &Path,
+    data_dir: &Path,
     interface: &InterfaceName,
     existing_cidrs: &[Cidr],
     existing_peers: &[Peer],
@@ -32,7 +33,7 @@ pub async fn create_peer(
 ) -> Result<(Peer, PeerInvitation), CreatePeerError> {
     let interface_config = InterfaceConfig::from_interface(config_dir, interface)
         .map_err(CreatePeerError::InterfaceConfigAccess)?;
-    let rest_client = RestClient::new(&interface_config.server);
+    let rest_client = RestClient::for_interface(&interface_config, data_dir, interface)?;
 
     let keypair = KeyPair::generate();
     let peer_contents = new_peer_info.into_peer_contents(&keypair);
