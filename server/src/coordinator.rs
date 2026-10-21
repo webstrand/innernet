@@ -242,8 +242,14 @@ async fn routes(
     if components.pop_front().as_deref() != Some("v1") {
         Err(ServerError::NotFound)
     } else {
-        let session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
         let component = components.pop_front();
+        // The admin API exists only over TLS: in plain HTTP its paths are not found, before the
+        // peer is identified. An admin that predates TLS is an ordinary peer in plain HTTP until
+        // its client is upgraded.
+        if component.as_deref() == Some("admin") && client_key.is_none() {
+            return Err(ServerError::NotFound);
+        }
+        let session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
         match component.as_deref() {
             Some("user") => api::user::routes(req, components, session).await,
             Some("admin") => api::admin::routes(req, components, session).await,
@@ -359,18 +365,14 @@ mod tests {
     #[tokio::test]
     async fn test_peers_require_tls_from_creation() -> Result<(), Error> {
         let server = test::Server::new()?;
-        for (id, ip, path) in [
-            (test::ADMIN_PEER_ID, test::ADMIN_PEER_IP, "/v1/admin/peers"),
-            (
-                test::DEVELOPER1_PEER_ID,
-                test::DEVELOPER1_PEER_IP,
-                "/v1/user/state",
-            ),
+        for (id, ip) in [
+            (test::ADMIN_PEER_ID, test::ADMIN_PEER_IP),
+            (test::DEVELOPER1_PEER_ID, test::DEVELOPER1_PEER_IP),
         ] {
             assert!(requires_tls(&server, id));
-            let res = server.plain_request(ip, "GET", path).await;
+            let res = server.plain_request(ip, "GET", "/v1/user/state").await;
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-            let res = server.request(ip, "GET", path).await;
+            let res = server.request(ip, "GET", "/v1/user/state").await;
             assert_eq!(res.status(), StatusCode::OK);
         }
         Ok(())

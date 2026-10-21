@@ -557,9 +557,9 @@ mod tests {
         let server = test::Server::new()?;
 
         let path = if cfg!(feature = "v6-test") {
-            format!("http://[{}]/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://[{}]/v1/user/state", test::WG_MANAGE_PEER_IP)
         } else {
-            format!("http://{}/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://{}/v1/user/state", test::WG_MANAGE_PEER_IP)
         };
         let req = Request::builder()
             .uri(path)
@@ -591,9 +591,9 @@ mod tests {
         let key = Key::generate_private().get_public();
 
         let path = if cfg!(feature = "v6-test") {
-            format!("http://[{}]/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://[{}]/v1/user/state", test::WG_MANAGE_PEER_IP)
         } else {
-            format!("http://{}/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://{}/v1/user/state", test::WG_MANAGE_PEER_IP)
         };
         // Request from an unknown IP, trying to disguise as an admin using HTTP headers.
         let req = Request::builder()
@@ -620,9 +620,9 @@ mod tests {
         let server = test::Server::new()?;
 
         let path = if cfg!(feature = "v6-test") {
-            format!("http://[{}]/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://[{}]/v1/user/state", test::WG_MANAGE_PEER_IP)
         } else {
-            format!("http://{}/v1/admin/peers", test::WG_MANAGE_PEER_IP)
+            format!("http://{}/v1/user/state", test::WG_MANAGE_PEER_IP)
         };
         let req = Request::builder()
             .uri(path)

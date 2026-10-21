@@ -429,6 +429,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_routes_not_in_plain_http() -> Result<(), Error> {
+        // An admin that predates TLS is an ordinary peer in plain HTTP until it upgrades: the
+        // admin API exists only over TLS.
+        let server = test::Server::new()?;
+        server.predate_tls(test::ADMIN_PEER_ID);
+        let old_peers = DatabasePeer::list(&server.db().lock())?;
+        let peer_path = format!("/v1/admin/peers/{}", test::USER1_PEER_ID);
+        for (method, path) in [
+            ("GET", "/v1/admin/peers"),
+            ("POST", "/v1/admin/peers"),
+            ("PUT", &peer_path),
+            ("DELETE", &peer_path),
+            ("GET", "/v1/admin/cidrs"),
+            ("GET", "/v1/admin/associations"),
+        ] {
+            let res = server
+                .plain_request(test::ADMIN_PEER_IP, method, path)
+                .await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let res = server
+            .plain_request(test::ADMIN_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let peers = |peers: Vec<DatabasePeer>| -> Vec<Peer> {
+            peers.into_iter().map(|peer| peer.inner).collect()
+        };
+        assert_eq!(
+            peers(DatabasePeer::list(&server.db().lock())?),
+            peers(old_peers)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delete() -> Result<(), Error> {
         let server = test::Server::new()?;
         let old_peers = DatabasePeer::list(&server.db().lock())?;
