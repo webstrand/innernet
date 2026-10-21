@@ -8,7 +8,6 @@ use anyhow::anyhow;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_shared::{Cidr, CidrContents, Error, PeerContents};
 use parking_lot::{Mutex, RwLock};
-use rusqlite::Connection;
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
@@ -107,8 +106,13 @@ impl Server {
 
         let interface = interface.parse().unwrap();
         // Add developer CIDR and user CIDR and some peers for testing.
-        let db = Connection::open(conf.database_path(&interface))?;
-        db.pragma_update(None, "foreign_keys", 1)?;
+        let config = crate::ConfigFile::from_file(conf.config_path(&interface))?;
+        let server_key = Key::from_base64(&config.private_key)?.get_public();
+        let db = crate::db::open(
+            &conf.database_path(&interface),
+            config.network(),
+            &server_key,
+        )?;
         assert_eq!(ADMIN_CIDR_ID, create_cidr(&db, "admin", ADMIN_CIDR)?.id);
         assert_eq!(
             ADMIN_PEER_ID,
@@ -166,7 +170,7 @@ impl Server {
         })
     }
 
-    pub fn db(&self) -> Arc<Mutex<Connection>> {
+    pub fn db(&self) -> Db {
         self.db.clone()
     }
 
@@ -236,7 +240,7 @@ impl Server {
     }
 }
 
-pub fn create_cidr(db: &Connection, name: &str, cidr_str: &str) -> Result<Cidr, Error> {
+pub fn create_cidr(db: &rusqlite::Connection, name: &str, cidr_str: &str) -> Result<Cidr, Error> {
     let cidr = DatabaseCidr::create(
         db,
         CidrContents {

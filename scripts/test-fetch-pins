@@ -73,12 +73,19 @@ for peer in alice bob; do
     client "$peer" fetch e2e --no-write-hosts >/dev/null 2>&1
 done
 
+# Prints a field of a client's config.
+config() { # <peer> <key>
+    sed -n "s|^$2 = \"\(.*\)\"$|\1|p" "$work/$1/conf/e2e.conf"
+}
+
 # Mallory's endpoint: its own key, bob's innernet IP, and alice as its only peer.
-alice_ip=$(db "SELECT ip FROM peers WHERE name = 'alice'")
-alice_key=$(db "SELECT public_key FROM peers WHERE name = 'alice'")
-bob_ip=$(db "SELECT ip FROM peers WHERE name = 'bob'")
-bob_key=$(db "SELECT public_key FROM peers WHERE name = 'bob'")
-coordination_server_key=$(db "SELECT public_key FROM peers WHERE ip = '10.66.0.1'")
+alice_ip=$(config alice address)
+alice_ip=${alice_ip%/*}
+alice_key=$(config alice private-key | wg pubkey)
+bob_ip=$(config bob address)
+bob_ip=${bob_ip%/*}
+bob_key=$(config bob private-key | wg pubkey)
+coordination_server_key=$(config alice public-key)
 mallory_private=$(wg genkey)
 mallory_key=$(echo "$mallory_private" | wg pubkey)
 ns mallory ip link add wg0 type wireguard
@@ -111,7 +118,15 @@ $(show_alice_interface)
 --- The coordination server replaces bob's key and endpoint with mallory's, and alice fetches -----
 
 EOF
-db "UPDATE peers SET public_key = '$mallory_key', endpoint = '6.6.6.6:51820' WHERE name = 'bob'"
+# The server keys its peers by their raw public keys, and holds endpoints apart. Its record of bob,
+# with bob's address, moves to mallory's key, with mallory's endpoint.
+mallory_hex=$(echo "$mallory_key" | base64 -d | od -An -tx1 | tr -d ' \n')
+bob_hex=$(echo "$bob_key" | base64 -d | od -An -tx1 | tr -d ' \n')
+db "UPDATE peers SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex';
+    UPDATE prefix_pins SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex';
+    DELETE FROM endpoints WHERE public_key IN (x'$bob_hex', x'$mallory_hex');
+    INSERT INTO endpoints (public_key, kind, position, address, port)
+    VALUES (x'$mallory_hex', 0, 0, x'06060606', 51820);"
 fetch_status=0
 client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
 echo "    (fetch exited with status $fetch_status)"

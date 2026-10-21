@@ -7,28 +7,32 @@ use clap::Parser;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Input};
 use indoc::printdoc;
+use innernet_node::Store;
 use innernet_publicip::Preference;
 use innernet_shared::{
     prompts, CidrContents, Endpoint, IpNetExt, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
-use rusqlite::{params, Connection};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    os::unix::fs::OpenOptionsExt,
+};
 use wireguard_control::KeyPair;
 
-fn create_database<P: AsRef<Path>>(
-    database_path: P,
-) -> Result<Connection, Box<dyn std::error::Error>> {
-    let conn = Connection::open(&database_path)?;
-    conn.pragma_update(None, "foreign_keys", 1)?;
-    // TODO(strohel): set stricter permissions on the db file?
-    conn.execute(db::peer::CREATE_TABLE_SQL, params![])?;
-    conn.execute(db::association::CREATE_TABLE_SQL, params![])?;
-    conn.execute(db::cidr::CREATE_TABLE_SQL, params![])?;
-    conn.pragma_update(None, "user_version", db::CURRENT_VERSION)?;
-    log::debug!("set database version to db::CURRENT_VERSION");
-
-    Ok(conn)
+/// Creates the database at `database_path`, which mustn't exist, with mode 0600, of the schema of
+/// every node and the coordinator's annex, for the network `network`.
+fn create_database(
+    database_path: &Path,
+    network: IpNet,
+    server_key: &wireguard_control::Key,
+) -> Result<Store, Error> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(database_path)?;
+    drop(file);
+    db::open(database_path, network, server_key)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Parser)]
@@ -63,11 +67,11 @@ struct DbInitData {
     endpoint: Endpoint,
 }
 
-fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), Error> {
+fn populate_database(store: &Store, db_init_data: DbInitData) -> Result<(), Error> {
     const SERVER_NAME: &str = "innernet-server";
 
     let root_cidr = DatabaseCidr::create(
-        conn,
+        store,
         CidrContents {
             name: db_init_data.network_name.clone(),
             cidr: db_init_data.network_cidr,
@@ -77,7 +81,7 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
     .map_err(|_| anyhow!("failed to create root CIDR"))?;
 
     let server_cidr = DatabaseCidr::create(
-        conn,
+        store,
         CidrContents {
             name: SERVER_NAME.into(),
             cidr: db_init_data.server_cidr,
@@ -85,9 +89,11 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
         },
     )
     .map_err(|_| anyhow!("failed to create innernet-server CIDR"))?;
+    // Every peer sees the peers of the server's CIDR.
+    DatabaseCidr::set_infra(store, server_cidr.id)?;
 
-    let _me = DatabasePeer::create(
-        conn,
+    DatabasePeer::create(
+        store,
         PeerContents {
             name: SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?,
             ip: db_init_data.our_ip,
@@ -202,13 +208,13 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
     //                  if any errors occur in these init calls.
 
     let database_path = conf.database_path(&name);
-    let conn = create_database(&database_path).map_err(|_| {
+    let store = create_database(&database_path, root_cidr, &our_keypair.public).map_err(|e| {
         anyhow!(
-            "failed to create database {}",
+            "failed to create database {} {e:#}",
             "(are you not running as root?)".bold()
         )
     })?;
-    populate_database(&conn, db_init_data)?;
+    populate_database(&store, db_init_data)?;
 
     println!(
         "{} Created database at {}\n",

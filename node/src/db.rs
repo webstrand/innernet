@@ -123,7 +123,16 @@ pub struct Scope<'a> {
     network: IpNet,
 }
 
-impl Scope<'_> {
+impl<'a> Scope<'a> {
+    /// The store as `conn`, a connection to a node's database or a transaction of it, sees it, for
+    /// the network `network`.
+    pub fn new(conn: &'a Connection, network: IpNet) -> Self {
+        Self {
+            conn,
+            network: network.trunc(),
+        }
+    }
+
     pub fn network(&self) -> IpNet {
         self.network
     }

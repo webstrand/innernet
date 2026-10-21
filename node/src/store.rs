@@ -391,3 +391,17 @@ pub fn replace_cidrs(conn: &Connection, cidrs: &[StoredCidr]) -> Result<(), rusq
     }
     Ok(())
 }
+
+/// Records `cidr`. The database refuses a prefix or a name that another CIDR has.
+pub fn insert_cidr(conn: &Connection, cidr: &StoredCidr) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO cidrs (address, prefix_len, name, infra) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            ip_to_bytes(cidr.prefix.first()),
+            cidr.prefix.prefix_len(),
+            cidr.name,
+            cidr.infra
+        ],
+    )?;
+    Ok(())
+}

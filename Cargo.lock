@@ -843,6 +843,7 @@ dependencies = [
  "dialoguer",
  "hyper",
  "indoc",
+ "innernet-node",
  "innernet-publicip",
  "innernet-shared",
  "ipnet",

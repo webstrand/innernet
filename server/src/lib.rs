@@ -4,14 +4,16 @@ use db::{DatabaseCidr, DatabasePeer};
 use dialoguer::Confirm;
 use hyper::{http, server::conn::AddrStream, Body, Request, Response};
 use indoc::printdoc;
+use innernet_node::{
+    realize::{TunnelBackend as _, WireGuard},
+    snapshot, Store,
+};
 use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
-    prompts, update_hosts_file,
-    wg::{self, DeviceExt},
-    AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, Error,
-    HostsOpts, Interface, IoErrorContext, NetworkOpts, PeerContents, RenameCidrOpts,
-    RenamePeerOpts, INNERNET_PUBKEY_HEADER,
+    prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
+    EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
+    PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
@@ -30,9 +32,7 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use wireguard_control::{
-    Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder,
-};
+use wireguard_control::{Backend, Device, InterfaceName, Key, KeyPair};
 
 mod api;
 mod db;
@@ -46,7 +46,7 @@ pub use error::ServerError;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-type Db = Arc<Mutex<Connection>>;
+type Db = Arc<Mutex<Store>>;
 type Endpoints = Arc<RwLock<HashMap<String, SocketAddr>>>;
 
 #[derive(Clone)]
@@ -94,6 +94,13 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
+    /// The prefix of the whole network.
+    pub fn network(&self) -> IpNet {
+        IpNet::new(self.address, self.network_cidr_prefix)
+            .map(|net| net.trunc())
+            .unwrap_or_else(|_| IpNet::from(self.address))
+    }
+
     pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
         let mut invitation_file = OpenOptions::new()
             .write(true)
@@ -162,10 +169,12 @@ impl ServerConfig {
     }
 }
 
+/// Opens the database of `interface`, for the network of its config, migrating a database of
+/// 2.0.0, whose coordinator is the peer with the public key of the config's private key.
 fn open_database_connection(
     interface: &InterfaceName,
     conf: &ServerConfig,
-) -> Result<rusqlite::Connection, Error> {
+) -> Result<Store, Error> {
     let database_path = conf.database_path(interface);
     if !Path::new(&database_path).exists() {
         bail!(
@@ -173,13 +182,13 @@ fn open_database_connection(
             database_path.to_string_lossy()
         );
     }
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let server_key = Key::from_base64(&config.private_key)?.get_public();
 
-    // TODO(strohel): warn about too open permissions on the db file?
-    let conn = Connection::open(&database_path)?;
-    // Foreign key constraints aren't on in SQLite by default. Enable.
-    conn.pragma_update(None, "foreign_keys", 1)?;
-    db::auto_migrate(&conn)?;
-    Ok(conn)
+    let file = File::open(&database_path).with_path(&database_path)?;
+    innernet_shared::warn_on_dangerous_mode(&file, &database_path).with_path(&database_path)?;
+    drop(file);
+    db::open(&database_path, config.network(), &server_key)
 }
 
 pub fn add_peer(
@@ -422,30 +431,24 @@ fn spawn_endpoint_refresher(interface: InterfaceName, network: NetworkOpts) -> E
 }
 
 /// Brings the peers of the WireGuard interface in line with the database, which is their source of
-/// truth: every enabled peer of the database is added to the interface or updated on it, and every
-/// other peer, disabled or no longer in the database, is removed from it. The server's own peer is
-/// left as it is.
+/// truth: every enabled peer of the snapshot that the server's node makes of the database is added
+/// to the interface or updated on it, and every other peer, disabled or no longer in the database,
+/// is removed from it. The server's own peer is left as it is.
 pub(crate) fn reconcile_interface(
     conn: &Connection,
     interface: &InterfaceName,
     backend: Backend,
 ) -> Result<(), ServerError> {
-    let device = Device::get(interface, backend).map_err(|_| ServerError::WireGuard)?;
     let peers = DatabasePeer::list(conn)?
         .into_iter()
-        .map(|peer| peer.inner)
-        .collect::<Vec<_>>();
-    let updates = device
-        .diff(&peers, &BTreeMap::new())
-        .into_iter()
-        .map(PeerConfigBuilder::from)
-        .collect::<Vec<_>>();
-    if !updates.is_empty() {
-        DeviceUpdate::new()
-            .add_peers(&updates)
-            .apply(interface, backend)
-            .map_err(|_| ServerError::WireGuard)?;
+        .map(|peer| peer.inner.contents);
+    WireGuard {
+        interface: *interface,
+        backend,
+        endpoint_overrides: BTreeMap::new(),
     }
+    .realize(&snapshot::snapshot(peers))
+    .map_err(|_| ServerError::WireGuard)?;
     Ok(())
 }
 
