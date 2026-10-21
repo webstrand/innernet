@@ -1,131 +1,138 @@
+use hyper::{client::HttpConnector, header, Body, Client, Method, Request, StatusCode};
 use innernet_shared::{
     interface_config::ServerInfo, Cidr, CidrContents, Peer, PeerContents, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use std::{io, time::Duration};
+use std::time::Duration;
 use thiserror::Error;
-use ureq::{Agent, AgentBuilder};
+
+/// How long a request may take. Some platforms, such as OpenBSD, can take longer to complete the
+/// first WireGuard handshake, so a lower timeout could fail a request that would succeed.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A REST client that can be used to communicate with an innernet REST server.
 ///
 /// We recommend to use the high level API (like [`Self::create_peer()`]) when possible and fall
 /// back on the low level [`Self::http()`] and [`Self::http_form()`] otherwise.
 pub struct RestClient<'a> {
-    agent: Agent,
+    client: Client<HttpConnector>,
     server: &'a ServerInfo,
 }
 
 impl<'a> RestClient<'a> {
     /// Create a [`Self`] to communicate with an innernet server described by [`ServerInfo`].
     pub fn new(server: &'a ServerInfo) -> Self {
-        let agent = AgentBuilder::new()
-            // Some platforms (e.g. OpenBSD) can take longer to complete the first WireGuard
-            // handshake, hence a lower timeout value could result in an unwarranted failure
-            .timeout(Duration::from_secs(10))
-            .redirects(0)
-            .build();
-        Self { agent, server }
+        Self {
+            client: Client::new(),
+            server,
+        }
     }
 
-    pub fn create_cidr(&self, cidr_contents: &CidrContents) -> Result<Cidr, RestError> {
-        let cidr = self.http_form("POST", "/admin/cidrs", cidr_contents)?;
-        Ok(cidr)
+    pub async fn create_cidr(&self, cidr_contents: &CidrContents) -> Result<Cidr, RestError> {
+        self.http_form("POST", "/admin/cidrs", cidr_contents).await
     }
 
-    pub fn get_cidrs(&self) -> Result<Vec<Cidr>, RestError> {
-        let cidrs = self.http("GET", "/admin/cidrs")?;
-        Ok(cidrs)
+    pub async fn get_cidrs(&self) -> Result<Vec<Cidr>, RestError> {
+        self.http("GET", "/admin/cidrs").await
     }
 
-    pub fn create_peer(&self, peer_contents: &PeerContents) -> Result<Peer, RestError> {
-        let peer = self.http_form("POST", "/admin/peers", peer_contents)?;
-        Ok(peer)
+    pub async fn create_peer(&self, peer_contents: &PeerContents) -> Result<Peer, RestError> {
+        self.http_form("POST", "/admin/peers", peer_contents).await
     }
 
-    pub fn get_peers(&self) -> Result<Vec<Peer>, RestError> {
-        let peers = self.http("GET", "/admin/peers")?;
-        Ok(peers)
+    pub async fn get_peers(&self) -> Result<Vec<Peer>, RestError> {
+        self.http("GET", "/admin/peers").await
     }
 
-    #[allow(clippy::result_large_err)]
     /// Perform a `verb` HTTP request at the given `endpoint`.
     ///
-    /// Example: `rest_client.http("GET", "/admin/peers")?;`.
-    pub fn http<T: DeserializeOwned>(&self, verb: &str, endpoint: &str) -> Result<T, RestError> {
-        self.request::<(), _>(verb, endpoint, None)
+    /// Example: `rest_client.http("GET", "/admin/peers").await?;`.
+    pub async fn http<T: DeserializeOwned>(
+        &self,
+        verb: &str,
+        endpoint: &str,
+    ) -> Result<T, RestError> {
+        self.request::<(), _>(verb, endpoint, None).await
     }
 
     /// Send serializable data using a `verb` HTTP request at the given `endpoint`
     ///
-    /// Example: `rest_client.http_form("POST", "/admin/peers", PeerContents { .. })?;`.
-    #[allow(clippy::result_large_err)]
-    pub fn http_form<S: Serialize, T: DeserializeOwned>(
+    /// Example: `rest_client.http_form("POST", "/admin/peers", PeerContents { .. }).await?;`.
+    pub async fn http_form<S: Serialize, T: DeserializeOwned>(
         &self,
         verb: &str,
         endpoint: &str,
         form: S,
     ) -> Result<T, RestError> {
-        self.request(verb, endpoint, Some(form))
+        self.request(verb, endpoint, Some(form)).await
     }
 
-    #[allow(clippy::result_large_err)]
-    fn request<S: Serialize, T: DeserializeOwned>(
+    async fn request<S: Serialize, T: DeserializeOwned>(
         &self,
         verb: &str,
         endpoint: &str,
         form: Option<S>,
     ) -> Result<T, RestError> {
-        let request = self
-            .agent
-            .request(
-                verb,
-                &format!("http://{}/v1{}", self.server.internal_endpoint, endpoint),
-            )
-            .set(INNERNET_PUBKEY_HEADER, &self.server.public_key);
-
-        let result = if let Some(form) = form {
-            let payload = serde_json::to_value(form).map_err(RestError::RequestSerialize)?;
-            request.send_json(payload)
-        } else {
-            request.call()
-        };
-        let response = result.map_err(|e| RestError::RequestSend(Box::new(e)))?;
-
-        let mut response = response.into_string().map_err(RestError::ResponseRead)?;
-        // A little trick for serde to parse an empty response as `()`.
-        if response.is_empty() {
-            response = "null".into();
+        let method = Method::from_bytes(verb.as_bytes()).map_err(|_| RestError::Method)?;
+        let request = Request::builder()
+            .method(method)
+            .uri(format!(
+                "http://{}/v1{}",
+                self.server.internal_endpoint, endpoint
+            ))
+            .header(INNERNET_PUBKEY_HEADER, &self.server.public_key);
+        let request = match form {
+            Some(form) => {
+                let payload = serde_json::to_vec(&form).map_err(RestError::RequestSerialize)?;
+                request
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload))
+            },
+            None => request.body(Body::empty()),
         }
-        serde_json::from_str(&response).map_err(RestError::ResponseDeserialize)
+        .map_err(|_| RestError::Method)?;
+
+        let response = tokio::time::timeout(TIMEOUT, async {
+            let response = self.client.request(request).await?;
+            let status = response.status();
+            let body = hyper::body::to_bytes(response.into_body()).await?;
+            Ok::<_, hyper::Error>((status, body))
+        })
+        .await
+        .map_err(|_| RestError::Timeout)?;
+        let (status, body) = response.map_err(RestError::Transport)?;
+        if !status.is_success() {
+            return Err(RestError::Status(status));
+        }
+
+        // A little trick for serde to parse an empty response as `()`.
+        let body: &[u8] = if body.is_empty() { b"null" } else { &body };
+        serde_json::from_slice(body).map_err(RestError::ResponseDeserialize)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum RestError {
     #[error("Error sending request: {0}")]
-    RequestSend(Box<ureq::Error>),
+    Transport(hyper::Error),
+    #[error("The request timed out after {}s", TIMEOUT.as_secs())]
+    Timeout,
+    #[error("The server answered with {0}")]
+    Status(StatusCode),
+    #[error("Invalid request method")]
+    Method,
     #[error("Error serializing request: {0}")]
     RequestSerialize(serde_json::Error),
     #[error("Error deserializing response: {0}")]
     ResponseDeserialize(serde_json::Error),
-    #[error("Error reading response: {0}")]
-    ResponseRead(io::Error),
 }
 
 impl RestError {
     pub fn has_status_of(&self, status: u16) -> bool {
-        if let RestError::RequestSend(error) = self {
-            matches!(**error, ureq::Error::Status(s, _) if s == status)
-        } else {
-            false
-        }
+        matches!(self, RestError::Status(s) if s.as_u16() == status)
     }
 
     pub fn is_transport_error(&self) -> bool {
-        if let RestError::RequestSend(error) = self {
-            matches!(**error, ureq::Error::Transport(_))
-        } else {
-            false
-        }
+        matches!(self, RestError::Transport(_) | RestError::Timeout)
     }
 }

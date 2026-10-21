@@ -23,7 +23,7 @@ pub enum CreatePeerError {
 }
 
 /// Create a new innernet [`Peer`] and a [`PeerInvitation`] they can use to join the network.
-pub fn create_peer(
+pub async fn create_peer(
     config_dir: &Path,
     interface: &InterfaceName,
     existing_cidrs: &[Cidr],
@@ -36,7 +36,7 @@ pub fn create_peer(
 
     let keypair = KeyPair::generate();
     let peer_contents = new_peer_info.into_peer_contents(&keypair);
-    let peer = rest_client.create_peer(&peer_contents)?;
+    let peer = rest_client.create_peer(&peer_contents).await?;
 
     let cidr_tree = CidrTree::new(existing_cidrs);
     let address = &cidr_tree

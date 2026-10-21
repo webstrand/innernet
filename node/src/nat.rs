@@ -2,43 +2,42 @@
 //!
 //! Doesn't follow the specific ICE protocol, but takes great inspiration from RFC 8445
 //! and applies it to a protocol more specific to innernet.
+//!
+//! Each step tries the next candidate of every peer that hasn't connected. The node's runtime
+//! takes the steps on timers, [`STEP_INTERVAL`] apart, so that the handshakes with the endpoints
+//! of a step have time to complete before the next.
 
-use innernet_shared::interface_config::InterfaceConfig;
-use std::time::{Duration, Instant};
-
+use crate::realize::Realized;
 use anyhow::Error;
-use innernet_node::realize::Realized;
 use innernet_shared::{
     wg::{DeviceExt, PeerInfoExt},
     Endpoint, Peer,
 };
+use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
 pub const STEP_INTERVAL: Duration = Duration::from_secs(5);
 
-pub struct NatTraverse<'a> {
-    interface: &'a InterfaceName,
+pub struct NatTraverse {
+    interface: InterfaceName,
     backend: Backend,
     remaining: Vec<Peer>,
 }
 
-impl<'a> NatTraverse<'a> {
+impl NatTraverse {
+    /// The traversal of the peers that `diffs` changed on `interface`, but for those whose
+    /// endpoint `endpoint_overrides` overrides.
     pub fn new(
-        interface: &'a InterfaceName,
-        interface_config: &InterfaceConfig,
+        interface: InterfaceName,
         backend: Backend,
-        realized: &[Realized],
+        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+        diffs: &[Realized],
     ) -> Result<Self, Error> {
         // Filter out removed peers from diffs list.
-        let mut remaining: Vec<_> = realized
+        let mut remaining: Vec<_> = diffs
             .iter()
-            .filter_map(|realized| realized.new.as_ref())
-            // Don't attempt NAT traversal for peers with an overridden endpoint.
-            .filter(|peer| {
-                !interface_config
-                    .peer_endpoint_overrides()
-                    .contains_key(&peer.ip)
-            })
+            .filter_map(|diff| diff.new.as_ref())
+            .filter(|peer| !endpoint_overrides.contains_key(&peer.ip))
             .cloned()
             .collect();
 
@@ -81,8 +80,8 @@ impl<'a> NatTraverse<'a> {
 
     /// Refreshes the current state of candidate traversal attempts, filtering out
     /// the peers that have been exhausted of all endpoint options.
-    fn refresh_remaining(&mut self) -> Result<(), Error> {
-        let device = Device::get(self.interface, self.backend)?;
+    pub fn refresh_remaining(&mut self) -> Result<(), Error> {
+        let device = Device::get(&self.interface, self.backend)?;
         // Remove connected and missing peers
         self.remaining.retain(|peer| {
             if let Some(peer_info) = device.get_peer(&peer.public_key) {
@@ -90,14 +89,14 @@ impl<'a> NatTraverse<'a> {
                 if recently_connected {
                     log::debug!(
                         "peer {} removed from NAT traverser (connected!).",
-                        peer.name
+                        &*peer.name
                     );
                 }
                 !recently_connected
             } else {
                 log::debug!(
                     "peer {} removed from NAT traverser (no longer on interface).",
-                    peer.name
+                    &*peer.name
                 );
                 false
             }
@@ -108,6 +107,7 @@ impl<'a> NatTraverse<'a> {
         Ok(())
     }
 
+    /// Sets the endpoint of every peer that hasn't connected to its next candidate.
     pub fn step(&mut self) -> Result<(), Error> {
         self.refresh_remaining()?;
 
@@ -115,7 +115,7 @@ impl<'a> NatTraverse<'a> {
         let candidate_updates = self.remaining.iter_mut().filter_map(|peer| {
             let endpoint = peer.candidates.pop();
             if let Some(endpoint) = &endpoint {
-                log::debug!("trying endpoint {} for peer {}", endpoint, peer.name);
+                log::debug!("trying endpoint {} for peer {}", endpoint, &*peer.name);
             }
             set_endpoint(&peer.public_key, endpoint.as_ref())
         });
@@ -124,19 +124,7 @@ impl<'a> NatTraverse<'a> {
 
         DeviceUpdate::new()
             .add_peers(&updates)
-            .apply(self.interface, self.backend)?;
-
-        let start = Instant::now();
-        while start.elapsed() < STEP_INTERVAL {
-            self.refresh_remaining()?;
-
-            if self.is_finished() {
-                log::debug!("NAT traverser is finished!");
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
+            .apply(&self.interface, self.backend)?;
         Ok(())
     }
 }

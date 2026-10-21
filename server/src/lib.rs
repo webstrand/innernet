@@ -440,6 +440,7 @@ pub(crate) fn reconcile_interface(
         interface: *interface,
         backend,
         endpoint_overrides: BTreeMap::new(),
+        events: Default::default(),
     }
     .realize(&snapshot::snapshot(peers))
     .map_err(|_| ServerError::WireGuard)?;

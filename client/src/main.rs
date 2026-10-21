@@ -6,10 +6,15 @@ use dialoguer::{Confirm, Input};
 use indoc::eprintdoc;
 use innernet_client_core::{
     data_store::DataStore,
-    interface::{fetch, redeem_invite},
+    interface::{fetch, redeem_invite, round},
     peer::create_peer,
     rest_client::{RestClient, RestError},
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
+};
+use innernet_node::{
+    addresses,
+    events::EventSource,
+    runtime::{self, Triggers},
 };
 use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
@@ -20,10 +25,10 @@ use innernet_shared::{
     WrappedIoError,
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io,
     path::{Path, PathBuf},
-    thread,
     time::Duration,
 };
 use util::{human_duration, human_size};
@@ -273,7 +278,7 @@ enum Command {
     },
 }
 
-fn install(
+async fn install(
     opts: &Opts,
     hosts_opts: &HostsOpts,
     install_opts: &InstallOpts,
@@ -306,7 +311,8 @@ fn install(
         &opts.network,
         &interface_name,
         config,
-    )?;
+    )
+    .await?;
 
     let mut fetch_success = false;
     for _ in 0..3 {
@@ -319,12 +325,13 @@ fn install(
             &interface_name,
             true,
         )
+        .await
         .is_ok()
         {
             fetch_success = true;
             break;
         }
-        thread::sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     if !fetch_success {
         log::warn!(
@@ -401,20 +408,21 @@ fn install(
     Ok(())
 }
 
-fn up(
+async fn up(
     specific_interface: Option<Interface>,
     opts: &Opts,
     loop_interval: Option<Duration>,
     hosts_opts: HostsOpts,
     nat_opts: &NatOpts,
 ) -> Result<(), Error> {
-    loop {
-        let interfaces = match &specific_interface {
+    let installed = || -> Result<Vec<Interface>, Error> {
+        Ok(match &specific_interface {
             Some(iface) => vec![iface.clone()],
             None => all_installed(&opts.config_dir)?,
-        };
-
-        for interface in interfaces {
+        })
+    };
+    let Some(interval) = loop_interval else {
+        for interface in installed()? {
             fetch(
                 &opts.config_dir,
                 &opts.data_dir,
@@ -423,17 +431,74 @@ fn up(
                 nat_opts,
                 &interface,
                 true,
-            )?;
+            )
+            .await?;
         }
+        return Ok(());
+    };
 
-        match loop_interval {
-            Some(interval) => thread::sleep(interval),
-            None => break,
+    // Each interface runs its node's rounds in a task of its own, at the interval, whenever the
+    // host's addresses change, and on the timers of NAT traversal. The interfaces are listed again
+    // at each interval, so that one installed or uninstalled meanwhile starts or stops.
+    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        let interfaces = match installed() {
+            Ok(interfaces) => interfaces,
+            Err(e) => {
+                log::error!("failed to list the installed interfaces: {e:#}");
+                continue;
+            },
+        };
+        running.retain(|name, task| {
+            let installed = interfaces
+                .iter()
+                .any(|interface| interface.to_string() == *name);
+            if !installed {
+                task.abort();
+            }
+            installed
+        });
+        for interface in interfaces {
+            if running.contains_key(&interface.to_string()) {
+                continue;
+            }
+            let (config_dir, data_dir, network) =
+                (opts.config_dir.clone(), opts.data_dir.clone(), opts.network);
+            let (hosts, nat) = (hosts_opts.clone(), nat_opts.clone());
+            let name = interface.to_string();
+            let task = tokio::task::spawn_local(async move {
+                let events = EventSource::default();
+                let triggers = Triggers {
+                    changed: None,
+                    interval: Some(interval),
+                    addresses: addresses::Watcher::new(ADDRESS_SETTLE)
+                        .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
+                        .ok(),
+                };
+                runtime::run(triggers, async || {
+                    round(
+                        &config_dir,
+                        &data_dir,
+                        &network,
+                        &hosts,
+                        &nat,
+                        &interface,
+                        true,
+                        &events,
+                    )
+                    .await
+                })
+                .await
+            });
+            running.insert(name, task);
         }
     }
-
-    Ok(())
 }
+
+/// How long the watcher of the host's addresses waits for a burst of changes to settle.
+const ADDRESS_SETTLE: Duration = Duration::from_millis(200);
 
 fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Error> {
     let config = InterfaceConfig::get_path(&opts.config_dir, interface);
@@ -480,16 +545,20 @@ fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Er
     Ok(())
 }
 
-fn add_cidr(interface: &InterfaceName, opts: &Opts, sub_opts: AddCidrOpts) -> Result<(), Error> {
+async fn add_cidr(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddCidrOpts,
+) -> Result<(), Error> {
     let InterfaceConfig { server, .. } =
         InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     log::info!("Fetching CIDRs");
     let rest_client = RestClient::new(&server);
-    let cidrs: Vec<Cidr> = rest_client.get_cidrs()?;
+    let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
 
     if let Some(cidr_request) = prompts::add_cidr(&cidrs, &sub_opts)? {
         log::info!("Creating CIDR...");
-        let cidr: Cidr = rest_client.create_cidr(&cidr_request)?;
+        let cidr: Cidr = rest_client.create_cidr(&cidr_request).await?;
 
         eprintdoc!(
             "
@@ -509,7 +578,7 @@ fn add_cidr(interface: &InterfaceName, opts: &Opts, sub_opts: AddCidrOpts) -> Re
     Ok(())
 }
 
-fn rename_cidr(
+async fn rename_cidr(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: RenameCidrOpts,
@@ -519,7 +588,7 @@ fn rename_cidr(
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
 
     if let Some((cidr_request, old_name)) = prompts::rename_cidr(&cidrs, &sub_opts)? {
         log::info!("Renaming CIDR...");
@@ -530,7 +599,9 @@ fn rename_cidr(
             .ok_or_else(|| anyhow!("CIDR not found."))?
             .id;
 
-        rest_client.http_form::<_, ()>("PUT", &format!("/admin/cidrs/{id}"), cidr_request)?;
+        rest_client
+            .http_form::<_, ()>("PUT", &format!("/admin/cidrs/{id}"), cidr_request)
+            .await?;
         log::info!("CIDR renamed.");
     } else {
         log::info!("Exited without renaming CIDR.");
@@ -539,7 +610,7 @@ fn rename_cidr(
     Ok(())
 }
 
-fn delete_cidr(
+async fn delete_cidr(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: DeleteCidrOpts,
@@ -548,13 +619,15 @@ fn delete_cidr(
         InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     println!("Fetching eligible CIDRs");
     let rest_client = RestClient::new(&server);
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
 
     let cidr_id = prompts::delete_cidr(&cidrs, &peers, &sub_opts)?;
 
     println!("Deleting CIDR...");
-    rest_client.http::<()>("DELETE", &format!("/admin/cidrs/{cidr_id}"))?;
+    rest_client
+        .http::<()>("DELETE", &format!("/admin/cidrs/{cidr_id}"))
+        .await?;
 
     println!("CIDR deleted.");
 
@@ -579,15 +652,19 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
     Ok(())
 }
 
-fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Result<(), Error> {
+async fn add_peer(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddPeerOpts,
+) -> Result<(), Error> {
     let InterfaceConfig { server, .. } =
         InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
-    let cidrs = rest_client.get_cidrs()?;
+    let cidrs = rest_client.get_cidrs().await?;
     log::info!("Fetching peers");
-    let peers = rest_client.get_peers()?;
+    let peers = rest_client.get_peers().await?;
     let cidr_tree = CidrTree::new(&cidrs[..]);
 
     if let Some((new_peer_info, target_path)) =
@@ -595,7 +672,7 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
     {
         log::info!("Creating peer...");
         let (peer, invitation) =
-            create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info)?;
+            create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info).await?;
 
         invitation.save_new(&target_path)?;
         prompts::print_invitation_info(&peer, &target_path);
@@ -606,7 +683,7 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
     Ok(())
 }
 
-fn rename_peer(
+async fn rename_peer(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: RenamePeerOpts,
@@ -616,7 +693,7 @@ fn rename_peer(
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching peers");
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
 
     if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
         log::info!("Renaming peer...");
@@ -628,7 +705,9 @@ fn rename_peer(
             .next()
             .ok_or_else(|| anyhow!("Peer not found."))?;
 
-        rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), peer_request)?;
+        rest_client
+            .http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), peer_request)
+            .await?;
         log::info!("Peer renamed.");
     } else {
         log::info!("exited without renaming peer.");
@@ -637,7 +716,7 @@ fn rename_peer(
     Ok(())
 }
 
-fn enable_or_disable_peer(
+async fn enable_or_disable_peer(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: EnableDisablePeerOpts,
@@ -648,12 +727,14 @@ fn enable_or_disable_peer(
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching peers.");
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
 
     if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
         let Peer { id, mut contents } = peer;
         contents.is_disabled = !enable;
-        rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)?;
+        rest_client
+            .http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)
+            .await?;
     } else {
         log::info!("exiting without enabling or disabling peer.");
     }
@@ -661,7 +742,7 @@ fn enable_or_disable_peer(
     Ok(())
 }
 
-fn add_association(
+async fn add_association(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
@@ -671,7 +752,7 @@ fn add_association(
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
 
     let association = if let (Some(ref cidr1), Some(ref cidr2)) = (&sub_opts.cidr1, &sub_opts.cidr2)
     {
@@ -691,19 +772,21 @@ fn add_association(
         return Ok(());
     };
 
-    rest_client.http_form::<_, ()>(
-        "POST",
-        "/admin/associations",
-        AssociationContents {
-            cidr_id_1: association.0.id,
-            cidr_id_2: association.1.id,
-        },
-    )?;
+    rest_client
+        .http_form::<_, ()>(
+            "POST",
+            "/admin/associations",
+            AssociationContents {
+                cidr_id_1: association.0.id,
+                cidr_id_2: association.1.id,
+            },
+        )
+        .await?;
 
     Ok(())
 }
 
-fn delete_association(
+async fn delete_association(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: AddDeleteAssociationOpts,
@@ -713,14 +796,16 @@ fn delete_association(
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
     log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations")?;
+    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
 
     if let Some(association) =
         prompts::delete_association(&associations[..], &cidrs[..], &sub_opts)?
     {
-        rest_client.http::<()>("DELETE", &format!("/admin/associations/{}", association.id))?;
+        rest_client
+            .http::<()>("DELETE", &format!("/admin/associations/{}", association.id))
+            .await?;
     } else {
         log::info!("exiting without adding association.");
     }
@@ -728,15 +813,15 @@ fn delete_association(
     Ok(())
 }
 
-fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
+async fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
     let InterfaceConfig { server, .. } =
         InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
     log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations")?;
+    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
 
     for association in associations {
         println!(
@@ -783,7 +868,7 @@ fn set_listen_port(
     Ok(())
 }
 
-fn override_endpoint(
+async fn override_endpoint(
     interface: &InterfaceName,
     opts: &Opts,
     sub_opts: OverrideEndpointOpts,
@@ -793,7 +878,7 @@ fn override_endpoint(
     let endpoint_contents = if sub_opts.unset {
         prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
     } else {
-        let server_capabilities = get_server_capabilities(&config)?;
+        let server_capabilities = get_server_capabilities(&config).await?;
         let port = match config.interface.listen_port {
             Some(port) => port,
             None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
@@ -804,7 +889,9 @@ fn override_endpoint(
 
     if let Some(contents) = endpoint_contents {
         log::info!("requesting endpoint update...");
-        RestClient::new(&config.server).http_form::<_, ()>("PUT", "/user/endpoint", contents)?;
+        RestClient::new(&config.server)
+            .http_form::<_, ()>("PUT", "/user/endpoint", contents)
+            .await?;
         log::info!(
             "endpoint override {}",
             if sub_opts.unset { "unset" } else { "set" }
@@ -902,10 +989,10 @@ fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, E
         || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
 }
 
-fn get_server_capabilities(config: &InterfaceConfig) -> Result<ServerCapabilities, Error> {
+async fn get_server_capabilities(config: &InterfaceConfig) -> Result<ServerCapabilities, Error> {
     let rest_client = RestClient::new(&config.server);
     let maybe_info: Result<ServerCapabilities, RestError> =
-        rest_client.http("GET", "/user/capabilities");
+        rest_client.http("GET", "/user/capabilities").await;
     match maybe_info {
         Ok(info) => Ok(info),
         Err(e) => {
@@ -1143,7 +1230,13 @@ fn main() {
     let opts = Opts::parse();
     util::init_logger(opts.verbose);
 
-    if let Err(e) = run(&opts) {
+    // Every command runs on one runtime, on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start the runtime");
+    let result = tokio::task::LocalSet::new().block_on(&runtime, run(&opts));
+    if let Err(e) = result {
         println!();
         log::error!("{:#}\n", e);
         if let Some(e) = e.downcast_ref::<WrappedIoError>() {
@@ -1156,7 +1249,7 @@ fn main() {
     }
 }
 
-fn run(opts: &Opts) -> Result<(), Error> {
+async fn run(opts: &Opts) -> Result<(), Error> {
     let command = opts.command.clone().unwrap_or(Command::Show {
         short: false,
         tree: false,
@@ -1170,7 +1263,7 @@ fn run(opts: &Opts) -> Result<(), Error> {
             hosts,
             install_opts,
             nat,
-        } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port)?,
+        } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port).await?,
         Command::Show {
             short,
             tree,
@@ -1189,7 +1282,8 @@ fn run(opts: &Opts) -> Result<(), Error> {
                 &nat,
                 &interface,
                 false,
-            )?;
+            )
+            .await?;
         },
         Command::Up {
             interface,
@@ -1197,53 +1291,56 @@ fn run(opts: &Opts) -> Result<(), Error> {
             hosts,
             nat,
             interval,
-        } => up(
-            interface,
-            opts,
-            daemon.then(|| Duration::from_secs(interval)),
-            hosts,
-            &nat,
-        )?,
+        } => {
+            up(
+                interface,
+                opts,
+                daemon.then(|| Duration::from_secs(interval)),
+                hosts,
+                &nat,
+            )
+            .await?
+        },
         Command::Down { interface } => wg::down(&interface, opts.network.backend)?,
         Command::Uninstall { interface, yes } => uninstall(&interface, opts, yes)?,
         Command::AddPeer {
             interface,
             sub_opts,
-        } => add_peer(&interface, opts, sub_opts)?,
+        } => add_peer(&interface, opts, sub_opts).await?,
         Command::RenamePeer {
             interface,
             sub_opts,
-        } => rename_peer(&interface, opts, sub_opts)?,
+        } => rename_peer(&interface, opts, sub_opts).await?,
         Command::AddCidr {
             interface,
             sub_opts,
-        } => add_cidr(&interface, opts, sub_opts)?,
+        } => add_cidr(&interface, opts, sub_opts).await?,
         Command::RenameCidr {
             interface,
             sub_opts,
-        } => rename_cidr(&interface, opts, sub_opts)?,
+        } => rename_cidr(&interface, opts, sub_opts).await?,
         Command::DeleteCidr {
             interface,
             sub_opts,
-        } => delete_cidr(&interface, opts, sub_opts)?,
+        } => delete_cidr(&interface, opts, sub_opts).await?,
         Command::ListCidrs { interface, tree } => list_cidrs(&interface, opts, tree)?,
         Command::DisablePeer {
             interface,
             sub_opts,
-        } => enable_or_disable_peer(&interface, opts, sub_opts, false)?,
+        } => enable_or_disable_peer(&interface, opts, sub_opts, false).await?,
         Command::EnablePeer {
             interface,
             sub_opts,
-        } => enable_or_disable_peer(&interface, opts, sub_opts, true)?,
+        } => enable_or_disable_peer(&interface, opts, sub_opts, true).await?,
         Command::AddAssociation {
             interface,
             sub_opts,
-        } => add_association(&interface, opts, sub_opts)?,
+        } => add_association(&interface, opts, sub_opts).await?,
         Command::DeleteAssociation {
             interface,
             sub_opts,
-        } => delete_association(&interface, opts, sub_opts)?,
-        Command::ListAssociations { interface } => list_associations(&interface, opts)?,
+        } => delete_association(&interface, opts, sub_opts).await?,
+        Command::ListAssociations { interface } => list_associations(&interface, opts).await?,
         Command::SetListenPort {
             interface,
             sub_opts,
@@ -1254,7 +1351,7 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => {
-            override_endpoint(&interface, opts, sub_opts)?;
+            override_endpoint(&interface, opts, sub_opts).await?;
         },
         Command::OverridePeerEndpoint {
             interface,

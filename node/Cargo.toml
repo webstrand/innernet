@@ -14,7 +14,12 @@ version = "2.0.0"
 anyhow = "1"
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = "2.4"
+libc = "0.2"
 log = "0.4"
 rusqlite.workspace = true
 rusqlite_migration = "2.6.0"
+tokio = { version = "1.28.0", features = ["macros", "net", "rt", "sync", "time"] }
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+
+[dev-dependencies]
+tokio = { version = "1.28.0", features = ["rt-multi-thread", "test-util"] }

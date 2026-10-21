@@ -20,6 +20,7 @@ version = "2.0.0"
 [dependencies]
 anyhow = "1"
 colored.workspace = true
+hyper = { version = "0.14", default-features = false, features = ["client", "http1", "runtime", "tcp"] }
 innernet-node = { version = "2.0.0", path = "../node" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = "2.4"
@@ -28,10 +29,11 @@ rusqlite.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
-ureq = { version = "2", default-features = false, features = ["json"] }
+tokio = { version = "1.28.0", features = ["macros", "rt", "time"] }
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
 
 [dev-dependencies]
+tokio = { version = "1.28.0", features = ["macros", "rt"] }
 once_cell = "1.17.1"
 tempfile = "3"
 env_logger = "0.7"

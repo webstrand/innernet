@@ -13,7 +13,8 @@ use std::{
     path::Path,
 };
 
-fn main() -> Result<(), Error> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Error> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let config_dir = Path::new(DEFAULT_CONFIG_DIR);
@@ -22,8 +23,8 @@ fn main() -> Result<(), Error> {
     let interface: InterfaceName = interface.parse()?;
     let interface_config = InterfaceConfig::from_interface(config_dir, &interface)?;
     let rest_client = RestClient::new(&interface_config.server);
-    let cidrs = rest_client.get_cidrs()?;
-    let peers = rest_client.get_peers()?;
+    let cidrs = rest_client.get_cidrs().await?;
+    let peers = rest_client.get_peers().await?;
 
     let new_peer_info = NewPeerInfo {
         name: "joe".parse().unwrap(),
@@ -34,7 +35,8 @@ fn main() -> Result<(), Error> {
     };
 
     let target_path = "invitation.toml";
-    let (peer, invitation) = create_peer(config_dir, &interface, &cidrs, &peers, new_peer_info)?;
+    let (peer, invitation) =
+        create_peer(config_dir, &interface, &cidrs, &peers, new_peer_info).await?;
     invitation.save_new(target_path)?;
     prompts::print_invitation_info(&peer, target_path);
 

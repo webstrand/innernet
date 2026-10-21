@@ -3,7 +3,11 @@
 //! [`WireGuard`] and [`HostsFile`]; another backend, such as an in-process WireGuard without a
 //! network device, implements the same trait.
 
-use crate::snapshot::Snapshot;
+use crate::{
+    events::{poll_wireguard, EventSource, TunnelEvents},
+    nat::NatTraverse,
+    snapshot::Snapshot,
+};
 use innernet_shared::{wg::DeviceExt as _, Endpoint, Error, HostsOpts, Peer, PeerChange};
 use std::{collections::BTreeMap, net::IpAddr};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
@@ -24,6 +28,16 @@ pub trait TunnelBackend {
     /// Brings the tunnel in line with `snapshot`: it holds every enabled peer of the snapshot, as
     /// the snapshot configures it, and no other. Returns what it changed of each peer.
     fn realize(&mut self, snapshot: &Snapshot) -> Result<Vec<Realized>, Error>;
+
+    /// The NAT traversal of the peers that `realized` changed, if the backend traverses NATs.
+    fn traverse(&self, _realized: &[Realized]) -> Result<Option<NatTraverse>, Error> {
+        Ok(None)
+    }
+
+    /// A subscription to what the tunnel observes of its peers, in the current runtime.
+    fn events(&self) -> TunnelEvents {
+        TunnelEvents::none()
+    }
 }
 
 /// The publisher of the names of a node.
@@ -40,6 +54,8 @@ pub struct WireGuard {
     /// The endpoint at which each peer is reached instead of the one that it states, by IP, as
     /// the node's config overrides them.
     pub endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
+    /// The source of the events of the interface, which polls the device.
+    pub events: EventSource,
 }
 
 impl TunnelBackend for WireGuard {
@@ -64,6 +80,23 @@ impl TunnelBackend for WireGuard {
                 .apply(&self.interface, self.backend)?;
         }
         Ok(realized)
+    }
+
+    fn traverse(&self, realized: &[Realized]) -> Result<Option<NatTraverse>, Error> {
+        NatTraverse::new(
+            self.interface,
+            self.backend,
+            &self.endpoint_overrides,
+            realized,
+        )
+        .map(Some)
+    }
+
+    fn events(&self) -> TunnelEvents {
+        let (interface, backend) = (self.interface, self.backend);
+        self.events.subscribe(|source| {
+            tokio::spawn(poll_wireguard(interface, backend, source));
+        })
     }
 }
 

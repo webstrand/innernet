@@ -16,7 +16,6 @@ use std::path::Path;
 
 pub mod data_store;
 pub mod interface;
-mod nat;
 pub mod peer;
 pub mod rest_client;
 
