@@ -3,9 +3,8 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::{DatabaseCidr, DatabasePeer},
-    reconcile_interface,
     util::{form_body, json_response, status_response},
-    Context, ServerError, Session,
+    ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
@@ -102,37 +101,21 @@ mod handlers {
 
         selected_peer.redeem(&conn, &form.public_key)?;
 
-        if cfg!(not(test)) {
-            let Context {
-                db,
-                interface,
-                backend,
-                ..
-            } = session.context.clone();
-
-            // If we were to modify the WireGuard interface immediately, the HTTP response wouldn't
-            // get through. Instead, we need to wait a reasonable amount for the HTTP response to
-            // flush, then update the interface.
-            //
-            // The client is also expected to wait the same amount of time after receiving a success
-            // response from /redeem.
-            //
-            // This might be avoidable if we were able to run code after we were certain the response
-            // had flushed over the TCP socket, but that isn't easily accessible from this high-level
-            // web framework.
-            //
-            // Related: https://github.com/hyperium/hyper/issues/2181
-            tokio::task::spawn(async move {
-                tokio::time::sleep(REDEEM_TRANSITION_WAIT).await;
-                log::info!(
-                    "WireGuard: replacing the invitation's key with {}'s",
-                    *selected_peer
-                );
-                if let Err(e) = reconcile_interface(&db.lock(), &interface, backend) {
-                    log::error!("{:?}", e);
-                }
-            });
-        }
+        session.context.invitations.notify_one();
+        // If the node were to change the WireGuard interface at once, the HTTP response wouldn't
+        // get through. Instead, the node is told after a wait long enough for the response to
+        // flush, which the client also waits after a success of /redeem.
+        //
+        // Related: https://github.com/hyperium/hyper/issues/2181
+        let changed = session.context.changed.clone();
+        tokio::task::spawn(async move {
+            tokio::time::sleep(REDEEM_TRANSITION_WAIT).await;
+            log::info!(
+                "WireGuard: replacing the invitation's key with {}'s",
+                *selected_peer
+            );
+            changed.notify();
+        });
         status_response(StatusCode::NO_CONTENT)
     }
 

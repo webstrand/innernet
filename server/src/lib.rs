@@ -1,27 +1,28 @@
 use anyhow::{anyhow, bail};
 use colored::*;
+use coordinator::{Coordinator, Hooks, Sockets};
 use db::{DatabaseCidr, DatabasePeer};
 use dialoguer::Confirm;
-use hyper::{http, server::conn::AddrStream, Body, Request, Response};
 use indoc::printdoc;
 use innernet_node::{
-    realize::{TunnelBackend as _, WireGuard},
-    snapshot, Store,
+    addresses,
+    events::{EventSource, TunnelEvent, TunnelEvents},
+    realize::{HostsFile, NamePublisher, TunnelBackend as _, WireGuard},
+    runtime::{self, Node, StoreChanged, Triggers},
+    Store,
 };
 use innernet_shared::{
-    get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
-    prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
-    EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
-    PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
+    prompts, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Error,
+    HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts, PeerContents, RenameCidrOpts,
+    RenamePeerOpts,
 };
 use ipnet::IpNet;
-use parking_lot::{Mutex, RwLock};
-use rusqlite::Connection;
+use node::LocalLink;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    convert::TryInto,
+    collections::BTreeMap,
     env,
     fs::{File, OpenOptions},
     io::prelude::*,
@@ -31,51 +32,25 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use subtle::ConstantTimeEq;
-use wireguard_control::{Backend, Device, InterfaceName, Key, KeyPair};
+use wireguard_control::{InterfaceName, Key, KeyPair};
 
 mod api;
+mod coordinator;
 mod db;
 mod error;
 pub mod initialize;
+mod node;
 #[cfg(test)]
 mod test;
 mod util;
 
 pub use error::ServerError;
 
+#[cfg(test)]
+pub(crate) use coordinator::{hyper_service, Context, Db};
+pub(crate) use coordinator::{Endpoints, Session};
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-type Db = Arc<Mutex<Store>>;
-type Endpoints = Arc<RwLock<HashMap<String, SocketAddr>>>;
-
-#[derive(Clone)]
-pub struct Context {
-    pub db: Db,
-    pub endpoints: Endpoints,
-    pub interface: InterfaceName,
-    pub backend: Backend,
-    pub public_key: Key,
-}
-
-pub struct Session {
-    pub context: Context,
-    pub peer: DatabasePeer,
-}
-
-impl Session {
-    pub fn admin_capable(&self) -> bool {
-        self.peer.is_admin && self.user_capable()
-    }
-
-    pub fn user_capable(&self) -> bool {
-        !self.peer.is_disabled && self.peer.is_redeemed
-    }
-
-    pub fn redeemable(&self) -> bool {
-        !self.peer.is_disabled && !self.peer.is_redeemed
-    }
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -195,7 +170,6 @@ pub fn add_peer(
     interface: &InterfaceName,
     conf: &ServerConfig,
     opts: AddPeerOpts,
-    network: NetworkOpts,
 ) -> Result<(), Error> {
     let config = ConfigFile::from_file(conf.config_path(interface))?;
     let conn = open_database_connection(interface, conf)?;
@@ -217,11 +191,6 @@ pub fn add_peer(
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
         let peer = DatabasePeer::create(&conn, peer_contents)?;
-        if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
-            reconcile_interface(&conn, interface, network.backend)?;
-
-            println!("adding to WireGuard interface: {}", *peer);
-        }
 
         let address = cidr_tree
             .ip_net_for(peer.ip)
@@ -265,7 +234,6 @@ pub fn enable_or_disable_peer(
     interface: &InterfaceName,
     conf: &ServerConfig,
     enable: bool,
-    network: NetworkOpts,
     opts: EnableDisablePeerOpts,
 ) -> Result<(), Error> {
     let conn = open_database_connection(interface, conf)?;
@@ -283,10 +251,6 @@ pub fn enable_or_disable_peer(
                 ..peer.contents.clone()
             },
         )?;
-
-        if Device::get(interface, network.backend).is_ok() {
-            reconcile_interface(&conn, interface, network.backend)?;
-        }
     } else {
         log::info!("exiting without enabling or disabling peer.");
     }
@@ -401,98 +365,7 @@ pub fn uninstall(
     Ok(())
 }
 
-fn spawn_endpoint_refresher(interface: InterfaceName, network: NetworkOpts) -> Endpoints {
-    let endpoints = Arc::new(RwLock::new(HashMap::new()));
-    tokio::task::spawn({
-        let endpoints = endpoints.clone();
-        async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                if let Ok(info) = Device::get(&interface, network.backend) {
-                    for peer in info.peers {
-                        if let Some(endpoint) = peer.config.endpoint {
-                            endpoints
-                                .write()
-                                .insert(peer.config.public_key.to_base64(), endpoint);
-                        }
-                    }
-                }
-            }
-        }
-    });
-    endpoints
-}
-
-/// Brings the peers of the WireGuard interface in line with the database, which is their source of
-/// truth: every enabled peer of the snapshot that the server's node makes of the database is added
-/// to the interface or updated on it, and every other peer, disabled or no longer in the database,
-/// is removed from it. The server's own peer is left as it is.
-pub(crate) fn reconcile_interface(
-    conn: &Connection,
-    interface: &InterfaceName,
-    backend: Backend,
-) -> Result<(), ServerError> {
-    let peers = DatabasePeer::list(conn)?
-        .into_iter()
-        .map(|peer| peer.inner.contents);
-    WireGuard {
-        interface: *interface,
-        backend,
-        endpoint_overrides: BTreeMap::new(),
-        events: Default::default(),
-    }
-    .realize(&snapshot::snapshot(peers))
-    .map_err(|_| ServerError::WireGuard)?;
-    Ok(())
-}
-
-fn spawn_expired_invite_sweeper(db: Db, interface: InterfaceName, backend: Backend) {
-    tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let conn = db.lock();
-            match DatabasePeer::delete_expired_invites(&conn) {
-                Ok(deleted) if deleted > 0 => {
-                    log::info!("Deleted {} expired peer invitations.", deleted);
-                    if let Err(e) = reconcile_interface(&conn, &interface, backend) {
-                        log::error!("Failed to remove expired peer invitations: {}", e);
-                    }
-                },
-                Err(e) => log::error!("Failed to delete expired peer invitations: {}", e),
-                _ => {},
-            }
-        }
-    });
-}
-
-fn spawn_hostfile_writer(db: Db, interface: InterfaceName, hosts_opts: HostsOpts) {
-    tokio::task::spawn({
-        async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-
-                match DatabasePeer::list_enabled(&db.lock()) {
-                    Ok(peers) => {
-                        if let Err(e) = update_hosts_file(
-                            &interface,
-                            &hosts_opts,
-                            peers.into_iter().map(|peer| peer.inner),
-                        ) {
-                            log::error!("Failed to write hostfile: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("Failed to list enabled peers for hostfile writing: {}", e)
-                    },
-                }
-            }
-        }
-    });
-}
-
+/// Runs the server's node and, beside it, the coordinator of the network of `interface`.
 pub async fn serve(
     interface: InterfaceName,
     conf: &ServerConfig,
@@ -501,8 +374,8 @@ pub async fn serve(
 ) -> Result<(), Error> {
     let config = ConfigFile::from_file(conf.config_path(&interface))?;
     log::debug!("opening database connection...");
-    let conn = open_database_connection(&interface, conf)?;
-    let public_key = check_database_matches_config(&conn, &config)?;
+    let store = open_database_connection(&interface, conf)?;
+    let public_key = check_database_matches_config(&store, &config)?;
 
     log::info!("bringing up interface.");
     wg::up(
@@ -514,65 +387,89 @@ pub async fn serve(
         &network,
     )?;
 
-    // The interface may be left over from an earlier run, with peers that have since been
-    // disabled or deleted.
-    reconcile_interface(&conn, &interface, network.backend)?;
-    log::info!("wireguard interface reconciled with the database.");
-
-    let candidates: Vec<Endpoint> = get_local_addrs()?
-        .map(|addr| SocketAddr::from((addr, config.listen_port)).into())
-        .collect();
-    let num_candidates = candidates.len();
-    let mut myself = DatabasePeer::own(&conn, &public_key)?;
-    myself.set_candidates(&conn, candidates)?;
-
-    log::info!(
-        "{} local candidates added to server peer config.",
-        num_candidates
-    );
-
-    let db = Arc::new(Mutex::new(conn));
-    let endpoints = spawn_endpoint_refresher(interface, network);
-    spawn_expired_invite_sweeper(db.clone(), interface, network.backend);
-
-    if !hosts_opts.no_write_hosts {
-        spawn_hostfile_writer(db.clone(), interface, hosts_opts);
-    }
-
-    let context = Context {
-        db,
-        endpoints,
+    let tunnel = WireGuard {
         interface,
-        public_key,
         backend: network.backend,
+        endpoint_overrides: BTreeMap::new(),
+        events: EventSource::default(),
     };
+    let endpoints = follow_endpoints(tunnel.events());
+    let db = Arc::new(Mutex::new(store));
+    let changed = StoreChanged::default();
+    let mut node = Node {
+        interface,
+        listen_port: config.listen_port,
+        nat: NatOpts {
+            no_nat_traversal: false,
+            exclude_nat_candidates: vec![],
+            no_nat_candidates: false,
+        },
+        tunnel: Box::new(tunnel),
+        names: (!hosts_opts.no_write_hosts).then(|| {
+            Box::new(HostsFile {
+                interface,
+                opts: hosts_opts.clone(),
+            }) as Box<dyn NamePublisher + Send>
+        }),
+    };
+    let mut link = LocalLink {
+        db: db.clone(),
+        key: public_key.clone(),
+    };
+    let triggers = Triggers {
+        changed: Some(changed.clone()),
+        interval: None,
+        addresses: addresses::Watcher::new(ADDRESS_SETTLE)
+            .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
+            .ok(),
+    };
+    let node_loop = runtime::run(triggers, async || node.round(&mut link).await);
 
     log::info!("innernet-server {} starting.", VERSION);
+    let coordinator = Coordinator::spawn(
+        public_key,
+        db,
+        Sockets {
+            api: get_listener((config.address, config.listen_port).into(), &interface)?,
+        },
+        Hooks { changed, endpoints },
+    )?;
+    tokio::select! {
+        () = node_loop => unreachable!("the node's loop runs forever"),
+        result = coordinator.join() => result,
+    }
+}
 
-    let listener = get_listener((config.address, config.listen_port).into(), &interface)?;
+/// How long the watcher of the host's addresses waits for a burst of changes to settle.
+const ADDRESS_SETTLE: Duration = Duration::from_millis(200);
 
-    let make_svc = hyper::service::make_service_fn(move |socket: &AddrStream| {
-        let remote_addr = socket.remote_addr();
-        let context = context.clone();
+/// The endpoints at which the tunnel observes the peers, as `events` report them.
+fn follow_endpoints(mut events: TunnelEvents) -> Endpoints {
+    let endpoints: Endpoints = Arc::default();
+    tokio::spawn({
+        let endpoints = endpoints.clone();
         async move {
-            Ok::<_, http::Error>(hyper::service::service_fn(move |req: Request<Body>| {
-                log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
-                hyper_service(req, context.clone(), remote_addr)
-            }))
+            while let Some(event) = events.next().await {
+                if let TunnelEvent::EndpointChanged {
+                    public_key,
+                    endpoint,
+                } = event
+                {
+                    endpoints.write().insert(public_key, endpoint);
+                }
+            }
         }
     });
-
-    let server = hyper::Server::from_tcp(listener)?.serve(make_svc);
-
-    server.await?;
-
-    Ok(())
+    endpoints
 }
 
 /// Checks, before the server starts anything, that the database holds the server's own peer, the
 /// one with the public key of the config's private key, and returns that key. Without it, the
 /// database and the config belong to different networks, or one of them was edited by hand.
-fn check_database_matches_config(conn: &Connection, config: &ConfigFile) -> Result<Key, Error> {
+fn check_database_matches_config(
+    conn: &rusqlite::Connection,
+    config: &ConfigFile,
+) -> Result<Key, Error> {
     let public_key = Key::from_base64(&config.private_key)?.get_public();
     if DatabasePeer::own(conn, &public_key).is_err() {
         bail!(
@@ -612,80 +509,12 @@ fn get_listener(addr: SocketAddr, _interface: &InterfaceName) -> Result<TcpListe
     Ok(listener)
 }
 
-pub(crate) async fn hyper_service(
-    req: Request<Body>,
-    context: Context,
-    remote_addr: SocketAddr,
-) -> Result<Response<Body>, http::Error> {
-    // Break the path into components.
-    let components: VecDeque<_> = req
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .map(String::from)
-        .collect();
-
-    routes(req, context, remote_addr, components)
-        .await
-        .or_else(TryInto::try_into)
-}
-
-async fn routes(
-    req: Request<Body>,
-    context: Context,
-    remote_addr: SocketAddr,
-    mut components: VecDeque<String>,
-) -> Result<Response<Body>, ServerError> {
-    // Must be "/v1/[something]"
-    if components.pop_front().as_deref() != Some("v1") {
-        Err(ServerError::NotFound)
-    } else {
-        let session = get_session(&req, context, remote_addr.ip())?;
-        let component = components.pop_front();
-        match component.as_deref() {
-            Some("user") => api::user::routes(req, components, session).await,
-            Some("admin") => api::admin::routes(req, components, session).await,
-            _ => Err(ServerError::NotFound),
-        }
-    }
-}
-
-fn get_session(
-    req: &Request<Body>,
-    context: Context,
-    addr: IpAddr,
-) -> Result<Session, ServerError> {
-    let pubkey = req
-        .headers()
-        .get(INNERNET_PUBKEY_HEADER)
-        .ok_or(ServerError::Unauthorized)?;
-    let pubkey = pubkey.to_str().map_err(|_| ServerError::Unauthorized)?;
-    let pubkey = Key::from_base64(pubkey).map_err(|_| ServerError::Unauthorized)?;
-    if pubkey
-        .as_bytes()
-        .ct_eq(context.public_key.as_bytes())
-        .into()
-    {
-        let peer = DatabasePeer::get_from_ip(&context.db.lock(), addr).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => ServerError::Unauthorized,
-            e => ServerError::Database(e),
-        })?;
-
-        if !peer.is_disabled {
-            return Ok(Session { context, peer });
-        }
-    }
-
-    Err(ServerError::Unauthorized)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test;
     use anyhow::Result;
-    use hyper::StatusCode;
+    use hyper::{Body, Request, StatusCode};
     use std::path::Path;
 
     #[test]

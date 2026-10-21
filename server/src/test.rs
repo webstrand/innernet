@@ -11,7 +11,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
-use wireguard_control::{Backend, InterfaceName, Key, KeyPair};
+use wireguard_control::{InterfaceName, Key, KeyPair};
 
 #[cfg(not(feature = "v6-test"))]
 mod v4 {
@@ -177,13 +177,10 @@ impl Server {
     pub fn context(&self) -> Context {
         Context {
             db: self.db.clone(),
-            interface: self.interface,
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
-            #[cfg(target_os = "linux")]
-            backend: Backend::Kernel,
-            #[cfg(not(target_os = "linux"))]
-            backend: Backend::Userspace,
+            changed: Default::default(),
+            invitations: Default::default(),
         }
     }
 

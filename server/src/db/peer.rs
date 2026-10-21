@@ -275,6 +275,15 @@ impl DatabasePeer {
             .collect())
     }
 
+    /// When the first of the invitations expires, if any does.
+    pub fn next_invite_expiry(conn: &Connection) -> Result<Option<SystemTime>, ServerError> {
+        Ok(store::load_peers(conn)?
+            .into_iter()
+            .filter(|peer| !peer.is_redeemed)
+            .filter_map(|peer| peer.invite_expires)
+            .min())
+    }
+
     /// Deletes the invitations that expired before now, each with what is pinned to its key.
     pub fn delete_expired_invites(conn: &Connection) -> Result<usize, ServerError> {
         let now = SystemTime::now();
@@ -287,5 +296,45 @@ impl DatabasePeer {
             store::forget_peer(conn, key)?;
         }
         Ok(expired.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test;
+    use innernet_shared::Error;
+    use std::time::Duration;
+
+    #[test]
+    fn test_invitations_expire() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let store = server.db();
+        let store = store.lock();
+        assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
+
+        // An invitation that has expired is the next to expire, and is deleted with its pin, so
+        // that its address can be offered again.
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:9"
+        } else {
+            "10.80.64.9"
+        };
+        let expires = SystemTime::now() - Duration::from_secs(60);
+        let invitation = PeerContents {
+            is_redeemed: false,
+            invite_expires: Some(expires),
+            ..test::developer_peer_contents("invited", ip)?
+        };
+        DatabasePeer::create(&store, invitation)?;
+        let next = DatabasePeer::next_invite_expiry(&store)?.unwrap();
+        assert!(next <= expires && next > expires - Duration::from_secs(1));
+        assert_eq!(DatabasePeer::delete_expired_invites(&store)?, 1);
+        assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
+        DatabasePeer::create(
+            &store,
+            test::developer_peer_contents("again", "10.80.64.9")?,
+        )?;
+        Ok(())
     }
 }

@@ -66,6 +66,8 @@ enum Command {
     },
 
     /// Add a peer to an existing network.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     AddPeer {
         interface: Interface,
 
@@ -73,7 +75,9 @@ enum Command {
         args: AddPeerOpts,
     },
 
-    /// Disable an enabled peer
+    /// Disable an enabled peer.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     DisablePeer {
         interface: Interface,
 
@@ -81,7 +85,9 @@ enum Command {
         args: EnableDisablePeerOpts,
     },
 
-    /// Enable a disabled peer
+    /// Enable a disabled peer.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     EnablePeer {
         interface: Interface,
 
@@ -90,6 +96,8 @@ enum Command {
     },
 
     /// Rename an existing peer.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     RenamePeer {
         interface: Interface,
 
@@ -98,6 +106,8 @@ enum Command {
     },
 
     /// Add a new CIDR to an existing network.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     AddCidr {
         interface: Interface,
 
@@ -106,6 +116,8 @@ enum Command {
     },
 
     /// Rename an existing CIDR.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     RenameCidr {
         interface: Interface,
 
@@ -114,6 +126,8 @@ enum Command {
     },
 
     /// Delete a CIDR.
+    ///
+    /// It writes the database; a running server's node picks the change up when it next starts.
     DeleteCidr {
         interface: Interface,
 
@@ -164,13 +178,13 @@ async fn run(opts: Opts) -> Result<(), anyhow::Error> {
             network: routing,
             hosts,
         } => serve(*interface, &conf, routing, hosts).await?,
-        Command::AddPeer { interface, args } => add_peer(&interface, &conf, args, opts.network)?,
+        Command::AddPeer { interface, args } => add_peer(&interface, &conf, args)?,
         Command::RenamePeer { interface, args } => rename_peer(&interface, &conf, args)?,
         Command::DisablePeer { interface, args } => {
-            enable_or_disable_peer(&interface, &conf, false, opts.network, args)?
+            enable_or_disable_peer(&interface, &conf, false, args)?
         },
         Command::EnablePeer { interface, args } => {
-            enable_or_disable_peer(&interface, &conf, true, opts.network, args)?
+            enable_or_disable_peer(&interface, &conf, true, args)?
         },
         Command::AddCidr { interface, args } => add_cidr(&interface, &conf, args)?,
         Command::RenameCidr { interface, args } => rename_cidr(&interface, &conf, args)?,
