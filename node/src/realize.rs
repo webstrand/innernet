@@ -1,14 +1,14 @@
 //! The output adapters, which realize a [`Snapshot`]: a [`TunnelBackend`], which configures the
-//! tunnel, and a [`NamePublisher`], which publishes the names. Each is a trait, implemented by
-//! [`WireGuard`] and [`HostsFile`]; another backend, such as an in-process WireGuard without a
-//! network device, implements the same trait.
+//! tunnel, and a [`NamePublisher`], which publishes the names. Each is a trait; [`WireGuard`]
+//! implements the tunnel, and another backend, such as an in-process WireGuard without a network
+//! device, implements the same trait.
 
 use crate::{
     events::{poll_wireguard, EventSource, TunnelEvents},
     nat::NatTraverse,
     snapshot::Snapshot,
 };
-use innernet_shared::{wg::DeviceExt as _, Endpoint, Error, HostsOpts, Peer, PeerChange};
+use innernet_shared::{wg::DeviceExt as _, Endpoint, Error, Peer, PeerChange};
 use std::{collections::BTreeMap, net::IpAddr};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
 
@@ -97,22 +97,5 @@ impl TunnelBackend for WireGuard {
         self.events.subscribe(|source| {
             tokio::spawn(poll_wireguard(interface, backend, source));
         })
-    }
-}
-
-/// The names written to the hosts file, under the hostnames that the host suffix gives them.
-pub struct HostsFile {
-    pub interface: InterfaceName,
-    pub opts: HostsOpts,
-}
-
-impl NamePublisher for HostsFile {
-    fn publish(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
-        innernet_shared::update_hosts_file(
-            &self.interface,
-            &self.opts,
-            snapshot.peers.iter().filter(|peer| !peer.is_disabled),
-        )?;
-        Ok(())
     }
 }

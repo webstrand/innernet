@@ -1,4 +1,4 @@
-use crate::{wg::PeerInfoExt, DEFAULT_HOSTS_PATH};
+use crate::wg::PeerInfoExt;
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -577,24 +577,45 @@ pub struct NetworkOpts {
 
 #[derive(Clone, Debug, Args)]
 pub struct HostsOpts {
-    /// The path to write hosts to
-    #[clap(long = "hosts-path", default_value = DEFAULT_HOSTS_PATH)]
-    pub hosts_path: PathBuf,
+    /// Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations
+    /// keep working.
+    #[clap(long = "hosts-path", hide = true)]
+    pub hosts_path: Option<PathBuf>,
 
-    /// Don't write to any hosts files
-    #[clap(long = "no-write-hosts", conflicts_with = "hosts_path")]
+    /// Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations
+    /// keep working.
+    #[clap(long = "no-write-hosts", hide = true)]
     pub no_write_hosts: bool,
 
     /// Use a different suffix for hosts, than 'INTERFACE.wg' , ex.
-    /// --host-suffix 'evilnet' names peers: PEER.evilnet, and
-    /// --host-suffix '' gives peers no suffix, just: PEER
+    /// --host-suffix 'evilnet' names peers: PEER.evilnet
     #[clap(long = "host-suffix", value_parser = parse_host_suffix)]
     pub host_suffix: Option<String>,
 }
 
-/// Parses a host suffix: empty, or labels that are each a valid hostname, separated by dots.
+impl HostsOpts {
+    /// Warns of the options of the hosts file, which innernet no longer writes, and of a host
+    /// suffix, since nothing publishes the names of the peers.
+    pub fn warn_of_hosts_file_options(&self) {
+        if self.hosts_path.is_some() || self.no_write_hosts {
+            log::warn!(
+                "innernet no longer writes a hosts file, so --hosts-path and --no-write-hosts \
+                 have no effect."
+            );
+        }
+        if self.host_suffix.is_some() {
+            log::warn!("nothing publishes the names of the peers, so --host-suffix has no effect.");
+        }
+    }
+}
+
+/// Parses a host suffix: labels that are each a valid hostname, separated by dots. An empty
+/// suffix, which named the peers in the hosts file by their bare names, is refused: every
+/// hostname lies under a suffix.
 fn parse_host_suffix(suffix: &str) -> Result<String, String> {
-    if suffix.is_empty() || suffix.split('.').all(Hostname::is_valid) {
+    if suffix.is_empty() {
+        Err("the host suffix must not be empty".to_string())
+    } else if suffix.split('.').all(Hostname::is_valid) {
         Ok(suffix.to_string())
     } else {
         Err("each dot-separated label must be a valid hostname".to_string())
@@ -1102,10 +1123,11 @@ mod tests {
 
     #[test]
     fn test_parse_host_suffix() {
-        for valid in ["", "evilnet", "wg.example.com"] {
+        for valid in ["evilnet", "wg.example.com"] {
             assert_eq!(parse_host_suffix(valid).as_deref(), Ok(valid));
         }
         for invalid in [
+            "",
             "evil net",
             "wg\nexample.com",
             "wg#1",

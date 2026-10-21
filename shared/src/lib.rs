@@ -1,7 +1,5 @@
 #![feature(ip)]
 
-use colored::Colorize;
-use hostsfile::HostsBuilder;
 use ipnet::IpNet;
 use std::{
     fs::{self, File, Permissions},
@@ -31,7 +29,6 @@ pub use types::*;
 pub const REDEEM_TRANSITION_WAIT: Duration = Duration::from_secs(5);
 pub const PERSISTENT_KEEPALIVE_INTERVAL_SECS: u16 = 25;
 pub const INNERNET_PUBKEY_HEADER: &str = "X-Innernet-Server-Key";
-pub const DEFAULT_HOSTS_PATH: &str = "/etc/hosts";
 
 pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
     for dir in dirs {
@@ -143,64 +140,23 @@ impl IpNetExt for IpNet {
     }
 }
 
-pub fn update_hosts_file(
-    interface: &InterfaceName,
-    opts: &HostsOpts,
-    peers: impl IntoIterator<Item = impl AsRef<Peer>>,
-) -> Result<(), WrappedIoError> {
-    if opts.no_write_hosts {
-        return Ok(());
+/// The zone under which the peers of `interface` are named: `host_suffix`, which the operator
+/// chooses, or `<interface>.wg` by default.
+pub fn host_zone(interface: &InterfaceName, host_suffix: Option<&str>) -> String {
+    match host_suffix {
+        Some(suffix) => suffix.to_string(),
+        None => format!("{interface}.wg"),
     }
-
-    let mut hosts_builder = HostsBuilder::new(format!("innernet {interface}"));
-    for peer in peers {
-        let peer = peer.as_ref();
-        match peer_hostname(interface, opts.host_suffix.as_deref(), &peer.contents.name) {
-            Some(peer_hostname) => hosts_builder.add_hostname(peer.contents.ip, peer_hostname),
-            None => log::warn!(
-                "omitting peer {} from the hosts file, since its name is not a valid hostname, \
-                 or without a host suffix not a single-label domain.",
-                peer.contents.public_key
-            ),
-        }
-    }
-    match hosts_builder
-        .write_to(opts.hosts_path.as_path())
-        .with_path(opts.hosts_path.as_path())
-    {
-        Ok(has_written) if has_written => {
-            log::info!(
-                "updated {} with the latest peers.",
-                opts.hosts_path.to_string_lossy().yellow()
-            )
-        },
-        Ok(_) => {},
-        Err(e) => log::warn!("failed to update hosts ({})", e),
-    };
-
-    Ok(())
 }
 
-/// The hostname of the peer `name` in the hosts file, or `None` if the peer must be omitted.
-///
-/// A peer name is written unescaped, so a name that isn't a valid hostname, such as one with a
-/// newline, could otherwise add any entry to the hosts file. With a suffix, which the operator
-/// chooses, the hostname is the peer name followed by the suffix. Without a suffix, the hostname
-/// is the peer name alone, which [`innernet_domain::is_canonical_domain_label`] must accept, so
-/// that it does not read as an address.
-fn peer_hostname(
+/// The hostname of the peer `name`, the name followed by the zone of [`host_zone`], or `None` if
+/// the name isn't a valid hostname.
+pub fn peer_hostname(
     interface: &InterfaceName,
     host_suffix: Option<&str>,
     name: &str,
 ) -> Option<String> {
-    if !Hostname::is_valid(name) {
-        return None;
-    }
-    match host_suffix {
-        None => Some(format!("{name}.{interface}.wg")),
-        Some("") => innernet_domain::is_canonical_domain_label(name).then(|| name.to_string()),
-        Some(suffix) => Some(format!("{name}.{suffix}")),
-    }
+    Hostname::is_valid(name).then(|| format!("{name}.{}", host_zone(interface, host_suffix)))
 }
 
 #[cfg(test)]
@@ -217,16 +173,13 @@ mod tests {
             hostname(Some("evilnet"), "peer-1").as_deref(),
             Some("peer-1.evilnet")
         );
-        assert_eq!(hostname(Some(""), "peer-1").as_deref(), Some("peer-1"));
 
-        // A name that a suffix follows may be a number, but without a suffix it must not be.
+        // A suffix always follows the name, so the name may be a number.
         assert_eq!(hostname(None, "08").as_deref(), Some("08.wg0.wg"));
         assert_eq!(
             hostname(Some("evilnet"), "08").as_deref(),
             Some("08.evilnet")
         );
-        assert_eq!(hostname(Some(""), "08"), None);
-        assert_eq!(hostname(Some(""), "0x7f000001"), None);
 
         // A name that isn't a valid hostname is omitted.
         assert_eq!(hostname(None, "peer\n10.0.0.1 example.com"), None);

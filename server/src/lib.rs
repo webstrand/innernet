@@ -7,7 +7,7 @@ use indoc::printdoc;
 use innernet_node::{
     addresses,
     events::{EventSource, TunnelEvent, TunnelEvents},
-    realize::{HostsFile, NamePublisher, TunnelBackend as _, WireGuard},
+    realize::{TunnelBackend as _, WireGuard},
     runtime::{self, Node, StoreChanged, Triggers},
     Store,
 };
@@ -372,6 +372,7 @@ pub async fn serve(
     network: NetworkOpts,
     hosts_opts: HostsOpts,
 ) -> Result<(), Error> {
+    hosts_opts.warn_of_hosts_file_options();
     let config = ConfigFile::from_file(conf.config_path(&interface))?;
     log::debug!("opening database connection...");
     let store = open_database_connection(&interface, conf)?;
@@ -405,12 +406,7 @@ pub async fn serve(
             no_nat_candidates: false,
         },
         tunnel: Box::new(tunnel),
-        names: (!hosts_opts.no_write_hosts).then(|| {
-            Box::new(HostsFile {
-                interface,
-                opts: hosts_opts.clone(),
-            }) as Box<dyn NamePublisher + Send>
-        }),
+        names: None,
     };
     let mut link = LocalLink {
         db: db.clone(),

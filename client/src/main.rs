@@ -358,10 +358,6 @@ async fn install(
 
             {interface} has been {installed}.
 
-            By default, innernet will write to your /etc/hosts file for peer name
-            resolution. To disable this behavior, use the --no-write-hosts or --write-hosts [PATH]
-            options.
-
             See the manpage or innernet GitHub repo for more detailed instruction on managing your
             interface and network. Have fun!
 

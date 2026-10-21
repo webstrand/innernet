@@ -233,16 +233,9 @@ You can omit `--locked` to use newer (but compatible) dependency versions, losin
 
 ## Development
 
-### Cargo build feature for SELinux
-
-If your target system uses SELinux, you will want to enable the 'selinux' feature when building the innernet binary.
-This will ensure that innernet maintains the correct selinux context on the /etc/hosts file when adding hosts.  To do so add ```--features selinux``` to the ```cargo build``` options.
-The `selinux-devel` package will need to be installed for the correct headers.
-
 ### `innernet-server` Build dependencies
 
 - `rustc` / `cargo` (version 1.50.0 or higher)
-- `libclang` (see more info at [https://crates.io/crates/clang-sys](https://crates.io/crates/clang-sys))
 - `libsqlite3`
 
 Build:
@@ -256,7 +249,6 @@ The resulting binary will be located at `./target/release/innernet-server`
 ### `innernet` Client CLI Build dependencies
 
 - `rustc` / `cargo` (version 1.50.0 or higher)
-- `libclang` (see more info at [https://crates.io/crates/clang-sys](https://crates.io/crates/clang-sys))
 
 Build:
 

@@ -10,7 +10,7 @@ use anyhow::{bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_node::{
     events::EventSource,
-    realize::{HostsFile, Realized, WireGuard},
+    realize::{Realized, WireGuard},
     runtime::{self, Link, Node, Round},
     snapshot::{self, Snapshot},
     store,
@@ -218,6 +218,7 @@ pub async fn round(
     bring_up_interface: bool,
     events: &EventSource,
 ) -> Result<Round, Error> {
+    hosts_opts.warn_of_hosts_file_options();
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let interface_up = interface_is_up(network_opts.backend, interface);
 
@@ -275,10 +276,7 @@ pub async fn round(
             endpoint_overrides: config.peer_endpoint_overrides().clone(),
             events: events.clone(),
         }),
-        names: Some(Box::new(HostsFile {
-            interface: *interface,
-            opts: hosts_opts.clone(),
-        })),
+        names: None,
     };
     let mut link = RemoteLink {
         interface: *interface,
