@@ -2,11 +2,29 @@
 //!
 //! A peer belongs to one parent CIDR, and can by default see all peers within that parent.
 
-use super::DatabaseCidr;
+use super::{ip_to_bytes, prefix_from_row, DatabaseCidr};
 use crate::ServerError;
-use innernet_node::store::{ip_to_bytes, prefix_from_row};
+use innernet_node::Store;
 use innernet_shared::{Association, Prefix};
-use rusqlite::{params, Connection};
+use rusqlite::params;
+
+/// The table of associations of servers that predate the rebuild of the database, which names
+/// each association, and its CIDRs, by an ID.
+#[cfg(test)]
+pub static ORIGIN_TABLE_SQL: &str = "CREATE TABLE associations (
+      id         INTEGER PRIMARY KEY,
+      cidr_id_1  INTEGER NOT NULL,
+      cidr_id_2  INTEGER NOT NULL,
+      UNIQUE(cidr_id_1, cidr_id_2),
+      FOREIGN KEY (cidr_id_1)
+         REFERENCES cidrs (id)
+            ON UPDATE RESTRICT
+            ON DELETE RESTRICT,
+      FOREIGN KEY (cidr_id_2)
+         REFERENCES cidrs (id)
+            ON UPDATE RESTRICT
+            ON DELETE RESTRICT
+    )";
 
 /// An association of two CIDRs, whose peers see each other's. `cidr_1` is the lower of the two
 /// prefixes.
@@ -27,20 +45,23 @@ impl DatabaseAssociation {
 
     /// Associates the CIDRs `a` and `b`, which must be two CIDRs that no association names yet,
     /// in either order.
-    pub fn create(conn: &Connection, a: Prefix, b: Prefix) -> Result<Self, ServerError> {
+    pub fn create(store: &Store, a: Prefix, b: Prefix) -> Result<Self, ServerError> {
         let (cidr_1, cidr_2) = (a.min(b), a.max(b));
         if cidr_1 == cidr_2 {
             log::warn!("tried to associate the CIDR {cidr_1} with itself.");
             return Err(ServerError::InvalidQuery);
         }
         for prefix in [cidr_1, cidr_2] {
-            if matches!(DatabaseCidr::get(conn, &prefix), Err(ServerError::NotFound)) {
+            if matches!(
+                DatabaseCidr::get(store, &prefix),
+                Err(ServerError::NotFound)
+            ) {
                 log::warn!("tried to associate the CIDR {prefix}, which doesn't exist.");
                 return Err(ServerError::InvalidQuery);
             }
         }
         // An existing association of the two refuses the new one.
-        conn.execute(
+        store.execute(
             "INSERT INTO associations (address_1, prefix_len_1, address_2, prefix_len_2)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -55,9 +76,9 @@ impl DatabaseAssociation {
 
     /// Deletes the association of the CIDRs `a` and `b`, in either order, or refuses with
     /// [`ServerError::NotFound`] if there is none.
-    pub fn delete(conn: &Connection, a: &Prefix, b: &Prefix) -> Result<(), ServerError> {
+    pub fn delete(store: &Store, a: &Prefix, b: &Prefix) -> Result<(), ServerError> {
         let (cidr_1, cidr_2) = (a.min(b), a.max(b));
-        let deleted = conn.execute(
+        let deleted = store.execute(
             "DELETE FROM associations WHERE address_1 = ?1 AND prefix_len_1 = ?2
                AND address_2 = ?3 AND prefix_len_2 = ?4",
             params![
@@ -74,8 +95,8 @@ impl DatabaseAssociation {
     }
 
     /// Every association, ordered by its CIDRs.
-    pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let mut stmt = conn.prepare_cached(
+    pub fn list(store: &Store) -> Result<Vec<Self>, ServerError> {
+        let mut stmt = store.prepare_cached(
             "SELECT address_1, prefix_len_1, address_2, prefix_len_2 FROM associations
              ORDER BY length(address_1), address_1, prefix_len_1,
                       length(address_2), address_2, prefix_len_2",
@@ -116,7 +137,14 @@ mod tests {
                 association,
             )
         };
-        let res = post(serde_json::to_value(association)?).await;
+        let res = server
+            .form_request(
+                test::ADMIN_PEER_IP,
+                "POST",
+                "/admin/associations",
+                association,
+            )
+            .await;
         assert_eq!(res.status(), StatusCode::CREATED);
         let flipped = Association {
             cidr_1: developer,

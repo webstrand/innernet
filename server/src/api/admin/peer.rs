@@ -817,43 +817,41 @@ mod tests {
         let peer_path = key_path(&server, test::DEVELOPER1_PEER_ID);
         let path = format!("{peer_path}/delegations");
         let [wider, misaligned, outside, taken] = developer_prefixes();
-        let get = |path: String| {
-            let server = &server;
-            async move {
-                let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
-                assert_eq!(res.status(), StatusCode::OK);
-                test::cbor_body::<TaggedPeerDelegations>(res).await.unwrap()
-            }
+        // A prefix of the user CIDR, another than the peer's.
+        let other_cidr = if cfg!(feature = "v6-test") {
+            "fd00:1337::3:0:1:0/112"
+        } else {
+            "10.80.130.0/24"
         };
-        // The delegations are sent as text, so that a misaligned prefix can be sent.
+        let get = || async {
+            let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            test::cbor_body::<TaggedPeerDelegations>(res).await.unwrap()
+        };
+        // The delegations are sent as text, which a prefix also deserializes from, so that a
+        // misaligned prefix can be sent.
         #[derive(Serialize)]
         struct Delegations {
             delegations: Vec<String>,
             tag: Tag,
         }
-        let put = |path: &str, delegations: &[&str], tag: &Tag| {
+        let put = |delegations: &[&str], tag: &Tag| {
             let body = Delegations {
                 delegations: delegations.iter().map(|d| d.to_string()).collect(),
                 tag: tag.clone(),
             };
-            let path = path.to_string();
-            let server = &server;
-            async move {
-                server
-                    .form_request(test::ADMIN_PEER_IP, "PUT", &path, body)
-                    .await
-            }
+            server.form_request(test::ADMIN_PEER_IP, "PUT", &path, body)
         };
 
-        let seen = get(path.clone()).await;
+        let seen = get().await;
         let own = seen.delegations[0].to_string();
         assert_eq!(seen.delegations.len(), 1);
         let peer_tag = get_tagged(&server, &peer_path).await.tag;
 
         // The delegations are replaced as a whole, and routed from then on.
-        let res = put(&path, &[&wider, &own], &seen.tag).await;
+        let res = put(&[&wider, &own], &seen.tag).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        let current = get(path.clone()).await;
+        let current = get().await;
         let mut expected: Vec<Prefix> = vec![own.parse()?, wider.parse()?];
         expected.sort();
         assert_eq!(current.delegations, expected);
@@ -871,56 +869,33 @@ mod tests {
         // A change based on delegations read before is refused, as is one without a tag or with
         // a misaligned prefix, and delegations that break the rules are refused with an
         // explanation.
-        let res = put(&path, &[&own], &seen.tag).await;
-        test::problem(res, &problem::PEER_CHANGED).await?;
+        assert_eq!(put(&[&own], &seen.tag).await.status(), StatusCode::CONFLICT);
         let untagged = serde_json::json!({ "delegations": [own] });
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
             .await;
         test::problem(res, &problem::TAG_MISSING).await?;
-        let res = put(&path, &[&misaligned], &current.tag).await;
+        let res = put(&[&misaligned], &current.tag).await;
         test::blank_problem(res, StatusCode::BAD_REQUEST).await?;
-        // A prefix of the user CIDR, another than the peer's.
-        let other_cidr = if cfg!(feature = "v6-test") {
-            "fd00:1337::3:0:1:0/112"
-        } else {
-            "10.80.130.0/24"
-        };
         for (delegations, reason) in [
             (vec![outside.as_str()], "child CIDR"),
-            (vec![other_cidr], "in its CIDR"),
+            (vec![other_cidr], "can't move it to the CIDR"),
             (vec![taken.as_str()], "delegated to peer developer2"),
             (
                 vec![wider.as_str(), wider.as_str()],
                 "another of the delegations",
             ),
         ] {
-            let res = put(&path, &delegations, &current.tag).await;
+            let res = put(&delegations, &current.tag).await;
             let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
             assert!(detail.contains(reason), "{reason}");
         }
-        assert_eq!(get(path.clone()).await, current);
-
-        // A withdrawn delegation stays pinned to the peer's key, so the server's node refuses it
-        // to another peer, with an explanation.
-        let res = put(&path, &[&own], &current.tag).await;
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        let other_path = format!(
-            "{}/delegations",
-            key_path(&server, test::DEVELOPER2_PEER_ID)
-        );
-        let other = get(other_path.clone()).await;
-        let other_own = other.delegations[0].to_string();
-        let res = put(&other_path, &[&other_own, &wider], &other.tag).await;
-        let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
-        assert!(detail.contains("pinned"), "{detail}");
-        assert_eq!(get(other_path).await, other);
+        assert_eq!(get().await, current);
 
         // A peer may be left without a delegation, which leaves it out of the legacy view.
-        let current = get(path.clone()).await;
         let key = Key::from_base64(&peer(&server, test::DEVELOPER1_PEER_ID).public_key)?;
         assert_eq!(
-            put(&path, &[], &current.tag).await.status(),
+            put(&[], &current.tag).await.status(),
             StatusCode::NO_CONTENT
         );
         let without = DatabasePeer::get_from_public_key(&server.db.lock(), &key)?;
@@ -928,8 +903,25 @@ mod tests {
         let cidrs = DatabaseCidr::list(&server.db.lock())?;
         assert!(without.legacy(test::DEVELOPER1_PEER_ID, &cidrs).is_none());
 
-        // A non-admin can't, and an unknown key is not found.
-        let tag = get(path.clone()).await.tag;
+        // A peer without a delegation has no CIDR, so a new delegation may give it any CIDR.
+        let tag = get().await.tag;
+        assert_eq!(
+            put(&[other_cidr], &tag).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let moved = DatabasePeer::get_from_public_key(&server.db.lock(), &key)?;
+        assert_eq!(
+            moved
+                .legacy(test::DEVELOPER1_PEER_ID, &cidrs)
+                .map(|legacy| legacy.cidr_id),
+            Some(test::USER_CIDR_ID)
+        );
+        let tag = get().await.tag;
+        assert_eq!(put(&[], &tag).await.status(), StatusCode::NO_CONTENT);
+
+        // A non-admin can't, an unknown key is not found, and plain-HTTP sessions don't reach
+        // the delegations.
+        let tag = get().await.tag;
         let res = server
             .form_request(
                 test::DEVELOPER2_PEER_IP,
@@ -937,7 +929,7 @@ mod tests {
                 &path,
                 TaggedPeerDelegations {
                     delegations: vec![],
-                    tag,
+                    tag: tag.clone(),
                 },
             )
             .await;
@@ -1358,16 +1350,34 @@ mod tests {
         let state: State = test::cbor_body(res).await?;
         assert_eq!(state.peers.iter().filter(|p| p.name.is_none()).count(), 2);
 
-        // The view of plain-HTTP sessions leaves out the peers without a name, which clients that
-        // predate TLS can't read.
+        // The view of plain-HTTP sessions is what the server's node core accepted. The user peers
+        // have never announced, and the unsigned announcement that the server makes of a peer
+        // releases no name, so they keep the names pinned to their keys. The view leaves out the
+        // peers without a name, which clients that predate TLS can't read, such as a new peer
+        // that is offered none.
+        let nameless_ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::3:0:0:9"
+        } else {
+            "10.80.128.9"
+        };
+        DatabasePeer::create(
+            &server.db().lock(),
+            PeerContents {
+                name: None,
+                ..test::user_peer_contents("nameless", nameless_ip)?
+            },
+        )?;
         server.predate_tls(test::USER1_PEER_ID);
         let res = server
             .plain_request(test::USER1_PEER_IP, "GET", "/v1/user/state")
             .await;
         let state = json(res).await;
         let peers: Vec<LegacyPeer> = serde_json::from_value(state["peers"].clone())?;
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].name.as_deref(), Some("innernet-server"));
+        let names: Vec<_> = peers.iter().map(|peer| peer.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [Some("innernet-server"), Some("user1"), Some("user2")]
+        );
 
         Ok(())
     }

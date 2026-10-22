@@ -188,7 +188,11 @@ fn open_database_connection(
     let file = File::open(&database_path).with_path(&database_path)?;
     innernet_shared::warn_on_dangerous_mode(&file, &database_path).with_path(&database_path)?;
     drop(file);
-    db::open(&database_path, config.network(), &server_key)
+    let store = db::open(&database_path, &server_key, config.network())?;
+    // The server's node core takes the peers that have never announced as the server makes them,
+    // as clients do.
+    DatabasePeer::admit_synthesized(&store)?;
+    Ok(store)
 }
 
 /// The admin client of the coordinator of a network, which the running server serves: the
@@ -307,7 +311,10 @@ pub async fn serve(
     log::debug!("opening database connection...");
     let store = open_database_connection(&interface, conf)?;
     let public_key = check_database_matches_config(&store, &config)?;
-    check_internal_address(&DatabasePeer::own(&store, &public_key)?, config.address)?;
+    check_internal_address(
+        &DatabasePeer::get_from_public_key(&store, &public_key)?,
+        config.address,
+    )?;
 
     log::info!("bringing up interface.");
     wg::up(
@@ -444,12 +451,9 @@ pub(crate) fn free_udp_port(address: IpAddr, listen_port: u16) -> Result<u16, Er
 /// Checks, before the server starts anything, that the database holds the server's own peer, the
 /// one with the public key of the config's private key, and returns that key. Without it, the
 /// database and the config belong to different networks, or one of them was edited by hand.
-fn check_database_matches_config(
-    conn: &rusqlite::Connection,
-    config: &ConfigFile,
-) -> Result<Key, Error> {
+fn check_database_matches_config(store: &Store, config: &ConfigFile) -> Result<Key, Error> {
     let public_key = Key::from_base64(&config.private_key)?.get_public();
-    if DatabasePeer::own(conn, &public_key).is_err() {
+    if DatabasePeer::get_from_public_key(store, &public_key).is_err() {
         bail!(
             "the database and the config don't match: the database holds no peer with the key \
              {} of the config's private key",
@@ -541,7 +545,7 @@ mod tests {
 
         // The server's own peer has the key of the config.
         let key = Key::from_base64(&config.private_key)?.get_public();
-        let own = DatabasePeer::own(&server.db().lock(), &key)?;
+        let own = DatabasePeer::get_from_public_key(&server.db().lock(), &key)?;
         assert_eq!(own.name.as_deref(), Some("innernet-server"));
 
         // A config whose key no peer has doesn't match the database.
@@ -760,7 +764,7 @@ mod tests {
         let config = ConfigFile::from_file(server.wg_conf_path())?;
         let store = server.db.lock();
         let key = Key::from_base64(&config.private_key)?.get_public();
-        let myself = DatabasePeer::own(&store, &key)?;
+        let myself = DatabasePeer::get_from_public_key(&store, &key)?;
         check_internal_address(&myself, config.address)?;
         let error = check_internal_address(&myself, test::ADMIN_PEER_IP.parse()?).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
@@ -885,12 +889,15 @@ mod tests {
         assert!(!DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?.requires_tls);
 
         // From an address of its delegations, it is served, and latched.
-        let delegations = [Prefix::host(ip.parse()?), Prefix::host(addr.ip())];
-        innernet_node::store::write_delegations(
-            &server.db.lock(),
-            &peer_key.public.0,
-            &delegations,
-        )?;
+        {
+            let store = server.db.lock();
+            crate::db::peer::insert_delegation(
+                &store,
+                &peer_key.public.0,
+                &Prefix::host(addr.ip()),
+            )?;
+            DatabasePeer::admit_synthesized(&store)?;
+        }
         let (status, body) =
             test::quic_get(addr, client, pinned, &header_key, "/user/state").await?;
         assert_eq!(status, 200);

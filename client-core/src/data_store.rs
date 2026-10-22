@@ -1,24 +1,35 @@
-use anyhow::{bail, ensure, Context as _, Error};
-use innernet_node::{db::CreateHook, store, Store};
+use anyhow::{anyhow, bail, ensure, Context as _, Error};
+use innernet_node::{
+    accept::{self, Accepted, Received, Refusal},
+    db::{self, Scope},
+    snapshot::{self, Snapshot},
+    store::{self as node_store, key_to_bytes, EndpointKind},
+    Store,
+};
 use innernet_shared::{
-    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, IoErrorContext, LegacyCidr,
-    LegacyPeer, PeerContents, Prefix, State,
+    announcement::{self, Announcement, SignedAnnouncement},
+    ensure_dirs_exist,
+    interface_config::InterfaceConfig,
+    Cidr, IoErrorContext, LegacyCidr, LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
 use rusqlite::{params, Connection, OptionalExtension as _};
 use serde::Deserialize;
 use std::{
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io,
     net::IpAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::UNIX_EPOCH,
 };
 use wireguard_control::{InterfaceName, Key};
 
-/// The peers and CIDRs that the coordinator reported, kept in the node's database, with the
-/// delegations of each peer pinned to its public key.
+/// The node's database of a client, which holds the peers and [`Cidr`]s that the coordination
+/// server reported, the announcements of the peers, and what each peer claims, pinned to its
+/// public key, in the schema of [`innernet_node::SCHEMA`]. Every read goes to the database.
 ///
 /// The database is stored at [`Self::get_path()`]. A data store from before SQLite, at
 /// [`Self::get_legacy_path()`], is imported when the database is created, and left untouched.
@@ -30,7 +41,7 @@ pub struct DataStore {
 }
 
 /// The network of a data store, as the interface config describes it, against which the data
-/// store checks the peers that the coordinator reports.
+/// store checks the peers that the coordination server reports.
 #[derive(Clone, Debug)]
 struct Network {
     /// The prefix of the network, outside which no peer lies.
@@ -88,8 +99,8 @@ impl DataStore {
         innernet_shared::warn_on_dangerous_mode(&file, path).with_path(path)?;
         drop(file);
 
-        let legacy_path = legacy_path.to_owned();
-        let import: CreateHook = Arc::new(move |scope| import_legacy(scope, &legacy_path));
+        let legacy = legacy_path.to_owned();
+        let import: db::CreateHook = Arc::new(move |scope| import_legacy(scope, &legacy));
         let store = Store::open(path, network.prefix, Some(import))
             .with_context(|| format!("failed to open the data store {}", path.display()))?;
         Ok(Self { store, network })
@@ -210,118 +221,146 @@ impl DataStore {
         Ok(())
     }
 
-    /// The node's store of the data store.
-    pub fn store(&self) -> &Store {
-        &self.store
-    }
-
-    /// Records the coordinator and this client as the interface config introduces them, when an
-    /// invitation is redeemed, so the data store must be new.
+    /// Records the coordinator and this client as the interface config introduces them, and
+    /// writes the data store. This is the introduction, when an invitation is redeemed, so the
+    /// data store must be new.
     ///
-    /// The invitation, which produced the interface config, is the authority on both, so their
-    /// delegations are pinned to their keys before the coordinator reports anything: the
-    /// coordinator's internal address, and `delegations`, those that the invitation offers this
-    /// client. Each record has no name until a fetch replaces it with the coordinator's record.
+    /// The invitation, which produced the interface config, is the authority on both, so each is
+    /// taken to make the unsigned announcement that [`Announcement::synthetic`] makes of its
+    /// record, whose addresses are pinned to its public key before the coordination server
+    /// reports anything: the coordinator's internal address, and `delegations`, those that the
+    /// invitation offers this client. Neither has a name until an announcement claims one.
     pub fn introduce(
         &mut self,
         config: &InterfaceConfig,
         delegations: &[Prefix],
     ) -> Result<(), Error> {
-        let [coordinator, own] = introduced_peers(config, delegations)?;
-        let tx = self.store.transaction()?;
-        if !store::load_peers(&tx)?.is_empty() {
-            bail!("the data store to introduce peers into is not new.");
-        }
-        for peer in [&coordinator, &own] {
-            store::write_peer(&tx, &store::key_to_bytes(&peer.public_key)?, peer)?;
-        }
-        tx.commit()?;
-        Ok(())
+        let introduced = introduced_peers(config, delegations)?;
+        self.transact(|tx| {
+            let recorded: i64 = tx.query_row("SELECT count(*) FROM peers", [], |r| r.get(0))?;
+            if recorded > 0 {
+                bail!("the data store to introduce peers into is not new.");
+            }
+            let all_types = accept::all_claim_types();
+            let mut synthetic = vec![];
+            for introduced in &introduced {
+                write_peer(tx, introduced)?;
+                synthetic.push(SignedAnnouncement::unsigned(&Announcement::synthetic(
+                    introduced,
+                ))?);
+            }
+            let received: Vec<Received> = introduced
+                .iter()
+                .zip(&synthetic)
+                .map(|(peer, announcement)| Received {
+                    public_key: &peer.public_key,
+                    announcement,
+                    checked_types: &all_types,
+                    repeats: true,
+                })
+                .collect();
+            let now = announcement::timestamp_now();
+            for accepted in tx.accept(&received, now)? {
+                accepted.map_err(|refusal| anyhow!("{refusal}"))?;
+            }
+            Ok(())
+        })
     }
 
-    /// Merges the peers of `state` into the data store and replaces its CIDRs with those of
-    /// `state`, in one transaction. Returns the peers of `state` that were dropped, each with the
-    /// reason that the node refused it, and warns if the record of this client no longer holds the
-    /// source address of its interface.
+    /// Merges the peers of `state` into the data store, replaces its CIDRs with those of `state`,
+    /// and writes it to disk. Returns the peers of `state` that were dropped, each with the reason
+    /// that it was dropped.
     ///
-    /// A peer that is absent from `state` is disabled rather than deleted, so that its delegations
-    /// stay pinned: the coordinator leaves disabled peers out of the state. A dropped peer was
-    /// reported, so the stored peer with its key keeps its record unchanged, as does one whose
-    /// record failed to deserialize.
+    /// A peer that the data store already holds is updated, a new peer is added, and a peer that
+    /// is absent from `state` is disabled rather than deleted, so that what it claims remains
+    /// pinned to its public key. A peer of `state` is dropped whole if one of its delegations lies
+    /// outside the network of the interface, if it shares its public key or one of its delegations
+    /// with an earlier peer of `state`. The coordinator is checked as every other peer is. A
+    /// dropped peer is absent from the update, so a pinned peer that it conflicts with is
+    /// disabled, while the stored record of a dropped peer with a pinned key is kept as it was.
+    ///
+    /// Each peer is taken to make the unsigned announcement that [`Announcement::synthetic`]
+    /// makes of what the server reports of it, which the node core accepts or refuses, as
+    /// [`innernet_node::db::Scope::decide`] decides. A refused announcement is ignored with a
+    /// warning, so that it never fails an update, and the last one accepted from the peer stays.
+    ///
+    /// What each peer claims is then pinned to its key. A signed announcement pins what it claims
+    /// and releases what it no longer claims; an unsigned one, which the server makes for a peer
+    /// that has never announced, pins what it claims beside what is pinned already, as
+    /// [`innernet_node::claims::Claim::unsigned`] adds it, and releases nothing, so that the server
+    /// alone can't move what such a peer holds to another key. An announcement that claims what is
+    /// pinned to another key is refused whole; a peer whose first announcement is refused is
+    /// dropped. Pinning prevents a compromised server from handing what a peer claims to another
+    /// key, but not from adding a new peer under its control, nor from deciding what a peer claims
+    /// before a client first sees it.
     pub fn update<'a>(
         &mut self,
         state: &'a State,
     ) -> Result<Vec<(&'a PeerContents, Error)>, Error> {
-        let tx = self.store.transaction()?;
-        let reported: Vec<&PeerContents> = state.peers.iter().collect();
-        let decided = tx.scope().accept(&reported)?;
-        let dropped = state
-            .peers
-            .iter()
-            .zip(decided)
-            .filter_map(|(peer, decided)| decided.err().map(|refusal| (peer, refusal.into())))
-            .collect();
-        for stored in store::load_peers(&tx)? {
-            let reported = state
-                .peers
-                .iter()
-                .any(|peer| peer.public_key == stored.public_key)
-                || state.invalid_peer_keys.contains(&stored.public_key);
-            if !reported && !stored.is_disabled {
-                tx.execute(
-                    "UPDATE peers SET is_disabled = 1 WHERE public_key = ?1",
-                    [store::key_to_bytes(&stored.public_key)?],
-                )?;
-            }
-        }
-        write_cidrs(&tx, &state.cidrs)?;
-        tx.commit()?;
+        let network = self.network.clone();
+        let dropped = self.transact(|tx| {
+            let dropped =
+                update_reported_peers(tx, &network, &state.peers, &state.invalid_peer_keys)?;
+            write_cidrs(tx, &state.cidrs)?;
+            Ok(dropped)
+        })?;
         self.warn_if_own_address_lost()?;
         Ok(dropped)
     }
 
-    /// Warns if the record of this client no longer holds the source address of its interface,
-    /// which the coordinator has then withdrawn.
-    fn warn_if_own_address_lost(&self) -> Result<(), Error> {
-        let Some((own_key, address)) = &self.network.own else {
-            return Ok(());
-        };
-        let own = store::load_peer(&self.store, &store::key_to_bytes(own_key)?)?;
-        if own.is_some_and(|own| !own.holds(*address)) {
-            log::warn!(
-                "the coordinator no longer delegates this client's address {address} to it, so \
-                 other peers no longer route traffic for that address here."
-            );
-        }
-        Ok(())
-    }
-
+    /// Merges `new_peers`, each taken to make the unsigned announcement of its record.
     #[cfg(test)]
     fn update_peers<'a>(
         &mut self,
         new_peers: &'a [PeerContents],
     ) -> Vec<(&'a PeerContents, Error)> {
-        let state = State {
-            peers: new_peers.to_vec(),
-            cidrs: self.cidrs().unwrap(),
-            observed_endpoint: None,
-            invalid_peer_keys: vec![],
-        };
-        let dropped: Vec<usize> = self
-            .update(&state)
+        let network = self.network.clone();
+        self.transact(|tx| update_reported_peers(tx, &network, new_peers, &[]))
             .unwrap()
-            .into_iter()
-            .map(|(peer, _)| state.peers.iter().position(|p| p == peer).unwrap())
-            .collect();
-        dropped
-            .into_iter()
-            .map(|i| (&new_peers[i], anyhow::anyhow!("dropped")))
-            .collect()
     }
 
-    /// The peers, ordered by their hosts fallback addresses, those without one last.
+    /// The peers, as the coordination server last reported them, but named as they claim,
+    /// without their announcements, as [`node_store::load_peers`] reads them.
     pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
-        Ok(store::load_peers(&self.store)?)
+        Ok(node_store::load_peers(&self.store)?)
+    }
+
+    /// The peers as they take effect, as [`snapshot::effective`] makes each of the last
+    /// announcement accepted from it, in the order of [`Self::peers`]. A peer without an accepted
+    /// announcement is routed nothing.
+    pub fn effective_peers(&self) -> Result<Vec<PeerContents>, Error> {
+        let announcements = node_store::load_announcements(&self.store, None)?;
+        Ok(self
+            .peers()?
+            .iter()
+            .map(|peer| {
+                let announcement = announcements.get(&peer.public_key);
+                snapshot::effective(peer, announcement.map(|stored| &stored.announcement))
+            })
+            .collect())
+    }
+
+    /// The peer with `public_key` as it takes effect, as [`Self::effective_peers`] makes it, or
+    /// `None` if the data store doesn't record it.
+    pub fn effective_peer(&self, public_key: &str) -> Result<Option<PeerContents>, Error> {
+        let key = key_to_bytes(public_key)?;
+        let Some(peer) = node_store::load_peer(&self.store, &key)? else {
+            return Ok(None);
+        };
+        let announcement = node_store::load_announcements(&self.store, Some(&key))?
+            .remove(public_key)
+            .map(|stored| stored.announcement);
+        Ok(Some(snapshot::effective(&peer, announcement.as_ref())))
+    }
+
+    /// What this client configures, as the node core makes it of the data store: the peers as
+    /// they take effect, in the order of [`Self::peers`].
+    pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        Ok(snapshot::of_store(&self.store)?)
+    }
+
+    pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
+        Ok(node_store::load_cidrs(&self.store)?)
     }
 
     /// Whether the peer with `public_key` is known to speak TLS.
@@ -330,7 +369,7 @@ impl DataStore {
             .store
             .query_row(
                 "SELECT tls FROM peers WHERE public_key = ?1",
-                [store::key_to_bytes(public_key)?],
+                [key_to_bytes(public_key)?],
                 |r| r.get(0),
             )
             .optional()?;
@@ -341,7 +380,7 @@ impl DataStore {
     pub fn latch_tls(&mut self, public_key: &str) -> Result<(), Error> {
         let updated = self.store.execute(
             "UPDATE peers SET tls = 1 WHERE public_key = ?1",
-            [store::key_to_bytes(public_key)?],
+            [key_to_bytes(public_key)?],
         )?;
         ensure!(
             updated == 1,
@@ -352,15 +391,7 @@ impl DataStore {
 
     /// Whether the data store records the peer with `public_key`.
     pub fn records_peer(&self, public_key: &str) -> Result<bool, Error> {
-        let recorded = self
-            .store
-            .query_row(
-                "SELECT 1 FROM peers WHERE public_key = ?1",
-                [store::key_to_bytes(public_key)?],
-                |_| Ok(()),
-            )
-            .optional()?;
-        Ok(recorded.is_some())
+        Ok(node_store::announces(&self.store, &key_to_bytes(public_key)?)?.is_some())
     }
 
     /// The UDP port of the TLS API of the peer with `public_key`, the coordinator, which runs over
@@ -370,7 +401,7 @@ impl DataStore {
             .store
             .query_row(
                 "SELECT quic_port FROM peers WHERE public_key = ?1",
-                [store::key_to_bytes(public_key)?],
+                [key_to_bytes(public_key)?],
                 |r| r.get(0),
             )
             .optional()?;
@@ -382,7 +413,7 @@ impl DataStore {
     pub fn set_quic_port(&mut self, public_key: &str, port: u16) -> Result<(), Error> {
         let updated = self.store.execute(
             "UPDATE peers SET quic_port = ?2 WHERE public_key = ?1",
-            params![store::key_to_bytes(public_key)?, port],
+            params![key_to_bytes(public_key)?, port],
         )?;
         ensure!(
             updated == 1,
@@ -391,22 +422,230 @@ impl DataStore {
         Ok(())
     }
 
-    /// The CIDRs, ordered by prefix.
-    pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
-        Ok(store::load_cidrs(&self.store)?)
+    /// Runs `change` in one transaction, which holds the write lock from the start, so that a
+    /// change made meanwhile by another process is neither missed nor overwritten.
+    fn transact<T>(&mut self, change: impl FnOnce(&Scope) -> Result<T, Error>) -> Result<T, Error> {
+        let tx = self.store.transaction()?;
+        let result = change(&tx.scope())?;
+        tx.commit()?;
+        Ok(result)
     }
+
+    /// Warns if the record of this client no longer holds the source address of its interface,
+    /// which the coordination server has then withdrawn.
+    fn warn_if_own_address_lost(&self) -> Result<(), Error> {
+        let Some((own_key, address)) = &self.network.own else {
+            return Ok(());
+        };
+        let own = node_store::load_peer(&self.store, &key_to_bytes(own_key)?)?;
+        if own.is_some_and(|own| !own.holds(*address)) {
+            log::warn!(
+                "the coordination server no longer delegates this client's address {address} to \
+                 it, so this client can no longer claim it."
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `candidate` lies within `network`, and shares neither a delegation nor its
+/// public key with a peer of `accepted`. Its name, if it has one, is valid, as every
+/// [`innernet_shared::Hostname`] is.
+fn check_reported(
+    network: IpNet,
+    candidate: &PeerContents,
+    accepted: &[&PeerContents],
+) -> Result<(), Error> {
+    if let Some(outside) = candidate
+        .delegations
+        .iter()
+        .find(|delegation| !network.contains(&delegation.net()))
+    {
+        bail!("{outside} is outside of the network {network}.");
+    }
+    if accepted.iter().any(|earlier| {
+        earlier.public_key == candidate.public_key
+            || earlier.delegations.iter().any(|delegation| {
+                candidate
+                    .delegations
+                    .iter()
+                    .any(|other| other.overlaps(delegation))
+            })
+    }) {
+        bail!("its public key or one of its delegations is shared with an earlier peer.");
+    }
+    Ok(())
+}
+
+/// Merges `new_peers` into the data store of `tx`, dropping each that is invalid, and hands the
+/// unsigned announcement of each to the node core, as [`DataStore::update`] describes.
+/// `invalid_peer_keys` are the public keys of the peers that the server reported but that failed
+/// to deserialize.
+fn update_reported_peers<'a>(
+    tx: &Scope,
+    network: &Network,
+    new_peers: &'a [PeerContents],
+    invalid_peer_keys: &[String],
+) -> Result<Vec<(&'a PeerContents, Error)>, Error> {
+    let mut accepted: Vec<&'a PeerContents> = vec![];
+    let mut dropped = vec![];
+    for new_peer in new_peers.iter() {
+        match check_reported(network.prefix, new_peer, &accepted) {
+            Ok(()) => accepted.push(new_peer),
+            Err(e) => dropped.push((new_peer, e)),
+        }
+    }
+
+    // The server leaves disabled peers out of the state, so a stored peer that the state doesn't
+    // report is disabled. A dropped peer was reported, so the stored peer with its public key
+    // keeps its record unchanged.
+    let reported: HashSet<&str> = new_peers
+        .iter()
+        .map(|peer| peer.public_key.as_str())
+        .chain(invalid_peer_keys.iter().map(String::as_str))
+        .collect();
+    for stored in node_store::load_peers(tx)? {
+        if !reported.contains(stored.public_key.as_str()) {
+            tx.execute(
+                "UPDATE peers SET is_disabled = 1 WHERE public_key = ?1",
+                [key_to_bytes(&stored.public_key)?],
+            )?;
+        }
+    }
+
+    // The unsigned announcement of each accepted peer, which the node core decides.
+    let all_types = accept::all_claim_types();
+    let synthesized: Vec<Option<SignedAnnouncement>> = accepted
+        .iter()
+        .map(|peer| {
+            SignedAnnouncement::unsigned(&Announcement::synthetic(peer))
+                .inspect_err(|e| {
+                    log::warn!("ignoring the announcement of peer {}: {e}", peer.public_key)
+                })
+                .ok()
+        })
+        .collect();
+    let received: Vec<Received> = accepted
+        .iter()
+        .zip(&synthesized)
+        .filter_map(|(peer, announcement)| {
+            Some(Received {
+                public_key: &peer.public_key,
+                announcement: announcement.as_ref()?,
+                checked_types: &all_types,
+                repeats: true,
+            })
+        })
+        .collect();
+    let now = announcement::timestamp_now();
+    let decided = tx.decide(&received, now)?;
+
+    // A refused announcement is ignored, and the last one accepted from the peer stays. A peer
+    // that claims what is pinned to another key without an accepted announcement is dropped, since
+    // nothing of it could take effect.
+    let mut refused = vec![];
+    let mut taken: Vec<Accepted> = vec![];
+    for (received, decided) in received.iter().zip(decided) {
+        match decided {
+            Ok(accepted) => taken.push(accepted),
+            Err(Refusal::Pinned(conflict))
+                if node_store::load_announcements(
+                    tx,
+                    Some(&key_to_bytes(received.public_key)?),
+                )?
+                .is_empty() =>
+            {
+                refused.push((received.public_key.to_string(), conflict));
+            },
+            Err(refusal) => log::warn!(
+                "ignoring the announcement of peer {}: {refusal}",
+                received.public_key
+            ),
+        }
+    }
+    for peer in accepted {
+        if let Some((_, conflict)) = refused.iter().find(|(key, _)| key == &peer.public_key) {
+            dropped.push((
+                peer,
+                anyhow!(
+                    "PINNING ERROR: the peer claims what is pinned to another public key: \
+                     {conflict}."
+                ),
+            ));
+            continue;
+        }
+        // A peer is recorded before what it claims is pinned to its key.
+        write_peer(tx, peer)
+            .with_context(|| format!("failed to store peer {}", peer.public_key))?;
+    }
+    tx.apply(&taken)?;
+
+    Ok(dropped)
+}
+
+/// Writes `peer`, but for its name, which is the one pinned to its key, its announcement, its
+/// delegations and its endpoints. A new peer is recorded without a name. A delegation that the
+/// data store records of another peer, which the server no longer reports as that peer's, follows
+/// the peer that the server now reports it of.
+fn write_peer(tx: &Connection, peer: &PeerContents) -> Result<(), Error> {
+    let public_key = key_to_bytes(&peer.public_key)?;
+    let invite_expires = peer
+        .invite_expires
+        .map(|time| time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()))
+        .transpose()?;
+    tx.execute(
+        "INSERT INTO peers (public_key, is_admin, is_disabled, is_redeemed,
+                            persistent_keepalive_interval, invite_expires)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (public_key) DO UPDATE SET
+           is_admin = excluded.is_admin,
+           is_disabled = excluded.is_disabled,
+           is_redeemed = excluded.is_redeemed,
+           persistent_keepalive_interval = excluded.persistent_keepalive_interval,
+           invite_expires = excluded.invite_expires",
+        params![
+            public_key,
+            peer.is_admin,
+            peer.is_disabled,
+            peer.is_redeemed,
+            peer.persistent_keepalive_interval,
+            invite_expires,
+        ],
+    )?;
+
+    tx.execute(
+        "DELETE FROM delegations WHERE public_key = ?1",
+        params![public_key],
+    )?;
+    for delegation in &peer.delegations {
+        tx.execute(
+            "INSERT INTO delegations (address, prefix_len, last, public_key) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (address) DO UPDATE SET prefix_len = excluded.prefix_len,
+               last = excluded.last, public_key = excluded.public_key",
+            params![
+                node_store::ip_to_bytes(delegation.first()),
+                delegation.prefix_len(),
+                node_store::ip_to_bytes(delegation.last()),
+                public_key,
+            ],
+        )?;
+    }
+
+    node_store::write_endpoints(tx, &public_key, EndpointKind::Endpoint, &peer.endpoint)?;
+    node_store::write_endpoints(tx, &public_key, EndpointKind::Candidate, &peer.candidates)?;
+    Ok(())
 }
 
 /// Replaces the CIDRs of the database with `cidrs`. They are only displayed, so of two CIDRs with
 /// the same prefix or the same name, the first is kept.
-fn write_cidrs(conn: &Connection, cidrs: &[Cidr]) -> Result<(), Error> {
-    conn.execute("DELETE FROM cidrs", [])?;
+fn write_cidrs(tx: &Connection, cidrs: &[Cidr]) -> Result<(), Error> {
+    tx.execute("DELETE FROM cidrs", [])?;
     for cidr in cidrs {
-        conn.execute(
+        tx.execute(
             "INSERT INTO cidrs (address, prefix_len, name) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![
-                store::ip_to_bytes(cidr.cidr.first()),
+                node_store::ip_to_bytes(cidr.cidr.first()),
                 cidr.cidr.prefix_len(),
                 cidr.name
             ],
@@ -416,11 +655,11 @@ fn write_cidrs(conn: &Connection, cidrs: &[Cidr]) -> Result<(), Error> {
 }
 
 /// Imports the legacy data store at `path` into the new database, if there is one. The import
-/// refuses, rather than repairs, a data store that the node would refuse a peer of: one with an
-/// invalid public key, a peer outside the network, or two records in conflict. A name that isn't
-/// valid is read as no name. The file itself is left untouched, so that earlier versions still
-/// find their pins in it.
-fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Error> {
+/// refuses, rather than repairs, a data store that holds an invalid public key, a peer outside the
+/// network or two records in conflict. The file itself is left untouched, so that earlier
+/// versions still find their pins in it.
+fn import_legacy(tx: &Scope, path: &Path) -> Result<(), Error> {
+    let network = tx.network();
     let json = match std::fs::read_to_string(path) {
         Ok(json) => json,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -432,21 +671,55 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
     }
     let LegacyContents::V1 { peers, cidrs } = serde_json::from_str(&json)
         .with_context(|| format!("{} is not a valid data store", path.display()))?;
-    let peers: Vec<PeerContents> = peers.into_iter().map(|peer| peer.contents.into()).collect();
-    let contents: Vec<&PeerContents> = peers.iter().collect();
-    for (peer, decided) in peers.iter().zip(scope.accept(&contents)?) {
-        if let Err(refusal) = decided {
-            bail!(
-                "{}: failed to import peer {} at {}: {refusal}",
+    let all_types = accept::all_claim_types();
+    let mut imported = HashMap::new();
+    for LegacyPeer { contents: peer, .. } in &peers {
+        ensure!(
+            network.contains(&peer.ip),
+            "{}: peer {} at {} is outside of the network {}",
+            path.display(),
+            peer.public_key,
+            peer.ip,
+            network,
+        );
+        let imported_ip = *imported.entry(&peer.public_key).or_insert(peer.ip);
+        ensure!(
+            imported_ip == peer.ip,
+            "{}: peer {} is at both {} and {}",
+            path.display(),
+            peer.public_key,
+            imported_ip,
+            peer.ip,
+        );
+        // An imported peer is taken to make the unsigned announcement of what the data store held
+        // of it, as a server that predates announcements would report it, which the node core
+        // accepts at once, so that what it claims, its name included, is pinned.
+        let peer = PeerContents::from(peer.clone());
+        (|| -> Result<(), Error> {
+            write_peer(tx, &peer)?;
+            let synthetic = SignedAnnouncement::unsigned(&Announcement::synthetic(&peer))?;
+            let received = Received {
+                public_key: &peer.public_key,
+                announcement: &synthetic,
+                checked_types: &all_types,
+                repeats: true,
+            };
+            tx.accept_one(&received, 0)?
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            Ok(())
+        })()
+        .with_context(|| {
+            format!(
+                "{}: failed to import peer {} at {}",
                 path.display(),
                 peer.public_key,
                 peer.display_address()
-            );
-        }
+            )
+        })?;
     }
     // A CIDR whose address has host bits set is the prefix of its network, as the server read it.
     let cidrs: Vec<Cidr> = cidrs.into_iter().map(Cidr::from).collect();
-    write_cidrs(scope, &cidrs)?;
+    write_cidrs(tx, &cidrs)?;
     log::info!(
         "imported {} peers from {} into the new data store.",
         peers.len(),
@@ -457,7 +730,7 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
 }
 
 /// The coordinator, at its internal address, and this client, with the delegations
-/// `delegations`, as the interface config and the invitation introduce them. Each record has no
+/// `delegations`, as the interface config and the invitation introduce them. Neither record has a
 /// name.
 fn introduced_peers(
     config: &InterfaceConfig,
@@ -494,14 +767,12 @@ fn introduced_peers(
         introduced(delegations, own_key, None),
     ])
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innernet_node::db::{APPLICATION_ID, BUSY_TIMEOUT, SCHEMA_VERSION};
-    use innernet_shared::{LegacyCidrContents, LegacyPeerContents, PeerContents};
+    use innernet_shared::{Cidr, LegacyCidrContents, LegacyPeerContents};
     use once_cell::sync::Lazy;
-    use rusqlite::{config::DbConfig, Connection};
-    use std::time::{Duration, UNIX_EPOCH};
     static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
         vec![PeerContents {
             name: Some("blah".parse().unwrap()),
@@ -541,30 +812,31 @@ mod tests {
         dir.join("wg0.json")
     }
 
-    fn network(prefix: IpNet) -> Network {
-        Network { prefix, own: None }
-    }
-
     fn open(dir: &Path, create: bool) -> Result<DataStore, Error> {
         DataStore::open_with_paths(&db_path(dir), &legacy_path(dir), network(*NETWORK), create)
+    }
+
+    /// The network `prefix`, without a record of this client.
+    fn network(prefix: IpNet) -> Network {
+        Network { prefix, own: None }
     }
 
     /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it, with the
     /// server IDs of the peers and of the CIDRs, numbered from 1, each peer in the first CIDR.
     fn write_legacy(dir: &Path, peers: &[PeerContents], cidrs: &[Cidr]) {
-        let peers: Vec<LegacyPeer> = peers
+        let peers: Vec<_> = peers
             .iter()
-            .zip(1..)
-            .map(|(contents, id)| LegacyPeer {
-                id,
+            .enumerate()
+            .map(|(i, contents)| LegacyPeer {
+                id: i as i64 + 1,
                 contents: LegacyPeerContents::from_peer(contents, 1).unwrap(),
             })
             .collect();
-        let cidrs: Vec<LegacyCidr> = cidrs
+        let cidrs: Vec<_> = cidrs
             .iter()
-            .zip(1..)
-            .map(|(cidr, id)| LegacyCidr {
-                id,
+            .enumerate()
+            .map(|(i, cidr)| LegacyCidr {
+                id: i as i64 + 1,
                 contents: LegacyCidrContents {
                     name: cidr.name.clone(),
                     cidr: cidr.cidr.net(),
@@ -633,19 +905,7 @@ mod tests {
         // Should NOT work, since the IP is pinned to another public key. The pinned peer is
         // disabled, since it is absent from the update.
         assert_eq!(store.update_peers(&modified).len(), 1);
-        assert_eq!(store.peers().unwrap(), disabled(&BASE_PEERS));
-    }
-
-    /// The number of rows of `table` of the peer with the public key `key`.
-    fn rows_of(store: &DataStore, table: &str, key: &str) -> i64 {
-        store
-            .store
-            .query_row(
-                &format!("SELECT count(*) FROM {table} WHERE public_key = ?1"),
-                [store::key_to_bytes(key).unwrap()],
-                |r| r.get(0),
-            )
-            .unwrap()
+        assert_eq!(store.peers().unwrap(), &disabled(&BASE_PEERS)[..]);
     }
 
     #[test]
@@ -665,7 +925,7 @@ mod tests {
         let mut wider = BASE_PEERS.clone();
         wider[0].delegations = delegations(&["10.0.0.1/32", "10.0.0.32/28"]);
         assert!(store.update_peers(&wider).is_empty());
-        assert_eq!(store.peers().unwrap(), wider);
+        assert_eq!(store.peers().unwrap(), &wider[..]);
         assert_eq!(rows_of(&store, "delegations", &BASE_PEERS[0].public_key), 2);
         assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
 
@@ -703,6 +963,7 @@ mod tests {
         // A peer may have no delegation, and is then listed last, without a CIDR.
         let mut without = other.clone();
         without.delegations = vec![];
+        let without = without;
         assert!(store
             .update_peers(&[without.clone(), BASE_PEERS[0].clone()])
             .is_empty());
@@ -727,26 +988,43 @@ mod tests {
         setup_basic_store(dir.path());
         let mut store = open(dir.path(), false).unwrap();
 
-        // The same public key reported at another IP moves there, and its old IP stays pinned to
-        // it.
+        // The same public key reported at another IP is accepted, and the IP it held stays pinned
+        // to it, but is no longer routed to it.
         let mut moved = BASE_PEERS.clone();
         moved[0].delegations = host("10.0.0.2");
         assert!(store.update_peers(&moved).is_empty());
-        assert_eq!(store.peers().unwrap(), moved);
-        let mut impostor = BASE_PEERS.clone();
-        impostor[0].public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
-        assert_eq!(store.update_peers(&impostor).len(), 1);
+        assert_eq!(store.peers().unwrap(), &moved[..]);
+        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
+        assert_eq!(rows_of(&store, "delegations", &BASE_PEERS[0].public_key), 1);
 
-        // Other changes to a pinned peer are applied in place, and new peers are added.
+        // Another key is refused at either IP, and the pinned peer is disabled, since the update
+        // leaves it out.
+        let other_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+        for ip in ["10.0.0.1", "10.0.0.2"] {
+            let mut other = BASE_PEERS[0].clone();
+            other.delegations = host(ip);
+            other.public_key = other_key.to_string();
+            assert_eq!(store.update_peers(&[other]).len(), 1);
+        }
+        assert_eq!(store.peers().unwrap(), &disabled(&moved)[..]);
+
+        // Other changes to a pinned peer are applied in place, but for its name, which stays
+        // pinned, and new peers are added.
         let mut updated = BASE_PEERS.clone();
-        updated[0].name = Some("renamed".parse().unwrap());
+        updated[0].is_admin = true;
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.name = Some("new".parse().unwrap());
         new_peer.delegations = host("10.0.0.3");
-        new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        new_peer.public_key = other_key.to_string();
+        new_peer.name = Some("new".parse().unwrap());
         updated.push(new_peer);
-        assert!(store.update_peers(&updated).is_empty());
-        assert_eq!(store.peers().unwrap(), updated);
+        let mut renamed = updated.clone();
+        renamed[0].name = Some("renamed".parse().unwrap());
+        assert!(store.update_peers(&renamed).is_empty());
+        assert_eq!(store.peers().unwrap(), &updated[..]);
+        assert_eq!(
+            open(dir.path(), false).unwrap().peers().unwrap(),
+            &updated[..]
+        );
     }
 
     #[test]
@@ -858,7 +1136,8 @@ mod tests {
             [BASE_PEERS[0].clone(), new_peer.clone()]
         );
 
-        // A stored peer renamed to an invalid name loses its name, and stays enabled.
+        // A stored peer renamed to an invalid name keeps the name pinned to its key, and stays
+        // enabled.
         let mut renamed = base;
         renamed["name"] = "Blah".into();
         let renamed_new = serde_json::to_value(&new_peer).unwrap();
@@ -866,11 +1145,7 @@ mod tests {
             .update(&state(&[renamed, renamed_new]))
             .unwrap()
             .is_empty());
-        let unnamed = PeerContents {
-            name: None,
-            ..BASE_PEERS[0].clone()
-        };
-        assert_eq!(store.peers().unwrap(), [unnamed, new_peer]);
+        assert_eq!(store.peers().unwrap(), [BASE_PEERS[0].clone(), new_peer]);
     }
 
     #[test]
@@ -879,20 +1154,34 @@ mod tests {
         setup_basic_store(dir.path());
         let mut store = open(dir.path(), false).unwrap();
 
-        // Any number of peers can be without a name, and a peer can lose its name.
+        // Any number of peers can be without a name.
         let mut nameless = BASE_PEERS.clone();
-        nameless[0].name = None;
-        let mut other = nameless[0].clone();
-        other.delegations = host("10.0.0.2");
-        other.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
-        nameless.push(other);
+        for (ip, key) in [
+            ("10.0.0.2", "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes="),
+            ("10.0.0.3", "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk="),
+        ] {
+            nameless.push(PeerContents {
+                name: None,
+                delegations: host(ip),
+                public_key: key.to_string(),
+                ..BASE_PEERS[0].clone()
+            });
+        }
         assert!(store.update_peers(&nameless).is_empty());
-        assert_eq!(store.peers().unwrap(), nameless);
-        assert_eq!(open(dir.path(), false).unwrap().peers().unwrap(), nameless);
+        assert_eq!(store.peers().unwrap(), &nameless[..]);
+        assert_eq!(
+            open(dir.path(), false).unwrap().peers().unwrap(),
+            &nameless[..]
+        );
 
-        // And get a name again.
-        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        // A peer without a name takes one that it claims, while an unsigned announcement that
+        // claims no name leaves the name pinned to the key of a peer that has one.
+        let mut named = nameless.clone();
+        named[0].name = None;
+        named[1].name = Some("named".parse().unwrap());
+        assert!(store.update_peers(&named).is_empty());
         assert_eq!(store.peers().unwrap()[0], BASE_PEERS[0]);
+        assert_eq!(store.peers().unwrap()[1].name, named[1].name);
     }
 
     #[test]
@@ -965,7 +1254,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "peers": [], "cidrs": *BASE_CIDRS }))
                 .unwrap();
         store.update(&state).unwrap();
-        assert_eq!(store.peers().unwrap(), disabled(&BASE_PEERS));
+        assert_eq!(store.peers().unwrap(), &disabled(&BASE_PEERS)[..]);
     }
 
     #[test]
@@ -981,28 +1270,26 @@ mod tests {
         new_peer.delegations = host("10.0.0.2");
         new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
-        new_peer.name = Some("third".parse().unwrap());
         new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].0, &same_ip[2]);
-        assert_eq!(store.peers().unwrap(), same_ip[..2]);
+        assert_eq!(store.peers().unwrap(), &same_ip[..2]);
 
         // Of two new peers with the same public key, the first is kept and the second dropped.
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.name = Some("fourth".parse().unwrap());
+        new_peer.name = Some("third".parse().unwrap());
         new_peer.delegations = host("10.0.0.3");
         new_peer.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
-        new_peer.name = Some("fifth".parse().unwrap());
         new_peer.delegations = host("10.0.0.4");
         same_public_key.push(new_peer);
         let dropped = store.update_peers(&same_public_key);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].0, &same_public_key[3]);
-        assert_eq!(store.peers().unwrap(), same_public_key[..3]);
+        assert_eq!(store.peers().unwrap(), &same_public_key[..3]);
     }
 
     #[test]
@@ -1028,7 +1315,7 @@ mod tests {
 
         // Should work, since peer is unmodified.
         assert!(store.update_peers(&[]).is_empty());
-        assert_eq!(store.peers().unwrap(), disabled(&BASE_PEERS));
+        assert_eq!(store.peers().unwrap(), &disabled(&BASE_PEERS)[..]);
     }
 
     /// The coordinator of [`introducing_config`], as the server reports it.
@@ -1055,55 +1342,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_latch() {
-        let dir = tempfile::tempdir().unwrap();
-        setup_basic_store(dir.path());
-        let mut store = open(dir.path(), false).unwrap();
-        let key = &BASE_PEERS[0].public_key;
-        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
-
-        // A peer isn't known to speak TLS until it is latched, which only a recorded peer can be.
-        assert!(!store.speaks_tls(key).unwrap());
-        assert!(!store.speaks_tls(unknown).unwrap());
-        assert!(store.latch_tls(unknown).is_err());
-        store.latch_tls(key).unwrap();
-        assert!(store.speaks_tls(key).unwrap());
-
-        // The latch survives updates of the peer and reopening the data store.
-        assert!(store.update_peers(&BASE_PEERS).is_empty());
-        let store = open(dir.path(), false).unwrap();
-        assert!(store.speaks_tls(key).unwrap());
-    }
-
-    #[test]
-    fn test_quic_port() {
-        let dir = tempfile::tempdir().unwrap();
-        setup_basic_store(dir.path());
-        let mut store = open(dir.path(), false).unwrap();
-        let key = &BASE_PEERS[0].public_key;
-        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
-
-        // The port is unknown until it is recorded, which only a recorded peer can be, and a
-        // port recorded later replaces it.
-        assert_eq!(store.quic_port(key).unwrap(), None);
-        assert_eq!(store.quic_port(unknown).unwrap(), None);
-        assert!(store.set_quic_port(unknown, 4433).is_err());
-        store.set_quic_port(key, 4433).unwrap();
-        assert_eq!(store.quic_port(key).unwrap(), Some(4433));
-        store.set_quic_port(key, 4434).unwrap();
-
-        // The port survives updates of the peer and reopening the data store, and the database
-        // refuses a port that isn't one.
-        assert!(store.update_peers(&BASE_PEERS).is_empty());
-        let store = open(dir.path(), false).unwrap();
-        assert_eq!(store.quic_port(key).unwrap(), Some(4434));
-        assert!(store
-            .store
-            .execute("UPDATE peers SET quic_port = 0", [])
-            .is_err());
-    }
-
-    #[test]
     fn test_introduce() {
         let dir = tempfile::tempdir().unwrap();
         let own_key = wireguard_control::KeyPair::generate();
@@ -1111,7 +1349,13 @@ mod tests {
 
         // A new data store pins the coordinator at its internal address, and this client to the
         // delegations that the invitation offers it, without a name.
-        let mut store = open(dir.path(), true).unwrap();
+        let mut store = DataStore::open_with_paths(
+            &db_path(dir.path()),
+            &legacy_path(dir.path()),
+            Network::from_config(&config).unwrap(),
+            true,
+        )
+        .unwrap();
         let offered: Vec<Prefix> = vec![
             "10.0.0.16/28".parse().unwrap(),
             "10.0.0.2/32".parse().unwrap(),
@@ -1122,11 +1366,26 @@ mod tests {
         assert_eq!(peers[0].delegations, COORDINATOR.delegations);
         assert_eq!(peers[0].public_key, COORDINATOR.public_key);
         assert_eq!(peers[0].name, None);
-        assert_eq!(peers[1].delegations, [offered[1], offered[0]]);
+        assert_eq!(
+            peers[1].delegations,
+            [offered[1], offered[0]],
+            "sorted, as delegations are"
+        );
         assert_eq!(peers[1].public_key, own_key.public.to_base64());
         assert_eq!(peers[1].name, None);
 
-        // No other key can be reported at the coordinator's internal address.
+        // The coordinator is checked as every other peer is, so it may be reported at another
+        // address, which then takes effect. Its unsigned announcement releases nothing, so its
+        // internal address stays pinned to its key, and no other key can be reported at it.
+        let mut moved = [COORDINATOR.clone()];
+        moved[0].delegations = host("10.0.0.3");
+        assert!(store.update_peers(&moved).is_empty());
+        let coordinator = store
+            .effective_peer(&COORDINATOR.public_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordinator.delegations, host("10.0.0.3"));
+        assert_eq!(coordinator.primary_ip, Some("10.0.0.3".parse().unwrap()));
         let mut replaced = [COORDINATOR.clone()];
         replaced[0].public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         assert_eq!(store.update_peers(&replaced).len(), 1);
@@ -1153,7 +1412,7 @@ mod tests {
             "peer.example.com:1".parse().unwrap(),
         ];
         v4.persistent_keepalive_interval = Some(25);
-        v4.invite_expires = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        v4.invite_expires = Some(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
         v4.is_admin = true;
         let mut domain = BASE_PEERS[0].clone();
         domain.name = Some("domain".parse().unwrap());
@@ -1201,8 +1460,8 @@ mod tests {
         let expected_peers = varied_peers();
         for store in [store, open(dir.path(), false).unwrap()] {
             let cidrs = store.cidrs().unwrap();
-            assert_eq!(cidrs, expected_cidrs);
-            assert_eq!(store.peers().unwrap(), expected_peers);
+            assert_eq!(cidrs, &expected_cidrs[..]);
+            assert_eq!(store.peers().unwrap(), &expected_peers[..]);
             assert_eq!(cidrs[0].parent(&cidrs), None);
             assert_eq!(cidrs[1].parent(&cidrs), Some(&cidrs[0]));
             assert_eq!(cidrs[2].parent(&cidrs), Some(&cidrs[0]));
@@ -1214,19 +1473,18 @@ mod tests {
     #[test]
     fn test_ipv6_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let network: IpNet = "fd00::/64".parse().unwrap();
         let mut peer = BASE_PEERS[0].clone();
         peer.delegations = host("fd00::1");
         peer.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
         let mut store = DataStore::open_with_paths(
             &db_path(dir.path()),
             &legacy_path(dir.path()),
-            self::network(network),
+            network("fd00::/64".parse().unwrap()),
             true,
         )
         .unwrap();
         assert!(store.update_peers(std::slice::from_ref(&peer)).is_empty());
-        assert_eq!(store.peers().unwrap(), [peer]);
+        assert_eq!(store.peers().unwrap(), std::slice::from_ref(&peer));
     }
 
     #[test]
@@ -1239,16 +1497,16 @@ mod tests {
         let legacy = std::fs::read(legacy_path(dir.path())).unwrap();
         let mut store = open(dir.path(), false).unwrap();
         let expected_peers = varied_peers();
-        assert_eq!(store.peers().unwrap(), expected_peers);
+        assert_eq!(store.peers().unwrap(), &expected_peers[..]);
         let mut expected_cidrs = varied_cidrs();
         expected_cidrs.sort_by_key(|c| c.cidr);
-        assert_eq!(store.cidrs().unwrap(), expected_cidrs);
+        assert_eq!(store.cidrs().unwrap(), &expected_cidrs[..]);
 
         // From then on the database is the data store, and the legacy one is never read again.
         store.update_peers(&[]);
         write_legacy(dir.path(), &[], &[]);
         let store = open(dir.path(), false).unwrap();
-        assert_eq!(store.peers().unwrap(), disabled(&expected_peers));
+        assert_eq!(store.peers().unwrap(), &disabled(&expected_peers)[..]);
         write_legacy(dir.path(), &legacy_peers, &varied_cidrs());
         assert_eq!(std::fs::read(legacy_path(dir.path())).unwrap(), legacy);
     }
@@ -1257,16 +1515,25 @@ mod tests {
     fn test_connection_settings() {
         let dir = tempfile::tempdir().unwrap();
         let store = open(dir.path(), true).unwrap();
-        let conn: &Connection = &store.store;
+        let conn = &*store.store;
         let pragma = |name| -> i64 { conn.pragma_query_value(None, name, |r| r.get(0)).unwrap() };
         assert_eq!(pragma("foreign_keys"), 1);
         assert_eq!(pragma("trusted_schema"), 0);
-        assert_eq!(pragma("busy_timeout"), BUSY_TIMEOUT.as_millis() as i64);
-        assert_eq!(pragma("application_id"), APPLICATION_ID as i64);
-        assert_eq!(pragma("user_version"), SCHEMA_VERSION);
-        assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());
-        assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML).unwrap());
-        assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL).unwrap());
+        assert_eq!(
+            pragma("busy_timeout"),
+            std::time::Duration::from_secs(5).as_millis() as i64
+        );
+        assert_eq!(pragma("application_id"), db::APPLICATION_ID as i64);
+        assert_eq!(pragma("user_version"), db::SCHEMA_VERSION);
+        assert!(conn
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+            .unwrap());
+        assert!(!conn
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML)
+            .unwrap());
+        assert!(!conn
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DDL)
+            .unwrap());
 
         // Every table is strict.
         let lax: i64 = conn
@@ -1295,7 +1562,7 @@ mod tests {
         };
 
         // A newer database that this version can still read is opened, without migrating it.
-        set(SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        set(db::SCHEMA_VERSION + 1, db::SCHEMA_VERSION);
         assert_eq!(
             open(dir.path(), false).unwrap().peers().unwrap(),
             *BASE_PEERS
@@ -1304,10 +1571,10 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION + 1);
+        assert_eq!(version, db::SCHEMA_VERSION + 1);
 
         // One that needs a newer reader is refused.
-        set(SCHEMA_VERSION + 1, SCHEMA_VERSION + 1);
+        set(db::SCHEMA_VERSION + 1, db::SCHEMA_VERSION + 1);
         assert!(open(dir.path(), false).is_err());
     }
 
@@ -1341,15 +1608,17 @@ mod tests {
         // The daemon's handle predates the pin, but its update still keeps another key from the
         // pinned IP, and disables the pinned peer, which its state leaves out.
         let mut impostor = pinned.clone();
-        impostor.name = Some("impostor".parse().unwrap());
         impostor.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         let mut with_impostor = BASE_PEERS.clone();
         with_impostor.push(impostor);
         assert_eq!(daemon.update_peers(&with_impostor).len(), 1);
         let mut expected = BASE_PEERS.clone();
         expected.extend(disabled(&[pinned]));
-        assert_eq!(daemon.peers().unwrap(), expected);
-        assert_eq!(open(dir.path(), false).unwrap().peers().unwrap(), expected);
+        assert_eq!(daemon.peers().unwrap(), &expected[..]);
+        assert_eq!(
+            open(dir.path(), false).unwrap().peers().unwrap(),
+            &expected[..]
+        );
     }
 
     #[test]
@@ -1376,5 +1645,164 @@ mod tests {
             }
         });
         assert_eq!(open(dir.path(), false).unwrap().peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_tls_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+        let key = &BASE_PEERS[0].public_key;
+        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+
+        // A peer isn't known to speak TLS until it is latched, which only a recorded peer can be.
+        assert!(!store.speaks_tls(key).unwrap());
+        assert!(!store.speaks_tls(unknown).unwrap());
+        assert!(store.latch_tls(unknown).is_err());
+        store.latch_tls(key).unwrap();
+        assert!(store.speaks_tls(key).unwrap());
+
+        // The latch survives updates of the peer and reopening the data store.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        let store = open(dir.path(), false).unwrap();
+        assert!(store.speaks_tls(key).unwrap());
+    }
+
+    #[test]
+    fn test_names_are_pinned() {
+        // The names of peers are pinned as soon as a data store of an earlier version is imported.
+        // An unsigned announcement, which the server makes for a peer that has never signed one,
+        // releases no name, so the server can neither rename such a peer nor move its name to
+        // another key, even by swapping two names in one update.
+        let dir = tempfile::tempdir().unwrap();
+        let other_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+        let mut other = BASE_PEERS[0].clone();
+        other.public_key = other_key.to_string();
+        other.delegations = host("10.0.0.2");
+        other.name = Some("other".parse().unwrap());
+        write_legacy(dir.path(), &[BASE_PEERS[0].clone(), other.clone()], &[]);
+        let mut store = open(dir.path(), false).unwrap();
+        let names = |store: &DataStore| {
+            store
+                .peers()
+                .unwrap()
+                .iter()
+                .map(|peer| peer.display_name().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&store), ["blah", "other"]);
+
+        let renamed = |peer: &PeerContents, name: &str| PeerContents {
+            name: Some(name.parse().unwrap()),
+            ..peer.clone()
+        };
+        assert!(store
+            .update_peers(&[BASE_PEERS[0].clone(), renamed(&other, "renamed")])
+            .is_empty());
+        assert_eq!(names(&store), ["blah", "other"]);
+        assert!(store
+            .update_peers(&[renamed(&BASE_PEERS[0], "other"), renamed(&other, "blah")])
+            .is_empty());
+        assert_eq!(names(&store), ["blah", "other"]);
+        assert_eq!(names(&open(dir.path(), false).unwrap()), ["blah", "other"]);
+
+        // A new peer that the server names as another key's pinned name is refused.
+        let mut new = other.clone();
+        new.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        new.delegations = host("10.0.0.3");
+        new.name = Some("blah".parse().unwrap());
+        let reported = [BASE_PEERS[0].clone(), other.clone(), new];
+        assert_eq!(store.update_peers(&reported).len(), 1);
+        assert_eq!(store.peers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_quic_port() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+        let key = &BASE_PEERS[0].public_key;
+        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+
+        // The port is unknown until it is recorded, which only a recorded peer can be, and a
+        // port recorded later replaces it.
+        assert_eq!(store.quic_port(key).unwrap(), None);
+        assert_eq!(store.quic_port(unknown).unwrap(), None);
+        assert!(store.set_quic_port(unknown, 4433).is_err());
+        store.set_quic_port(key, 4433).unwrap();
+        assert_eq!(store.quic_port(key).unwrap(), Some(4433));
+        store.set_quic_port(key, 4434).unwrap();
+
+        // The port survives updates of the peer and reopening the data store, and the database
+        // refuses a port that isn't one.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        let store = open(dir.path(), false).unwrap();
+        assert_eq!(store.quic_port(key).unwrap(), Some(4434));
+        assert!(store
+            .store
+            .execute("UPDATE peers SET quic_port = 0", [])
+            .is_err());
+    }
+
+    /// The number of rows of `table` that belong to the public key `key`.
+    fn rows_of(store: &DataStore, table: &str, key: &str) -> i64 {
+        store
+            .store
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE public_key = ?1"),
+                [key_to_bytes(key).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn test_database_keeps_consistency() {
+        // The database refuses to pin a name to two keys, a pin of an unknown kind, and to delete a
+        // peer while what refers to it remains. An operator releases a prefix pin by deleting it,
+        // and a name by clearing it.
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let store = open(dir.path(), false).unwrap();
+        let key = key_to_bytes(&BASE_PEERS[0].public_key).unwrap();
+        let other = key_to_bytes("HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=").unwrap();
+        let conn = &*store.store;
+        conn.execute_batch(&format!(
+            "INSERT INTO peers (public_key, name) VALUES (x'{other}', 'other');
+             INSERT INTO prefix_pins VALUES (x'0a000002', 32, x'0a000002', x'{other}', 1, 1);
+             INSERT INTO delegations (address, prefix_len, last, public_key)
+               VALUES (x'0a000002', 32, x'0a000002', x'{other}');",
+            other = hex(&other),
+        ))
+        .unwrap();
+        for refused in [
+            "INSERT INTO prefix_pins VALUES (x'0a000003', 32, x'0a000003', x'{key}', 0, 1)",
+            "UPDATE peers SET name = 'blah' WHERE public_key = x'{other}'",
+            "DELETE FROM peers WHERE public_key = x'{key}'",
+        ] {
+            let refused = refused
+                .replace("{key}", &hex(&key))
+                .replace("{other}", &hex(&other));
+            assert!(
+                conn.execute_batch(&refused).is_err(),
+                "{refused} was accepted"
+            );
+        }
+        // A pin is released by deleting it.
+        conn.execute_batch(&format!(
+            "DELETE FROM prefix_pins WHERE public_key = x'{other}';
+             UPDATE peers SET name = NULL WHERE public_key = x'{other}';",
+            other = hex(&other),
+        ))
+        .unwrap();
+        drop(store);
+        assert_eq!(
+            open(dir.path(), false).unwrap().peers().unwrap()[0],
+            BASE_PEERS[0]
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Access to the tables of [`SCHEMA`](crate::SCHEMA), through a [`Connection`], which a
+//! Access to the node tables of [`SCHEMA`](crate::SCHEMA), through a [`Connection`], which a
 //! [`rusqlite::Transaction`] dereferences to. Each function reads or writes what it names and
 //! nothing else, and leaves transactions to the host: the host decides what applies together.
 //!
@@ -6,7 +6,8 @@
 //! [`key_to_bytes`] makes of their base64 text, and the readers key their results by the canonical
 //! base64 text, as a state's public keys are deserialized.
 
-use innernet_shared::{Cidr, Endpoint, Hostname, PeerContents, Prefix};
+use crate::claims::Claim;
+use innernet_shared::{announcement::Announcement, Cidr, Endpoint, Hostname, PeerContents, Prefix};
 use ipnet::IpNet;
 use rusqlite::{params, types::Type, Connection, OptionalExtension as _, Row};
 use std::{
@@ -19,14 +20,21 @@ use wireguard_control::{InvalidKey, Key};
 /// The kinds of the endpoints of `endpoints`, as the `endpoint_kinds` table names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
+    /// The endpoint that the node records of a peer apart from its announcements.
     Endpoint = 0,
+    /// The candidates that the node records of a peer apart from its announcements.
     Candidate = 1,
+    /// The endpoints that the last announcement accepted from a peer states, in their order.
+    Announced = 2,
 }
 
 impl EndpointKind {
     /// Every kind, with its name in `endpoint_kinds`.
-    pub const ALL: &'static [(Self, &'static str)] =
-        &[(Self::Endpoint, "endpoint"), (Self::Candidate, "candidate")];
+    pub const ALL: &'static [(Self, &'static str)] = &[
+        (Self::Endpoint, "endpoint"),
+        (Self::Candidate, "candidate"),
+        (Self::Announced, "announced"),
+    ];
 
     fn from_i64(kind: i64) -> Option<Self> {
         Self::ALL
@@ -39,7 +47,7 @@ impl EndpointKind {
 /// The kinds of the pins of `prefix_pins`, as the `pin_kinds` table names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinKind {
-    /// A delegation of a peer.
+    /// A prefix of the delegation that a peer claims.
     Delegation = 1,
 }
 
@@ -93,6 +101,7 @@ pub fn row_key(row: &Row, column: usize) -> Result<String, rusqlite::Error> {
         .map_err(|_| rusqlite::Error::InvalidColumnType(column, "public key".into(), Type::Blob))
 }
 
+/// The address of a row, in the column `column`.
 fn row_ip(row: &Row, column: usize) -> Result<Option<IpAddr>, rusqlite::Error> {
     row.get::<_, Option<Vec<u8>>>(column)?
         .map(|bytes| {
@@ -132,11 +141,13 @@ pub fn write_endpoints<'a>(
     Ok(())
 }
 
-/// The endpoints of a peer, as `endpoints` holds them.
+/// The endpoints of a peer, as `endpoints` holds them: those that the node records apart from the
+/// peer's announcements, and those that its last accepted announcement states, in their order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredEndpoints {
     pub endpoint: Option<Endpoint>,
     pub candidates: Vec<Endpoint>,
+    pub announced: Vec<Endpoint>,
 }
 
 /// The endpoints of every peer, or only of the peer with the public key `only`, by public key.
@@ -172,9 +183,285 @@ pub fn load_endpoints(
         match kind {
             EndpointKind::Endpoint => entry.endpoint = Some(endpoint),
             EndpointKind::Candidate => entry.candidates.push(endpoint),
+            EndpointKind::Announced => entry.announced.push(endpoint),
         }
     }
     Ok(endpoints)
+}
+
+/// Writes `announcement`, the last one accepted from the peer with the public key `key`, and
+/// whether it is `signed`, decoded, in place of the stored one: its timestamp and its statements,
+/// its announced endpoints among them, in their order. Its claims are pinned apart, with
+/// [`release_claims`] and [`pin_claims`]. An older announcement is refused, as is an unsigned
+/// one of a peer that has signed one, as [`StoreError`] tells; a signed one latches the peer, so
+/// that only its signed announcements are written from then on.
+pub fn write_announcement(
+    conn: &Connection,
+    key: &[u8; 32],
+    announcement: &Announcement,
+    signed: bool,
+) -> Result<(), rusqlite::Error> {
+    let stored: Option<(Option<u64>, bool)> = conn
+        .query_row(
+            "SELECT a.timestamp, p.announces FROM peers p
+             LEFT JOIN announcements a ON a.public_key = p.public_key
+             WHERE p.public_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match stored {
+        None => return Err(StoreError::UnknownPeer.into()),
+        Some((Some(last), _)) if announcement.timestamp < last => {
+            return Err(StoreError::Older.into());
+        },
+        Some((_, true)) if !signed => return Err(StoreError::Unsigned.into()),
+        _ => {},
+    }
+    let Announcement {
+        timestamp,
+        claims: _,
+        allowed_ips,
+        primary_ip,
+        endpoints,
+    } = announcement;
+    let timestamp = i64::try_from(*timestamp)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    conn.execute(
+        "INSERT INTO announcements (public_key, timestamp, signed, primary_ip)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (public_key) DO UPDATE SET timestamp = excluded.timestamp,
+           signed = excluded.signed, primary_ip = excluded.primary_ip",
+        params![key, timestamp, signed, primary_ip.map(ip_to_bytes)],
+    )?;
+    conn.execute(
+        "DELETE FROM announced_allowed_ips WHERE public_key = ?1",
+        params![key],
+    )?;
+    for prefix in allowed_ips {
+        conn.execute(
+            "INSERT INTO announced_allowed_ips (public_key, address, prefix_len)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![key, ip_to_bytes(prefix.first()), prefix.prefix_len()],
+        )?;
+    }
+    if signed {
+        conn.execute(
+            "UPDATE peers SET announces = 1 WHERE public_key = ?1",
+            params![key],
+        )?;
+    }
+    write_endpoints(conn, key, EndpointKind::Announced, endpoints)
+}
+
+/// Releases what is pinned to the key `key`: its prefixes and its name. A host that pins the
+/// claims of several keys at once releases them all before it pins any, so that what moves from
+/// one key to another in one update is never pinned twice; the store refuses that.
+pub fn release_claims(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM prefix_pins WHERE public_key = ?1",
+        params![key],
+    )?;
+    conn.execute(
+        "UPDATE peers SET name = NULL WHERE public_key = ?1 AND name IS NOT NULL",
+        params![key],
+    )?;
+    Ok(())
+}
+
+/// Pins `claim` to the key `key`, each of its prefixes marked claimed if `claimed`, the
+/// delegation that the last announcement accepted from the peer claims, holds it, and its name as
+/// the name of the peer. A prefix that overlaps one pinned to another key is refused, as
+/// [`StoreError::Pinned`], and the database refuses a name pinned to another key.
+pub fn pin_claims(
+    conn: &Connection,
+    key: &[u8; 32],
+    claim: &Claim,
+    claimed: &[Prefix],
+) -> Result<(), rusqlite::Error> {
+    for prefix in &claim.delegation {
+        if pinned_overlapping(conn, prefix)?
+            .iter()
+            .any(|(holder, _)| holder != key)
+        {
+            return Err(StoreError::Pinned(*prefix).into());
+        }
+        conn.execute(
+            "INSERT INTO prefix_pins (address, prefix_len, last, public_key, kind, claimed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (address, prefix_len) DO NOTHING",
+            params![
+                ip_to_bytes(prefix.first()),
+                prefix.prefix_len(),
+                ip_to_bytes(prefix.last()),
+                key,
+                PinKind::Delegation as i64,
+                claimed.contains(prefix),
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE peers SET name = ?2 WHERE public_key = ?1",
+        params![key, claim.name.as_deref()],
+    )?;
+    Ok(())
+}
+
+/// What is pinned to the key of every peer, or only to the key `only`, by public key: its prefixes,
+/// sorted, and its name. A peer with nothing pinned to it is left out. A stored name that isn't a
+/// valid [`Hostname`] is no name.
+pub fn load_claims(
+    conn: &Connection,
+    only: Option<&[u8; 32]>,
+) -> Result<HashMap<String, Claim>, rusqlite::Error> {
+    let mut claims: HashMap<String, Claim> = HashMap::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, name FROM peers
+         WHERE name IS NOT NULL AND (?1 IS NULL OR public_key = ?1)",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        let name = Hostname::try_from(row.get::<_, String>(1)?).ok();
+        if name.is_some() {
+            claims.entry(row_key(row, 0)?).or_default().name = name;
+        }
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM prefix_pins
+         WHERE ?1 IS NULL OR public_key = ?1
+         ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        let prefix = prefix_from_row(row.get(1)?, row.get(2)?)?;
+        claims
+            .entry(row_key(row, 0)?)
+            .or_default()
+            .delegation
+            .push(prefix);
+    }
+    Ok(claims)
+}
+
+/// The last announcement accepted from a peer, as the node stores it decoded, and whether it was
+/// signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAnnouncement {
+    pub announcement: Announcement,
+    pub signed: bool,
+}
+
+/// The last announcement accepted from every peer, or only from the peer with the public key
+/// `only`, by public key, as the node stores it decoded: its timestamp and its statements, with
+/// the announced endpoints in their order, and its claims, the claimed prefixes pinned to the
+/// peer's key and the name of the peer. A stored name that isn't valid is none.
+pub fn load_announcements(
+    conn: &Connection,
+    only: Option<&[u8; 32]>,
+) -> Result<HashMap<String, StoredAnnouncement>, rusqlite::Error> {
+    let mut announcements: HashMap<String, StoredAnnouncement> = HashMap::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.public_key, a.timestamp, a.signed, a.primary_ip, p.name
+         FROM announcements a JOIN peers p ON p.public_key = a.public_key
+         WHERE ?1 IS NULL OR a.public_key = ?1",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        let mut announcement = Announcement {
+            timestamp: row.get(1)?,
+            primary_ip: row_ip(row, 3)?,
+            ..Default::default()
+        };
+        announcement.claims.name = row
+            .get::<_, Option<String>>(4)?
+            .and_then(|name| Hostname::try_from(name).ok());
+        announcements.insert(
+            row_key(row, 0)?,
+            StoredAnnouncement {
+                announcement,
+                signed: row.get(2)?,
+            },
+        );
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM prefix_pins
+         WHERE claimed = 1 AND (?1 IS NULL OR public_key = ?1)
+         ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        if let Some(stored) = announcements.get_mut(&row_key(row, 0)?) {
+            let prefix = prefix_from_row(row.get(1)?, row.get(2)?)?;
+            stored.announcement.claims.delegation.push(prefix);
+        }
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM announced_allowed_ips
+         WHERE ?1 IS NULL OR public_key = ?1
+         ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        if let Some(stored) = announcements.get_mut(&row_key(row, 0)?) {
+            let prefix = prefix_from_row(row.get(1)?, row.get(2)?)?;
+            stored.announcement.allowed_ips.push(prefix);
+        }
+    }
+    for (public_key, endpoints) in load_endpoints(conn, only)? {
+        if let Some(stored) = announcements.get_mut(&public_key) {
+            stored.announcement.endpoints = endpoints.announced;
+        }
+    }
+    Ok(announcements)
+}
+
+/// Whether the peer with the public key `key` has signed an announcement that the node accepted,
+/// after which only its signed announcements are accepted, or `None` if the node doesn't record
+/// the peer.
+pub fn announces(conn: &Connection, key: &[u8; 32]) -> Result<Option<bool>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT announces FROM peers WHERE public_key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Why the store refuses a write. The store keeps what a node accepted consistent with the rules
+/// of [`crate::accept`], whatever writes it: it refuses what the code that decides what to accept
+/// never asks of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreError {
+    /// The peer isn't recorded.
+    UnknownPeer,
+    /// The announcement is older than the one stored.
+    Older,
+    /// The announcement is unsigned, but the peer has signed one.
+    Unsigned,
+    /// The prefix overlaps one pinned to another key.
+    Pinned(Prefix),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPeer => f.write_str("the peer is not recorded"),
+            Self::Older => f.write_str("the announcement is older than the one stored"),
+            Self::Unsigned => {
+                f.write_str("the peer signs its announcements, so an unsigned one is refused")
+            },
+            Self::Pinned(prefix) => write!(f, "{prefix} overlaps a prefix pinned to another key"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<StoreError> for rusqlite::Error {
+    fn from(error: StoreError) -> Self {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+    }
 }
 
 /// The pins that overlap `prefix`, each as the key that it is pinned to, in bytes, and its prefix,
@@ -202,115 +489,25 @@ pub fn pinned_overlapping(
     Ok(overlapping)
 }
 
-/// Pins `delegations` to the key `key`, each unless it is pinned to the key already. The pins of a
-/// key accumulate: none is released when a delegation is withdrawn. The caller must have checked
-/// that no prefix overlaps one pinned to another key.
-pub fn pin_delegations(
-    conn: &Connection,
-    key: &[u8; 32],
-    delegations: &[Prefix],
-) -> Result<(), rusqlite::Error> {
-    for delegation in delegations {
-        conn.execute(
-            "INSERT INTO prefix_pins (address, prefix_len, last, public_key, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (address, prefix_len) DO NOTHING",
-            params![
-                ip_to_bytes(delegation.first()),
-                delegation.prefix_len(),
-                ip_to_bytes(delegation.last()),
-                key,
-                PinKind::Delegation as i64
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-/// The public key of the peer that has the name `name`, if any.
-pub fn name_holder(conn: &Connection, name: &str) -> Result<Option<[u8; 32]>, rusqlite::Error> {
+/// The public key of the peer to whose key `name` is pinned, if any.
+pub fn name_holder(conn: &Connection, name: &str) -> Result<Option<String>, rusqlite::Error> {
     conn.query_row(
         "SELECT public_key FROM peers WHERE name = ?1",
         params![name],
-        |row| row.get::<_, Vec<u8>>(0),
+        |row| row_key(row, 0),
     )
-    .optional()?
-    .map(|key| {
-        key.try_into()
-            .map_err(|_| rusqlite::Error::InvalidColumnType(0, "public key".into(), Type::Blob))
-    })
-    .transpose()
+    .optional()
 }
 
-/// Writes `peer`, keyed by `key`, the bytes of its public key: its record, in place of the stored
-/// one, its delegations, pinned to its key as [`pin_delegations`] pins them, and its endpoint and
-/// candidates. A peer without a name is stored with a NULL name.
-pub fn write_peer(
-    conn: &Connection,
-    key: &[u8; 32],
-    peer: &PeerContents,
-) -> Result<(), rusqlite::Error> {
-    let invite_expires = peer
-        .invite_expires
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs());
+/// Deletes the peer with the public key `key` and everything that the node holds of it: its
+/// announcement, what is pinned to its key, its endpoints and its delegations, and the rows of a
+/// host's tables that refer to it with `ON DELETE CASCADE`. A coordinator deletes an invitation
+/// so, or a peer that it removes; what other nodes pinned to the key stays pinned there.
+pub fn forget_peer(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO peers (public_key, name, is_admin, is_disabled, is_redeemed,
-                            persistent_keepalive_interval, invite_expires)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT (public_key) DO UPDATE SET
-           name = excluded.name,
-           is_admin = excluded.is_admin,
-           is_disabled = excluded.is_disabled,
-           is_redeemed = excluded.is_redeemed,
-           persistent_keepalive_interval = excluded.persistent_keepalive_interval,
-           invite_expires = excluded.invite_expires",
-        params![
-            key,
-            peer.name.as_deref(),
-            peer.is_admin,
-            peer.is_disabled,
-            peer.is_redeemed,
-            peer.persistent_keepalive_interval,
-            invite_expires,
-        ],
-    )?;
-    pin_delegations(conn, key, &peer.delegations)?;
-    write_delegations(conn, key, &peer.delegations)?;
-    write_endpoints(conn, key, EndpointKind::Endpoint, &peer.endpoint)?;
-    write_endpoints(conn, key, EndpointKind::Candidate, &peer.candidates)
-}
-
-/// Replaces the delegations of the peer with the public key `key` with `delegations`.
-pub fn write_delegations(
-    conn: &Connection,
-    key: &[u8; 32],
-    delegations: &[Prefix],
-) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "DELETE FROM delegations WHERE public_key = ?1",
+        "DELETE FROM announcements WHERE public_key = ?1",
         params![key],
     )?;
-    for delegation in delegations {
-        conn.execute(
-            "INSERT INTO delegations (address, prefix_len, last, public_key)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                ip_to_bytes(delegation.first()),
-                delegation.prefix_len(),
-                ip_to_bytes(delegation.last()),
-                key
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-/// Deletes the peer with the public key `key` and everything that the node holds of it: what is
-/// pinned to its key, its endpoints, and the rows of a host's tables that refer to it with
-/// `ON DELETE CASCADE`. A coordinator deletes an invitation so; what other nodes pinned to the key
-/// stays pinned there.
-pub fn forget_peer(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Error> {
     conn.execute(
         "DELETE FROM prefix_pins WHERE public_key = ?1",
         params![key],
@@ -319,33 +516,18 @@ pub fn forget_peer(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Er
     Ok(())
 }
 
-/// The delegations of every peer, or only of the peer with the public key `only`, by public key,
-/// each sorted.
-pub fn load_delegations(
-    conn: &Connection,
-    only: Option<&[u8; 32]>,
-) -> Result<HashMap<String, Vec<Prefix>>, rusqlite::Error> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT public_key, address, prefix_len FROM delegations
-         WHERE ?1 IS NULL OR public_key = ?1
-         ORDER BY length(address), address, prefix_len",
-    )?;
-    let mut rows = stmt.query(params![only])?;
-    let mut delegations: HashMap<String, Vec<Prefix>> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        let delegation = prefix_from_row(row.get(1)?, row.get(2)?)?;
-        delegations
-            .entry(row_key(row, 0)?)
-            .or_default()
-            .push(delegation);
+/// The error of the store that `error` carries, if it carries one.
+pub fn store_error(error: &rusqlite::Error) -> Option<&StoreError> {
+    match error {
+        rusqlite::Error::ToSqlConversionFailure(error) => error.downcast_ref(),
+        _ => None,
     }
-    Ok(delegations)
 }
 
-/// The peers that the node records, invitations included, each with its delegations, ordered by
-/// their hosts fallback addresses, those without one last, then by public key. Server IDs aren't
-/// stored, so every peer's CIDR ID is 0: a host that needs IDs assigns them. A stored name that
-/// isn't a valid [`Hostname`] reads as no name.
+/// The peers that the node records, invitations included, each without its announcement, with
+/// the name pinned to its key, its delegations, and the endpoint and candidates recorded apart
+/// from its announcements, ordered by their hosts fallback addresses, those without one last, then
+/// by public key. A stored name that isn't a valid [`Hostname`] is no name.
 pub fn load_peers(conn: &Connection) -> Result<Vec<PeerContents>, rusqlite::Error> {
     load_peers_where(conn, None)
 }
@@ -362,7 +544,21 @@ fn load_peers_where(
     conn: &Connection,
     only: Option<&[u8; 32]>,
 ) -> Result<Vec<PeerContents>, rusqlite::Error> {
-    let mut delegations = load_delegations(conn, only)?;
+    let mut delegations: HashMap<String, Vec<Prefix>> = HashMap::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM delegations
+         WHERE ?1 IS NULL OR public_key = ?1
+         ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    while let Some(row) = rows.next()? {
+        let delegation = prefix_from_row(row.get(1)?, row.get(2)?)?;
+        delegations
+            .entry(row_key(row, 0)?)
+            .or_default()
+            .push(delegation);
+    }
+
     let mut endpoints = load_endpoints(conn, only)?;
     let mut peers = vec![];
     let mut stmt = conn.prepare_cached(

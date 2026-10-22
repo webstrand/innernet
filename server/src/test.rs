@@ -107,7 +107,7 @@ const PEER_IDS: [i64; 6] = [
 ];
 
 /// The peer of the test database with the ID `id`, one of the `*_PEER_ID`s, found by its IP.
-pub fn peer(conn: &rusqlite::Connection, id: i64) -> DatabasePeer {
+pub fn peer(store: &Store, id: i64) -> DatabasePeer {
     let ip = match id {
         SERVER_PEER_ID => SERVER_CIDR.split_once('/').unwrap().0,
         ADMIN_PEER_ID => ADMIN_PEER_IP,
@@ -117,7 +117,7 @@ pub fn peer(conn: &rusqlite::Connection, id: i64) -> DatabasePeer {
         USER2_PEER_ID => USER2_PEER_IP,
         _ => panic!("the test database has no peer with the ID {id}"),
     };
-    DatabasePeer::get_by_address(conn, ip.parse().unwrap()).unwrap()
+    DatabasePeer::get_by_address(store, ip.parse().unwrap()).unwrap()
 }
 
 pub struct Server {
@@ -160,8 +160,8 @@ impl Server {
         let public_key = Key::from_base64(&config.private_key)?.get_public();
         let db = crate::db::open(
             &conf.database_path(&interface),
-            config.network(),
             &public_key,
+            config.network(),
         )?;
         create_cidr(&db, "admin", ADMIN_CIDR)?;
         DatabasePeer::create(&db, admin_peer_contents("admin", ADMIN_PEER_IP)?)?;
@@ -228,14 +228,14 @@ impl Server {
             .unwrap();
     }
 
-    /// Delegates `prefix` to the peer with the ID `id`, beside its delegations.
+    /// Delegates `prefix` to the peer with the ID `id`, besides its other delegations, which the
+    /// unsigned announcement that the server makes of a peer that has never announced then claims.
     pub fn delegate(&self, id: i64, prefix: &str) {
         let store = self.db.lock();
-        let mut peer = peer(&store, id);
-        let mut delegations = peer.delegations.clone();
-        delegations.push(prefix.parse().unwrap());
-        peer.set_delegations(&store, delegations, &self.public_key, self.internal_address)
-            .unwrap();
+        let peer = peer(&store, id);
+        let key = Key::from_base64(&peer.public_key).unwrap();
+        crate::db::peer::insert_delegation(&store, &key.0, &prefix.parse().unwrap()).unwrap();
+        DatabasePeer::admit_synthesized(&store).unwrap();
     }
 
     /// The server's public key, that of its own peer.

@@ -2,7 +2,7 @@ use crate::{
     db::{self, DatabaseCidr, DatabasePeer},
     ConfigFile, Interface, Path, ServerConfig,
 };
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use clap::Parser;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Input};
@@ -20,20 +20,17 @@ use std::{
 };
 use wireguard_control::KeyPair;
 
-/// Creates the database at `database_path`, which mustn't exist, with mode 0600, of the schema of
-/// every node and the coordinator's annex, for the network `network`.
-fn create_database(
-    database_path: &Path,
-    network: IpNet,
-    server_key: &wireguard_control::Key,
-) -> Result<Store, Error> {
-    let file = std::fs::OpenOptions::new()
+/// Creates the database at `database_path`, which must not exist yet, readable by its owner only,
+/// as the config is, of the schema of every node and the coordinator's annex, for the network
+/// `network`.
+fn create_database(database_path: &Path, network: IpNet) -> Result<Store, Error> {
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(database_path)?;
-    drop(file);
-    db::open(database_path, network, server_key)
+        .open(database_path)
+        .with_context(|| format!("failed to create {}", database_path.display()))?;
+    Store::open(database_path, network, Some(db::create_annex()))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Parser)]
@@ -242,7 +239,7 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
     //                  if any errors occur in these init calls.
 
     let database_path = conf.database_path(&name);
-    let store = create_database(&database_path, root_cidr, &our_keypair.public).map_err(|e| {
+    let store = create_database(&database_path, root_cidr).map_err(|e| {
         anyhow!(
             "failed to create database {} {e:#}",
             "(are you not running as root?)".bold()

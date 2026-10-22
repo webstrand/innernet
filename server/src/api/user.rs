@@ -71,7 +71,7 @@ mod handlers {
 
         let cidrs = DatabaseCidr::list(&conn)?;
 
-        let mut peers = selected_peer.get_all_allowed_peers(&conn)?;
+        let mut peers = selected_peer.get_all_allowed_peers(&conn, &session.context.public_key)?;
         inject_endpoints(&session, peers.iter_mut().map(|peer| &mut peer.inner));
         if session.over_tls {
             form_response(

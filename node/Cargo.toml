@@ -1,7 +1,7 @@
 [package]
 authors = ["webstrand <webstrand@gmail.com>"]
 categories = ["network-programming"]
-description = "The core that every innernet peer runs: what it stores of the other peers of its network."
+description = "The core that every innernet peer runs: what it stores of the other peers, and what it accepts of their announcements."
 edition = "2021"
 keywords.workspace = true
 license = "MIT"

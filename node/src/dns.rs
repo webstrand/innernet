@@ -457,11 +457,13 @@ mod tests {
             allowed_ips: None,
             primary_ip: None,
         };
-        let snapshot = crate::snapshot::snapshot([
-            peer("a", "10.0.0.2", false),
-            peer("off", "10.0.0.3", true),
-            peer("Not Valid", "10.0.0.4", false),
-        ]);
+        let snapshot = crate::snapshot::Snapshot {
+            peers: vec![
+                peer("a", "10.0.0.2", false),
+                peer("off", "10.0.0.3", true),
+                peer("Not Valid", "10.0.0.4", false),
+            ],
+        };
 
         // The enabled peers that have a name, in the zone of the interface or of the suffix.
         assert_eq!(Names::of(&interface, None, &snapshot), {

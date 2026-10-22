@@ -1,175 +1,61 @@
+//! Tests of the node's database and of the input port.
+
 use crate::{
-    accept::Refusal,
-    store::{self, key_to_bytes, EndpointKind, PinKind},
-    Store,
+    accept::{self, Conflict, Received, Refusal},
+    claims::Claim,
+    db::Store,
+    store::{self, key_to_bytes, EndpointKind, PinKind, StoreError},
 };
-use innernet_shared::{PeerContents, Prefix};
+use innernet_shared::{
+    announcement::{self, Announcement, AnnouncementError, Claims, SignedAnnouncement},
+    xeddsa, Prefix,
+};
+use rusqlite::Connection;
 use wireguard_control::KeyPair;
 
-fn network() -> ipnet::IpNet {
-    "10.0.0.0/16".parse().unwrap()
+/// A new database of the current schema, for the network 10.0.0.0/16.
+fn database() -> Store {
+    Store::in_memory("10.0.0.0/16".parse().unwrap()).unwrap()
 }
 
-fn peer(name: &str, ip: &str) -> PeerContents {
-    PeerContents {
-        name: Some(name.parse().unwrap()),
-        delegations: vec![Prefix::host(ip.parse().unwrap())],
-        public_key: KeyPair::generate().public.to_base64(),
-        endpoint: None,
-        persistent_keepalive_interval: None,
-        is_admin: false,
-        is_disabled: false,
-        is_redeemed: true,
-        invite_expires: None,
-        candidates: vec![],
-        announcement: None,
-        allowed_ips: None,
-        primary_ip: None,
+/// Records a peer with the key `keypair`.
+fn record(conn: &Connection, keypair: &KeyPair) {
+    conn.execute(
+        "INSERT INTO peers (public_key) VALUES (?1)",
+        [keypair.public.0],
+    )
+    .unwrap();
+}
+
+fn prefixes(prefixes: &[&str]) -> Vec<Prefix> {
+    prefixes.iter().map(|p| p.parse().unwrap()).collect()
+}
+
+/// An announcement that claims `delegation` and `name`, with the first address of the delegation
+/// as its primary IP.
+fn announcement(timestamp: u64, delegation: &[&str], name: Option<&str>) -> Announcement {
+    Announcement {
+        timestamp,
+        claims: Claims {
+            delegation: prefixes(delegation),
+            name: name.map(|name| name.parse().unwrap()),
+        },
+        allowed_ips: prefixes(delegation),
+        primary_ip: prefixes(delegation).first().map(Prefix::first),
+        ..Default::default()
     }
 }
 
-fn accept(store: &Store, peers: &[&PeerContents]) -> Vec<Result<(), Refusal>> {
-    store.accept(peers).unwrap()
-}
-
-#[test]
-fn test_pins() {
-    let store = Store::in_memory(network()).unwrap();
-    let a = peer("a", "10.0.0.2");
-    assert_eq!(accept(&store, &[&a]), [Ok(())]);
-
-    // The key may move to another address, but its old address stays pinned to it, so that no
-    // other key may take it.
-    let moved = PeerContents {
-        delegations: vec!["10.0.0.3/32".parse().unwrap()],
-        ..a.clone()
-    };
-    assert_eq!(accept(&store, &[&moved]), [Ok(())]);
-    let impostor = peer("b", "10.0.0.2");
-    assert_eq!(
-        accept(&store, &[&impostor]),
-        [Err(Refusal::Pinned {
-            prefix: a.delegations[0]
-        })]
-    );
-    let pins: i64 = store
-        .query_row("SELECT count(*) FROM prefix_pins", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(pins, 2);
-
-    // Anything else of a pinned peer changes in place.
-    let renamed = PeerContents {
-        name: Some("renamed".parse().unwrap()),
-        is_admin: true,
-        ..a.clone()
-    };
-    assert_eq!(accept(&store, &[&renamed]), [Ok(())]);
-    assert_eq!(store::load_peers(&store).unwrap(), [renamed]);
-}
-
-#[test]
-fn test_network() {
-    let store = Store::in_memory(network()).unwrap();
-    let outside = peer("outside", "10.1.0.2");
-    assert_eq!(
-        accept(&store, &[&outside]),
-        [Err(Refusal::OutsideNetwork {
-            prefix: outside.delegations[0],
-            network: network()
-        })]
-    );
-    assert!(store::load_peers(&store).unwrap().is_empty());
-}
-
-#[test]
-fn test_duplicates_and_names_moving() {
-    let store = Store::in_memory(network()).unwrap();
-    let a = peer("a", "10.0.0.2");
-    let b = peer("b", "10.0.0.3");
-    let same_ip = PeerContents {
-        name: Some("c".parse().unwrap()),
-        ..peer("c", "10.0.0.2")
-    };
-    assert_eq!(
-        accept(&store, &[&a, &b, &same_ip]),
-        [Ok(()), Ok(()), Err(Refusal::Duplicate)]
-    );
-
-    // Two peers swap names within one batch.
-    let a_as_b = PeerContents {
-        name: Some("b".parse().unwrap()),
-        ..a.clone()
-    };
-    let b_as_a = PeerContents {
-        name: Some("a".parse().unwrap()),
-        ..b.clone()
-    };
-    assert_eq!(accept(&store, &[&a_as_b, &b_as_a]), [Ok(()), Ok(())]);
-
-    // A name that its holder keeps can't be taken.
-    let c = PeerContents {
-        name: Some("a".parse().unwrap()),
-        ..peer("c", "10.0.0.4")
-    };
-    assert_eq!(accept(&store, &[&c]), [Err(Refusal::NameTaken)]);
-    let names: Vec<String> = store::load_peers(&store)
-        .unwrap()
-        .iter()
-        .map(|peer| peer.display_name().to_string())
-        .collect();
-    assert_eq!(names, ["b", "a"]);
-}
-
-#[test]
-fn test_forget_releases_the_pins() {
-    let store = Store::in_memory(network()).unwrap();
-    let invitation = PeerContents {
-        is_redeemed: false,
-        endpoint: Some("198.51.100.1:51820".parse().unwrap()),
-        ..peer("invited", "10.0.0.2")
-    };
-    accept(&store, &[&invitation]);
-    store::forget_peer(&store, &key_to_bytes(&invitation.public_key).unwrap()).unwrap();
-    let redeemed = PeerContents {
-        is_redeemed: true,
-        public_key: KeyPair::generate().public.to_base64(),
-        ..invitation
-    };
-    assert_eq!(accept(&store, &[&redeemed]), [Ok(())]);
-    assert_eq!(store::load_peers(&store).unwrap(), [redeemed]);
-}
-
-#[test]
-fn test_schema_holds_no_policy() {
-    // The schema enforces consistency alone: an operator may delete a pin and its peer by hand.
-    let store = Store::in_memory(network()).unwrap();
-    let a = peer("a", "10.0.0.2");
-    accept(&store, &[&a]);
-    let triggers: i64 = store
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(triggers, 0);
-    let key = key_to_bytes(&a.public_key).unwrap();
-    assert!(store
-        .execute("DELETE FROM peers WHERE public_key = ?1", [&key])
-        .is_err());
-    store
-        .execute("DELETE FROM prefix_pins WHERE public_key = ?1", [&key])
-        .unwrap();
-    store
-        .execute("DELETE FROM peers WHERE public_key = ?1", [&key])
-        .unwrap();
+fn sign(keypair: &KeyPair, announcement: &Announcement) -> SignedAnnouncement {
+    let private_key = xeddsa::PrivateKey::from_base64(&keypair.private.to_base64()).unwrap();
+    announcement.sign(&private_key).unwrap()
 }
 
 #[test]
 fn test_kinds_match_tables() {
-    let store = Store::in_memory(network()).unwrap();
+    let conn = database();
     let kinds = |table: &str| -> Vec<(i64, String)> {
-        let mut stmt = store
+        let mut stmt = conn
             .prepare(&format!("SELECT kind, name FROM {table} ORDER BY kind"))
             .unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -190,100 +76,240 @@ fn test_kinds_match_tables() {
 }
 
 #[test]
-fn test_peers_without_a_name() {
-    // Any number of peers can be without a name, and a peer can lose its name and get one again.
-    let store = Store::in_memory(network()).unwrap();
-    let nameless: Vec<PeerContents> = ["10.0.0.2", "10.0.0.3"]
-        .into_iter()
-        .map(|ip| PeerContents {
-            name: None,
-            ..peer("x", ip)
-        })
-        .collect();
-    let refs: Vec<&PeerContents> = nameless.iter().collect();
-    assert_eq!(accept(&store, &refs), [Ok(()), Ok(())]);
-    let nulls: i64 = store
-        .query_row("SELECT count(*) FROM peers WHERE name IS NULL", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(nulls, 2);
-    assert_eq!(store::load_peers(&store).unwrap(), nameless);
-
-    let named = PeerContents {
-        name: Some("named".parse().unwrap()),
-        ..nameless[0].clone()
-    };
-    assert_eq!(accept(&store, &[&named]), [Ok(())]);
-    assert_eq!(store::load_peers(&store).unwrap()[0], named);
-}
-
-#[test]
-fn test_invalid_stored_names_are_no_names() {
-    // A stored name that isn't a valid hostname, as an operator may write by hand, reads as none.
-    let store = Store::in_memory(network()).unwrap();
-    let a = peer("a", "10.0.0.2");
-    accept(&store, &[&a]);
-    store
-        .execute("UPDATE peers SET name = 'Not Valid'", [])
-        .unwrap();
-    assert_eq!(store::load_peers(&store).unwrap()[0].name, None);
-}
-
-#[test]
-fn test_delegations() {
-    let store = Store::in_memory(network()).unwrap();
-    let delegations = |prefixes: &[&str]| -> Vec<Prefix> {
-        prefixes
+fn test_schema_keeps_consistency() {
+    // The schema refuses what would make the database inconsistent: a name pinned to two keys, a
+    // pin whose last address lies before its first, and a peer deleted before what refers to it.
+    // It lets an operator move a pin by hand.
+    let conn = database();
+    let [key, other] = [(); 2].map(|_| KeyPair::generate());
+    record(&conn, &key);
+    record(&conn, &other);
+    let hex = |keypair: &KeyPair| -> String {
+        keypair
+            .public
+            .0
             .iter()
-            .map(|prefix| prefix.parse().unwrap())
+            .map(|b| format!("{b:02x}"))
             .collect()
     };
-    let a = PeerContents {
-        delegations: delegations(&["10.0.0.2/32"]),
-        ..peer("a", "10.0.0.2")
-    };
-    assert_eq!(accept(&store, &[&a]), [Ok(())]);
+    let (key, other) = (hex(&key), hex(&other));
+    conn.execute_batch(&format!(
+        "INSERT INTO prefix_pins VALUES (x'0a000100', 24, x'0a0001ff', x'{other}', 1, 1);
+         UPDATE peers SET name = 'other' WHERE public_key = x'{other}';"
+    ))
+    .unwrap();
+    for refused in [
+        format!("INSERT INTO prefix_pins VALUES (x'0a000209', 32, x'0a000200', x'{key}', 1, 1)"),
+        format!("UPDATE peers SET name = 'other' WHERE public_key = x'{key}'"),
+        format!("DELETE FROM peers WHERE public_key = x'{other}'"),
+    ] {
+        assert!(
+            conn.execute_batch(&refused).is_err(),
+            "{refused} was accepted"
+        );
+    }
+    conn.execute_batch(&format!(
+        "UPDATE prefix_pins SET public_key = x'{key}';
+         DELETE FROM prefix_pins;
+         DELETE FROM peers WHERE public_key = x'{other}';"
+    ))
+    .unwrap();
+}
 
-    // A wider delegation that holds a prefix pinned to the same key nests within its pins.
-    let wider = PeerContents {
-        delegations: delegations(&["10.0.0.0/28", "10.0.1.0/24"]),
-        ..a.clone()
-    };
-    assert_eq!(accept(&store, &[&wider]), [Ok(())]);
-    assert_eq!(store::load_peers(&store).unwrap(), [wider]);
+#[test]
+fn test_store_refuses_what_accept_never_asks() {
+    let conn = database();
+    let [peer, other] = [(); 2].map(|_| KeyPair::generate());
+    record(&conn, &peer);
+    record(&conn, &other);
+    let (key, other_key) = (peer.public.0, other.public.0);
+    let pinned = |error: rusqlite::Error| store::store_error(&error).cloned();
 
-    // Another key is refused within any of them, even after they are withdrawn, as is a record
-    // whose delegations overlap one another, or those of an earlier record of the batch.
-    assert_eq!(accept(&store, &[&a]), [Ok(())]);
-    let inside = PeerContents {
-        delegations: delegations(&["10.0.1.128/25"]),
-        ..peer("b", "10.0.2.1")
+    // A prefix that overlaps one pinned to another key is refused, while the pins of one key
+    // nest.
+    let claim = |delegation: &[&str]| Claim {
+        delegation: prefixes(delegation),
+        name: None,
     };
+    store::pin_claims(&conn, &key, &claim(&["10.0.1.0/24"]), &[]).unwrap();
+    store::pin_claims(&conn, &key, &claim(&["10.0.1.0/25"]), &[]).unwrap();
+    for refused in [&["10.0.1.0/24"][..], &["10.0.1.128/25"], &["10.0.0.0/23"]] {
+        let error = store::pin_claims(&conn, &other_key, &claim(refused), &[]).unwrap_err();
+        assert!(matches!(pinned(error), Some(StoreError::Pinned(_))));
+    }
+
+    // An announcement older than the stored one is refused; a signed one latches the peer, after
+    // which an unsigned one is refused; an unknown peer has none.
+    let at = |timestamp| announcement(timestamp, &["10.0.1.0/24"], None);
+    store::write_announcement(&conn, &key, &at(5), false).unwrap();
+    let error = store::write_announcement(&conn, &key, &at(4), false).unwrap_err();
+    assert_eq!(pinned(error), Some(StoreError::Older));
+    store::write_announcement(&conn, &key, &at(6), true).unwrap();
+    assert_eq!(store::announces(&conn, &key).unwrap(), Some(true));
+    let error = store::write_announcement(&conn, &key, &at(7), false).unwrap_err();
+    assert_eq!(pinned(error), Some(StoreError::Unsigned));
+    let unknown = KeyPair::generate().public.0;
+    let error = store::write_announcement(&conn, &unknown, &at(7), true).unwrap_err();
+    assert_eq!(pinned(error), Some(StoreError::UnknownPeer));
+
+    // Forgetting a peer deletes it with its announcement and its pins, which another key may then
+    // take.
+    store::forget_peer(&conn, &key).unwrap();
+    assert_eq!(store::announces(&conn, &key).unwrap(), None);
+    store::pin_claims(&conn, &other_key, &claim(&["10.0.1.0/24"]), &[]).unwrap();
+}
+
+#[test]
+fn test_accept() {
+    let conn = database();
+    let [peer, other] = [(); 2].map(|_| KeyPair::generate());
+    record(&conn, &peer);
+    record(&conn, &other);
+    let key = peer.public.to_base64();
+    let all_types = accept::all_claim_types();
+    let relayed: &[String] = &all_types;
+    let now = announcement::timestamp_now();
+    let accept = |key: &str, signed: &SignedAnnouncement, checked_types: &[String], repeats| {
+        let received = Received {
+            public_key: key,
+            announcement: signed,
+            checked_types,
+            repeats,
+        };
+        conn.accept_one(&received, now).unwrap()
+    };
+    let stored = |key: &str| {
+        store::load_announcements(&conn, Some(&key_to_bytes(key).unwrap()))
+            .unwrap()
+            .remove(key)
+    };
+    let claims = |key: &str| {
+        store::load_claims(&conn, Some(&key_to_bytes(key).unwrap()))
+            .unwrap()
+            .remove(key)
+            .unwrap_or_default()
+    };
+
+    // An unsigned announcement, on the coordinator's word, pins what it claims.
+    let synthetic = announcement(0, &["10.0.1.0/24"], Some("peer"));
+    let unsigned = SignedAnnouncement::unsigned(&synthetic).unwrap();
+    let accepted = accept(&key, &unsigned, relayed, true).unwrap();
+    assert!(!accepted.signed);
+    assert_eq!(stored(&key).unwrap().announcement, synthetic);
+    // The same again is read again.
+    assert!(accept(&key, &unsigned, relayed, true).is_ok());
+
+    // Another unsigned one releases nothing: neither the prefix that it leaves out, nor the name.
+    let moved = announcement(0, &["10.0.2.0/24"], Some("moved"));
+    let accepted = accept(
+        &key,
+        &SignedAnnouncement::unsigned(&moved).unwrap(),
+        relayed,
+        true,
+    )
+    .unwrap();
+    assert_eq!(accepted.announcement.claims.name, synthetic.claims.name);
     assert_eq!(
-        accept(&store, &[&inside]),
-        [Err(Refusal::Pinned {
-            prefix: inside.delegations[0]
-        })]
+        claims(&key).delegation,
+        prefixes(&["10.0.1.0/24", "10.0.2.0/24"])
     );
-    let overlapping = PeerContents {
-        delegations: delegations(&["10.0.2.0/24", "10.0.2.0/25"]),
-        ..peer("b", "10.0.2.1")
-    };
-    assert_eq!(accept(&store, &[&overlapping]), [Err(Refusal::Overlapping)]);
-    let b = peer("b", "10.0.2.1");
-    let c = PeerContents {
-        delegations: delegations(&["10.0.2.0/24"]),
-        ..peer("c", "10.0.3.1")
-    };
-    assert_eq!(accept(&store, &[&b, &c]), [Ok(()), Err(Refusal::Duplicate)]);
+    assert_eq!(
+        stored(&key).unwrap().announcement.claims.delegation,
+        prefixes(&["10.0.2.0/24"])
+    );
 
-    // A peer may have no delegation, and is then listed last.
-    let without = PeerContents {
-        delegations: vec![],
-        ..a.clone()
-    };
-    assert_eq!(accept(&store, &[&without]), [Ok(())]);
-    let listed = store::load_peers(&store).unwrap();
-    assert_eq!(listed.last(), Some(&without));
+    // Another key can't claim what is pinned to the peer, whatever it signs.
+    let grabbing = sign(
+        &other,
+        &announcement(now, &["10.0.1.128/25"], Some("other")),
+    );
+    assert_eq!(
+        accept(&other.public.to_base64(), &grabbing, relayed, true),
+        Err(Refusal::Pinned(Conflict::Prefix {
+            claimed: "10.0.1.128/25".parse().unwrap(),
+            held: "10.0.1.0/24".parse().unwrap(),
+            holder: key.clone(),
+        }))
+    );
+    let naming = sign(&other, &announcement(now, &[], Some("peer")));
+    assert_eq!(
+        accept(&other.public.to_base64(), &naming, relayed, true),
+        Err(Refusal::Pinned(Conflict::Name {
+            name: "peer".parse().unwrap(),
+            holder: key.clone(),
+        }))
+    );
+    assert_eq!(stored(&other.public.to_base64()), None);
+
+    // The first signed announcement latches the peer, and releases what it no longer claims.
+    let first = announcement(now, &["10.0.1.0/25"], Some("signed"));
+    assert!(
+        accept(&key, &sign(&peer, &first), relayed, true)
+            .unwrap()
+            .signed
+    );
+    assert_eq!(claims(&key).delegation, first.claims.delegation);
+    assert_eq!(claims(&key).name, first.claims.name);
+    assert_eq!(store::announces(&conn, &peer.public.0).unwrap(), Some(true));
+
+    // From then on, an unsigned one is refused, as is a stale one, one from too far ahead, and
+    // one that isn't the peer's, and the last accepted one stays.
+    let later = announcement(now + 1, &["10.0.1.0/26"], None);
+    for (received, refusal) in [
+        (
+            SignedAnnouncement::unsigned(&later).unwrap(),
+            Refusal::Unsigned,
+        ),
+        (
+            sign(
+                &peer,
+                &Announcement {
+                    timestamp: now - 1,
+                    ..first.clone()
+                },
+            ),
+            Refusal::Stale {
+                timestamp: now - 1,
+                last: now,
+            },
+        ),
+        (
+            sign(
+                &peer,
+                &Announcement {
+                    timestamp: now + 3_600_000_000_000,
+                    ..first.clone()
+                },
+            ),
+            Refusal::TooFarAhead,
+        ),
+        (
+            sign(&other, &later),
+            Refusal::Unreadable(AnnouncementError::BadSignature),
+        ),
+        (
+            sign(&peer, &announcement(now + 1, &["10.1.0.0/24"], None)),
+            Refusal::OutsideNetwork {
+                prefix: "10.1.0.0/24".parse().unwrap(),
+                network: "10.0.0.0/16".parse().unwrap(),
+            },
+        ),
+    ] {
+        assert_eq!(accept(&key, &received, relayed, true), Err(refusal));
+        assert_eq!(stored(&key).unwrap().announcement, first);
+    }
+    // The same signed announcement again is refused from a source that doesn't repeat.
+    let again = sign(&peer, &first);
+    assert!(accept(&key, &again, relayed, true).is_ok());
+    assert!(matches!(
+        accept(&key, &again, relayed, false),
+        Err(Refusal::Stale { .. })
+    ));
+
+    // Only the claims of the types that the coordinator checks are taken.
+    let types = ["delegation".to_string()];
+    let renamed = announcement(now + 2, &["10.0.1.0/25"], Some("renamed"));
+    let accepted = accept(&key, &sign(&peer, &renamed), &types, true).unwrap();
+    assert_eq!(accepted.announcement.claims.name, None);
+    assert_eq!(claims(&key).name, None);
 }

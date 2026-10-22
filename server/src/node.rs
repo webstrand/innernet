@@ -24,15 +24,12 @@ impl Link for LocalLink {
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {
-        let peers = DatabasePeer::list(&self.db.lock())?
-            .into_iter()
-            .map(|peer| peer.inner);
-        Ok(snapshot::snapshot(peers))
+        Ok(snapshot::of_store(&self.db.lock())?)
     }
 
     async fn report_candidates(&mut self, candidates: Vec<Endpoint>) -> Result<(), Error> {
         let store = self.db.lock();
-        DatabasePeer::own(&store, &self.key)?.set_candidates(&store, candidates)?;
+        DatabasePeer::get_from_public_key(&store, &self.key)?.set_candidates(&store, candidates)?;
         Ok(())
     }
 }

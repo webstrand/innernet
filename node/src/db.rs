@@ -1,11 +1,10 @@
 //! The database of a node: the [`Store`], which holds the connection to it with the network of
-//! the node, and through which alone the node accepts the records of peers, and how the
-//! connection is opened, configured and migrated to the version of [`SCHEMA`](crate::SCHEMA) that
-//! this binary writes.
+//! the node, and through which alone the node accepts announcements, and how the connection is
+//! opened, configured and migrated to the version of [`SCHEMA`](crate::SCHEMA) that this binary
+//! writes.
 
-use crate::accept::{self, Refusal};
+use crate::accept::{self, Accepted, Received, Refusal};
 use anyhow::{ensure, Error};
-use innernet_shared::PeerContents;
 use ipnet::IpNet;
 use rusqlite::{config::DbConfig, Connection, OpenFlags, Transaction, TransactionBehavior};
 use rusqlite_migration::{HookError, Migrations, M};
@@ -18,14 +17,14 @@ pub const APPLICATION_ID: i32 = 0x696e_6e72;
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long to wait for another connection to finish writing the database.
-pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a host runs in the transaction that creates the schema of a new database, such as the
 /// import of a store of earlier versions.
 pub type CreateHook = Arc<dyn Fn(&Scope) -> Result<(), Error> + Send + Sync>;
 
 /// A node's database, with the network of the node, the whole-network prefix of its config,
-/// outside which it accepts no peer. It dereferences to its connection, through which a host
+/// outside which it accepts no claim. It dereferences to its connection, through which a host
 /// reads and writes its own tables.
 #[derive(Debug)]
 pub struct Store {
@@ -98,12 +97,22 @@ impl Store {
         migrate(&mut self.conn, self.network, on_create)
     }
 
-    /// Accepts what the node accepts of `peers`, as [`Scope::accept`] does.
+    /// Accepts what the node accepts of `received`, as [`Scope::accept`] does.
     pub fn accept(
         &self,
-        peers: &[&PeerContents],
-    ) -> Result<Vec<Result<(), Refusal>>, rusqlite::Error> {
-        self.scope().accept(peers)
+        received: &[Received],
+        now: u64,
+    ) -> Result<Vec<Result<Accepted, Refusal>>, rusqlite::Error> {
+        self.scope().accept(received, now)
+    }
+
+    /// Accepts `received` alone, as [`Scope::accept`] does.
+    pub fn accept_one(
+        &self,
+        received: &Received,
+        now: u64,
+    ) -> Result<Result<Accepted, Refusal>, rusqlite::Error> {
+        self.scope().accept_one(received, now)
     }
 }
 
@@ -115,44 +124,61 @@ impl Deref for Store {
     }
 }
 
-/// A store as a connection or a transaction of it sees it, through which the node accepts the
-/// records of peers within the network of the store.
+/// A store as a connection or a transaction of it sees it, through which the node accepts
+/// announcements within the network of the store.
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
     conn: &'a Connection,
     network: IpNet,
 }
 
-impl<'a> Scope<'a> {
-    /// The store as `conn`, a connection to a node's database or a transaction of it, sees it, for
-    /// the network `network`.
-    pub fn new(conn: &'a Connection, network: IpNet) -> Self {
-        Self {
-            conn,
-            network: network.trunc(),
-        }
-    }
-
+impl Scope<'_> {
     pub fn network(&self) -> IpNet {
         self.network
     }
 
-    /// Accepts what the node accepts of `peers`, the records of peers as the coordinator makes
-    /// them, as [`accept::decide`] decides it, and records it. Returns, for each of `peers`,
-    /// whether it was accepted or why it was refused.
+    /// Decides what the node accepts of `received`, at the time `now`, without writing anything:
+    /// each announcement is checked as [`accept::check`] checks it within the network of the store,
+    /// and what each accepted one claims is pinned to its key, as [`crate::claims::resolve`]
+    /// decides it.
+    pub fn decide(
+        &self,
+        received: &[Received],
+        now: u64,
+    ) -> Result<Vec<Result<Accepted, Refusal>>, rusqlite::Error> {
+        accept::decide(self.conn, self.network, received, now)
+    }
+
+    /// Records `accepted`, as [`Self::decide`] decided it: each announcement, and what is pinned to
+    /// each key.
+    pub fn apply(&self, accepted: &[Accepted]) -> Result<(), rusqlite::Error> {
+        accept::apply(self.conn, accepted)
+    }
+
+    /// Accepts what the node accepts of `received`, as [`Self::decide`] decides it, and records
+    /// it. Returns, for each of `received`, what was accepted or why it was refused.
     pub fn accept(
         &self,
-        peers: &[&PeerContents],
-    ) -> Result<Vec<Result<(), Refusal>>, rusqlite::Error> {
-        let decided = accept::decide(self.conn, self.network, peers)?;
-        let accepted: Vec<&PeerContents> = peers
+        received: &[Received],
+        now: u64,
+    ) -> Result<Vec<Result<Accepted, Refusal>>, rusqlite::Error> {
+        let decided = self.decide(received, now)?;
+        let accepted: Vec<Accepted> = decided
             .iter()
-            .zip(&decided)
-            .filter(|(_, decided)| decided.is_ok())
-            .map(|(peer, _)| *peer)
+            .filter_map(|decided| decided.as_ref().ok().cloned())
             .collect();
-        accept::apply(self.conn, &accepted)?;
+        self.apply(&accepted)?;
         Ok(decided)
+    }
+
+    /// Accepts `received` alone, as [`Self::accept`] does.
+    pub fn accept_one(
+        &self,
+        received: &Received,
+        now: u64,
+    ) -> Result<Result<Accepted, Refusal>, rusqlite::Error> {
+        let mut decided = self.accept(std::slice::from_ref(received), now)?;
+        Ok(decided.remove(0))
     }
 }
 
@@ -192,9 +218,10 @@ impl Deref for StoreTransaction<'_> {
 }
 
 /// Configures `conn` as every connection to a node's database is: foreign keys on, a busy timeout,
-/// and off what the database doesn't need: SQL that deliberately corrupts it, functions with side
-/// effects called from the schema, and double-quoted strings, which otherwise fall back to
-/// literals when no column has the name and so hide typos.
+/// transactions that take the write lock up front, and off what the database doesn't need: SQL
+/// that deliberately corrupts it, functions with side effects called from the schema, and
+/// double-quoted strings, which otherwise fall back to literals when no column has the name and so
+/// hide typos.
 pub fn configure(conn: &Connection) -> Result<(), Error> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;

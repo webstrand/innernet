@@ -1,32 +1,52 @@
-use super::{DatabaseAssociation, DatabaseCidr};
+use super::{
+    atomically, ip_to_bytes, key_to_bytes, prefix_from_row, DatabaseAssociation, DatabaseCidr,
+};
 use crate::ServerError;
 use innernet_node::{
-    accept::Refusal,
-    store::{self, ip_to_bytes, key_to_bytes, prefix_from_row, row_key, EndpointKind},
+    accept::{self, Received},
+    store::{self as node_store, row_key, write_endpoints, EndpointKind},
     Store,
 };
 use innernet_shared::{
+    announcement::{self, Announcement, SignedAnnouncement},
     check_delegations, cidr_of_delegations, xeddsa, Endpoint, LegacyPeer, LegacyPeerContents,
     PeerContents, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Type, OptionalExtension as _};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::IpAddr,
     ops::{Deref, DerefMut},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use wireguard_control::Key;
 
-/// A peer of the coordinator's database.
+/// The columns of `peers` that [`DatabasePeer::from_row`] reads, in its order.
+static COLUMNS: &[&str] = &[
+    "public_key",
+    "is_admin",
+    "is_disabled",
+    "is_redeemed",
+    "invite_expires",
+    "tls",
+    "announces",
+];
+
 #[derive(Debug)]
 pub struct DatabasePeer {
     pub inner: PeerContents,
-    /// Whether the peer must authenticate over TLS with its key, and is refused when it connects
-    /// in plain HTTP, authenticated only by its source IP: the node's `tls` of the peer. Set from
-    /// creation for every peer that the server creates, and for good once a peer that predates
-    /// TLS connects over TLS.
+    /// Whether the peer must authenticate over TLS with its key, and is refused when it
+    /// connects in plain HTTP, authenticated only by its source IP. Set from creation for every
+    /// peer that the server creates, and for good once a peer that predates TLS connects over
+    /// TLS.
     pub requires_tls: bool,
+    /// The last announcement of the peer that the server's node core accepted, as it stored it
+    /// decoded: the last that the peer signed, or, for a peer that has never announced, the last
+    /// unsigned one that the server made of it, or `None` if the node core has accepted none.
+    pub announced: Option<Announcement>,
+    /// Whether the peer has signed an announcement that the server accepted, after which only its
+    /// signed announcements are accepted.
+    pub announces: bool,
 }
 
 impl Deref for DatabasePeer {
@@ -44,17 +64,19 @@ impl DerefMut for DatabasePeer {
 }
 
 impl DatabasePeer {
-    /// The peer as the API of plain-HTTP sessions transfers it, with the ID `id`, which
-    /// [`Self::plain_http_ids`] gives it, and the ID of its CIDR, the CIDR of its delegations,
-    /// among `cidrs`, every CIDR, as [`DatabaseCidr::id_of`] numbers them, or `None` if clients
-    /// that predate TLS can't represent it, as [`LegacyPeerContents::from_peer`] tells: a peer
-    /// without a name or without a hosts fallback address, which has no CIDR either.
+    /// The peer as the API of plain-HTTP sessions transfers it, as it takes effect, with the ID
+    /// `id`, which [`Self::plain_http_ids`] gives it, and the ID of its CIDR, the CIDR of its
+    /// delegations, among `cidrs`, every CIDR, as [`DatabaseCidr::id_of`] numbers them, or `None`
+    /// if clients that predate TLS can't represent it, as [`LegacyPeerContents::from_peer`] tells:
+    /// a peer without a name or without a hosts fallback address, which has no CIDR either. Such
+    /// clients can't check announcements, so they get what the announcement of the peer, if any,
+    /// makes of it.
     pub fn legacy(&self, id: i64, cidrs: &[DatabaseCidr]) -> Option<LegacyPeer> {
         let cidr = cidr_of_delegations(&self.delegations, &DatabaseCidr::prefixes(cidrs))?;
         let cidr_id = DatabaseCidr::id_of(&cidr, cidrs)?;
         Some(LegacyPeer {
             id,
-            contents: LegacyPeerContents::from_peer(&self.inner, cidr_id)?,
+            contents: LegacyPeerContents::from_peer(&self.effective(), cidr_id)?,
         })
     }
 
@@ -63,52 +85,97 @@ impl DatabasePeer {
     /// are consistent within one response, which is all that clients that predate TLS rely on,
     /// but not from one response to the next: creating or deleting a peer renumbers the peers
     /// after it.
-    pub fn plain_http_ids(conn: &Connection) -> Result<HashMap<String, i64>, ServerError> {
-        Ok(Self::list(conn)?
+    pub fn plain_http_ids(store: &Store) -> Result<HashMap<String, i64>, ServerError> {
+        Ok(Self::list(store)?
             .into_iter()
             .zip(1..)
             .map(|(peer, id)| (peer.inner.public_key, id))
             .collect())
     }
 
+    /// The peer as it takes effect, as [`innernet_node::snapshot::effective`] makes it of the last
+    /// announcement of it that the server's node core accepted, signed or not. A peer of which the
+    /// node core has accepted none is routed nothing, and has no name, as on every client.
+    pub fn effective(&self) -> PeerContents {
+        innernet_node::snapshot::effective(&self.inner, self.announced.as_ref())
+    }
+
     /// Creates the peer `contents`, offering it its delegations, of which it must have at least
     /// one. The delegations must follow the rules of [`check_delegations`], which give the peer
-    /// its CIDR, and the server's node must accept the peer: a name, if it has one, that no other
-    /// peer has, and delegations that overlap no prefix pinned to another key.
+    /// its CIDR.
     pub fn create(store: &Store, mut contents: PeerContents) -> Result<Self, ServerError> {
         contents.delegations.sort();
+        // Only the peer itself announces.
+        contents.announcement = None;
+        contents.allowed_ips = None;
+        contents.primary_ip = None;
+        let PeerContents {
+            name,
+            delegations,
+            public_key,
+            endpoint,
+            is_admin,
+            is_disabled,
+            is_redeemed,
+            invite_expires,
+            candidates,
+            ..
+        } = &contents;
         log::info!("creating peer {:?}", contents);
 
-        if !Self::is_valid_public_key(&contents.public_key) {
+        if !Self::is_valid_public_key(public_key) {
             log::warn!("peer public key is invalid.");
             return Err(ServerError::InvalidQuery);
         }
 
-        if contents.delegations.is_empty() {
+        if delegations.is_empty() {
             return Err(ServerError::Delegation(
                 "a new peer must be offered at least one delegation".into(),
             ));
         }
-        check_new_delegations(store, &contents.delegations, None)?;
+        check_new_delegations(store, delegations, None)?;
 
-        let key = key_to_bytes(&contents.public_key).map_err(|_| ServerError::InvalidQuery)?;
-        let tx = store.unchecked_transaction()?;
-        if let Err(refusal) = store.accept(&[&contents])?.remove(0) {
-            log::warn!("the server's node refuses the peer: {refusal}");
-            return Err(refused(refusal));
-        }
-        // A peer that the server creates is redeemed and used by a client that speaks TLS, so
+        let invite_expires = invite_expires
+            .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .flatten()
+            .map(|t| t.as_secs());
+
+        // A peer created by this version is redeemed and used by a client that speaks TLS, so
         // that nothing else on its machine can act as the peer, and above all as an admin. Only
         // peers that existed before the server spoke TLS may still use plain HTTP.
-        tx.execute(
-            "UPDATE peers SET tls = 1 WHERE public_key = ?1",
-            params![key],
-        )?;
-        tx.commit()?;
-        Ok(Self {
+        let requires_tls = true;
+
+        let key = key_to_bytes(public_key)?;
+        atomically(store, || {
+            store.execute(
+                "INSERT INTO peers (public_key, is_admin, is_disabled,
+                                    is_redeemed, invite_expires, tls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key,
+                    is_admin,
+                    is_disabled,
+                    is_redeemed,
+                    invite_expires,
+                    requires_tls,
+                ],
+            )?;
+            offer_name(store, &key, name.as_deref())?;
+            for delegation in delegations {
+                insert_delegation(store, &key, delegation)?;
+            }
+            write_endpoints(store, &key, EndpointKind::Endpoint, endpoint)?;
+            write_endpoints(store, &key, EndpointKind::Candidate, candidates)?;
+            Self::admit_synthesized(store)
+        })?;
+        let mut peer = Self {
             inner: contents,
-            requires_tls: true,
-        })
+            requires_tls,
+            announced: None,
+            announces: false,
+        };
+        peer.reload_announced(store)?;
+        Ok(peer)
     }
 
     /// Peers are looked up by the key they authenticate with over TLS, encoded canonically.
@@ -117,10 +184,20 @@ impl DatabasePeer {
             .is_ok_and(|key| xeddsa::is_valid_public_key(&key) && key.to_base64() == public_key)
     }
 
-    /// Applies the changes an admin may make to the peer: its name, which it may lose, whether it
-    /// is an admin, and whether it is disabled. The other fields of `contents` are ignored. The
-    /// peer alone sets its endpoint and candidates, its delegations change with
-    /// [`Self::set_delegations`], and its public key never changes.
+    /// The public key of the peer, as the database holds it.
+    fn key(&self) -> Result<[u8; 32], ServerError> {
+        key_to_bytes(&self.public_key)
+    }
+
+    /// The peer as the database now holds it, found by its public key.
+    pub fn reload(&self, store: &Store) -> Result<Self, ServerError> {
+        Ok(Self::get_from_public_key(store, &Key(self.key()?))?)
+    }
+
+    /// Applies the changes an admin may make to the peer: the name offered to it, whether it is an
+    /// admin, and whether it is disabled. The other fields of `contents` are ignored. The peer
+    /// alone sets its endpoint and candidates, its delegations, which give it its CIDR, change
+    /// with [`Self::set_delegations`], and its public key never changes.
     pub fn update(&mut self, store: &Store, contents: PeerContents) -> Result<(), ServerError> {
         if contents.is_admin && !self.is_admin && !self.requires_tls {
             log::warn!(
@@ -129,31 +206,35 @@ impl DatabasePeer {
             );
             return Err(ServerError::PromotionRequiresTls);
         }
-        let updated = PeerContents {
-            name: contents.name,
-            is_admin: contents.is_admin,
-            is_disabled: contents.is_disabled,
-            ..self.stored(store)?
-        };
-        if let Err(refusal) = store.accept(&[&updated])?.remove(0) {
-            log::warn!("the server's node refuses the change: {refusal}");
-            return Err(refused(refusal));
-        }
-        self.inner.name = updated.name;
-        self.inner.is_admin = updated.is_admin;
-        self.inner.is_disabled = updated.is_disabled;
-        Ok(())
+
+        let key = self.key()?;
+        atomically(store, || {
+            store.execute(
+                "UPDATE peers SET is_admin = ?2, is_disabled = ?3 WHERE public_key = ?1",
+                params![key, contents.is_admin, contents.is_disabled],
+            )?;
+            offer_name(store, &key, contents.name.as_deref())?;
+            Self::admit_synthesized(store)
+        })?;
+
+        self.inner.name = contents.name;
+        self.inner.is_admin = contents.is_admin;
+        self.inner.is_disabled = contents.is_disabled;
+        self.reload_announced(store)
     }
 
-    /// Replaces the delegations of the peer with `delegations` as a whole, together or not at
-    /// all. The delegations must follow the rules of [`check_delegations`], with the delegations
-    /// of the other peers. A peer with delegations keeps its CIDR: the new delegations, if any,
-    /// must lie in the CIDR of the current ones, so that a change never moves the peer to another
-    /// CIDR, and so changes what it sees. The server's node must accept them: no delegation may
-    /// overlap a prefix pinned to another key, as one that was delegated to another peer stays.
-    /// The peer may be left without a delegation, which leaves it in effect disabled, except the
-    /// server's own peer, the one with the public key `server_key`, which must keep the delegation
-    /// that holds `internal_address`, the address that the server serves its API on.
+    /// Replaces the delegations of the peer, the ranges assigned to it, with `delegations` as a
+    /// whole: withdraws those that `delegations` leaves out and adds the others, together or not
+    /// at all. The delegations must follow the rules of [`check_delegations`], with the
+    /// delegations of the other peers. A peer with delegations keeps its CIDR: the new
+    /// delegations, if any, must lie in the CIDR of the current ones, so that a change never moves
+    /// the peer to another CIDR, and so changes what it sees. The peer may be left without a
+    /// delegation, which leaves it in effect disabled and without a CIDR, except the server's own
+    /// peer, the one with the public key `server_key`, which must keep the delegation that holds
+    /// `internal_address`, the address that the server serves its API on.
+    ///
+    /// The unsigned announcement that the server makes of the peer claims every range, and
+    /// doesn't hold them: what it pinned stays pinned to the peer's key, as on every node.
     pub fn set_delegations(
         &mut self,
         store: &Store,
@@ -185,77 +266,137 @@ impl DatabasePeer {
             _ => {},
         }
 
-        let updated = PeerContents {
-            delegations,
-            ..self.stored(store)?
-        };
-        let tx = store.unchecked_transaction()?;
-        if let Err(refusal) = store.accept(&[&updated])?.remove(0) {
-            log::warn!("the server's node refuses the delegations: {refusal}");
-            return Err(refused(refusal));
-        }
-        tx.commit()?;
-        self.inner.delegations = updated.delegations;
-        Ok(())
-    }
-
-    /// The record of the peer as the node holds it.
-    fn stored(&self, conn: &Connection) -> Result<PeerContents, ServerError> {
-        store::load_peer(conn, &self.key()?)?.ok_or(ServerError::NotFound)
-    }
-
-    fn key(&self) -> Result<[u8; 32], ServerError> {
-        key_to_bytes(&self.public_key).map_err(|_| ServerError::NotFound)
-    }
-
-    /// The peer as the database now holds it, found by its public key.
-    pub fn reload(&self, conn: &Connection) -> Result<Self, ServerError> {
-        Self::get_by_key(conn, &self.key()?)?.ok_or(ServerError::NotFound)
+        atomically(store, || {
+            for withdrawn in self
+                .delegations
+                .iter()
+                .filter(|old| !delegations.contains(old))
+            {
+                store.execute(
+                    "DELETE FROM delegations WHERE address = ?1 AND prefix_len = ?2
+                       AND public_key = ?3",
+                    params![ip_to_bytes(withdrawn.first()), withdrawn.prefix_len(), key],
+                )?;
+            }
+            for added in delegations
+                .iter()
+                .filter(|new| !self.delegations.contains(new))
+            {
+                insert_delegation(store, &key, added)?;
+            }
+            Self::admit_synthesized(store)
+        })?;
+        self.inner.delegations = delegations;
+        self.reload_announced(store)
     }
 
     /// Sets the endpoint that the peer reports for itself.
     pub fn set_endpoint(
         &mut self,
-        conn: &Connection,
+        store: &Store,
         endpoint: Option<Endpoint>,
     ) -> Result<(), ServerError> {
-        store::write_endpoints(conn, &self.key()?, EndpointKind::Endpoint, &endpoint)?;
+        let key = self.key()?;
+        atomically(store, || {
+            write_endpoints(store, &key, EndpointKind::Endpoint, &endpoint)?;
+            Self::admit_synthesized(store)
+        })?;
         self.inner.endpoint = endpoint;
-        Ok(())
+        self.reload_announced(store)
     }
 
     /// Sets the candidates that the peer reports for itself.
     pub fn set_candidates(
         &mut self,
-        conn: &Connection,
+        store: &Store,
         candidates: Vec<Endpoint>,
     ) -> Result<(), ServerError> {
-        store::write_endpoints(conn, &self.key()?, EndpointKind::Candidate, &candidates)?;
+        let key = self.key()?;
+        atomically(store, || {
+            write_endpoints(store, &key, EndpointKind::Candidate, &candidates)?;
+            Self::admit_synthesized(store)
+        })?;
         self.inner.candidates = candidates;
-        Ok(())
+        self.reload_announced(store)
     }
 
     /// Sets the endpoint and candidates of the peer together, on its behalf, so that a failure
     /// can't leave the endpoint changed and the candidates stale.
     pub fn set_endpoints(
         &mut self,
-        conn: &Connection,
+        store: &Store,
         endpoint: Option<Endpoint>,
         candidates: Vec<Endpoint>,
     ) -> Result<(), ServerError> {
         let key = self.key()?;
-        let tx = conn.unchecked_transaction()?;
-        store::write_endpoints(&tx, &key, EndpointKind::Endpoint, &endpoint)?;
-        store::write_endpoints(&tx, &key, EndpointKind::Candidate, &candidates)?;
-        tx.commit()?;
+        atomically(store, || {
+            write_endpoints(store, &key, EndpointKind::Endpoint, &endpoint)?;
+            write_endpoints(store, &key, EndpointKind::Candidate, &candidates)?;
+            Self::admit_synthesized(store)
+        })?;
         self.inner.endpoint = endpoint;
         self.inner.candidates = candidates;
+        self.reload_announced(store)
+    }
+
+    /// Hands the server's node core the unsigned announcement that the server makes of each peer
+    /// that has never signed one, invitations included, as [`Announcement::synthetic`] makes it of
+    /// what the server records of the peer, relayed on the server's own word, as a client takes it.
+    /// The node core accepts or refuses it as every node does, as [`innernet_node::accept`]
+    /// describes; a refusal is logged. What the server offers and assigns gates only what it
+    /// accepts from now on, so a name that the server offers a peer while another key claims it
+    /// takes no effect.
+    ///
+    /// The server calls it whenever what it records of such a peer changes, and when it opens
+    /// the database.
+    pub fn admit_synthesized(store: &Store) -> Result<(), ServerError> {
+        let peers: Vec<Self> = Self::list(store)?
+            .into_iter()
+            .filter(|peer| !peer.announces)
+            .collect();
+        let mut synthesized = vec![];
+        for peer in &peers {
+            match SignedAnnouncement::unsigned(&Announcement::synthetic(&peer.inner)) {
+                Ok(unsigned) => synthesized.push((peer, unsigned)),
+                Err(e) => log::warn!("making no announcement of peer {}: {e}", **peer),
+            }
+        }
+        let all_types = accept::all_claim_types();
+        let received: Vec<Received> = synthesized
+            .iter()
+            .map(|(peer, announcement)| Received {
+                public_key: &peer.inner.public_key,
+                announcement,
+                checked_types: &all_types,
+                repeats: true,
+            })
+            .collect();
+        let now = announcement::timestamp_now();
+        let decided = store.accept(&received, now)?;
+        for ((peer, _), decided) in synthesized.iter().zip(decided) {
+            if let Err(refusal) = decided {
+                log::warn!(
+                    "the server's node refuses the announcement that the server makes of peer \
+                     {}: {refusal}",
+                    peer.inner
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads again the last announcement of the peer that the node core accepted.
+    fn reload_announced(&mut self, store: &Store) -> Result<(), ServerError> {
+        let key = self.key()?;
+        self.announced = node_store::load_announcements(store, Some(&key))?
+            .remove(&self.inner.public_key)
+            .map(|stored| stored.announcement);
         Ok(())
     }
 
     /// Requires the peer to authenticate over TLS from now on.
-    pub fn set_requires_tls(&mut self, conn: &Connection) -> Result<(), ServerError> {
-        conn.execute(
+    pub fn set_requires_tls(&mut self, store: &Store) -> Result<(), ServerError> {
+        store.execute(
             "UPDATE peers SET tls = 1 WHERE public_key = ?1",
             params![self.key()?],
         )?;
@@ -263,10 +404,6 @@ impl DatabasePeer {
         Ok(())
     }
 
-    /// Redeems the invitation with the key `pubkey`, the invitee's own. The node never moves a pin
-    /// to another key, so the invitation, which nothing but the server has seen, is deleted with
-    /// what is pinned to its key, and the redeemed peer recorded in its place, latched to TLS if the
-    /// invitation was.
     pub fn redeem(&mut self, store: &Store, pubkey: &str) -> Result<(), ServerError> {
         if self.is_redeemed {
             return Err(ServerError::Gone);
@@ -280,54 +417,117 @@ impl DatabasePeer {
             log::warn!("refusing to redeem {} with an invalid public key.", **self);
             return Err(ServerError::InvalidQuery);
         }
-        let key = key_to_bytes(pubkey).map_err(|_| ServerError::InvalidQuery)?;
-        let redeemed = PeerContents {
-            public_key: pubkey.into(),
-            is_redeemed: true,
-            ..self.stored(store)?
-        };
-        let tx = store.unchecked_transaction()?;
-        store::forget_peer(&tx, &self.key()?)?;
-        if let Err(refusal) = store.accept(&[&redeemed])?.remove(0) {
-            log::warn!("the server's node refuses the redeemed peer: {refusal}");
-            return Err(refused(refusal));
-        }
-        if self.requires_tls {
-            tx.execute(
-                "UPDATE peers SET tls = 1 WHERE public_key = ?1",
-                params![key],
+
+        // The invitation's key was never the peer's, so nothing stays pinned to it: what the node
+        // holds of the invitation goes, and what the server assigns and offers it follows the new
+        // key, which the node then takes as it takes every peer that has never announced.
+        let old_key = self.key()?;
+        let new_key = key_to_bytes(pubkey)?;
+        let redeemed = atomically(store, || {
+            store.execute(
+                "DELETE FROM announcements WHERE public_key = ?1",
+                params![old_key],
             )?;
-        }
-        tx.commit()?;
+            store.execute(
+                "DELETE FROM prefix_pins WHERE public_key = ?1",
+                params![old_key],
+            )?;
+            let updated = store.execute(
+                "UPDATE peers SET is_redeemed = 1, public_key = ?1, name = NULL
+                 WHERE public_key = ?2 AND is_redeemed = 0",
+                params![new_key, old_key],
+            )?;
+            if updated == 0 {
+                return Err(ServerError::NotFound);
+            }
+            Self::admit_synthesized(store)
+        });
+        redeemed?;
         self.inner.public_key = pubkey.into();
         self.inner.is_redeemed = true;
-        Ok(())
+        self.reload_announced(store)
     }
 
-    fn get_by_key(conn: &Connection, key: &[u8; 32]) -> Result<Option<Self>, ServerError> {
-        Ok(Self::list(conn)?
-            .into_iter()
-            .find(|peer| key_to_bytes(&peer.public_key).ok() == Some(*key)))
+    /// Reads a peer from a row of [`COLUMNS`], without the name offered to it, its delegations,
+    /// endpoint and candidates, and its announcement, which [`load`] fills in.
+    fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+        let public_key = row_key(row, 0)?;
+        let is_admin = row.get(1)?;
+        let is_disabled = row.get(2)?;
+        let is_redeemed = row.get(3)?;
+        let invite_expires = row
+            .get::<_, Option<u64>>(4)?
+            .map(|unixtime| SystemTime::UNIX_EPOCH + Duration::from_secs(unixtime));
+        let requires_tls = row.get(5)?;
+        let announces = row.get(6)?;
+
+        let persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
+
+        let inner = PeerContents {
+            name: None,
+            delegations: vec![],
+            public_key,
+            endpoint: None,
+            persistent_keepalive_interval,
+            is_admin,
+            is_disabled,
+            is_redeemed,
+            invite_expires,
+            candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
+        };
+        Ok(Self {
+            inner,
+            requires_tls,
+            announced: None,
+            announces,
+        })
     }
 
-    /// The server's own peer, the one with the public key `key` of the server's config.
-    pub fn own(conn: &Connection, key: &Key) -> Result<Self, ServerError> {
-        Self::get_by_key(conn, &key.0)?.ok_or(ServerError::NotFound)
+    /// The peers of the rows that `sql` selects with `params`, each filled in as [`load`] does
+    /// it, ordered by their hosts fallback addresses, those without one last, then by their
+    /// public keys.
+    fn query(
+        store: &Store,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<Self>, rusqlite::Error> {
+        let mut stmt = store.prepare_cached(sql)?;
+        let mut peers = stmt
+            .query_map(params, Self::from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        load(store, &mut peers)?;
+        peers.sort_by(|a, b| {
+            let order = |peer: &Self| {
+                let fallback = peer.hosts_fallback();
+                (fallback.is_none(), fallback)
+            };
+            order(a)
+                .cmp(&order(b))
+                .then_with(|| a.public_key.cmp(&b.public_key))
+        });
+        Ok(peers)
     }
 
-    /// The peer with the public key `key`.
-    pub fn get_from_public_key(conn: &Connection, key: &Key) -> Result<Self, rusqlite::Error> {
-        Self::get_by_key(conn, &key.0)
-            .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    /// The peer of the row that `sql` selects with `params`, filled in as [`load`] does it.
+    fn query_one(
+        store: &Store,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Self, rusqlite::Error> {
+        let mut peer = store.query_row(sql, params, Self::from_row)?;
+        load(store, std::slice::from_mut(&mut peer))?;
+        Ok(peer)
     }
 
     /// The peer whose delegations hold the address `ip`.
-    pub fn get_by_address(conn: &Connection, ip: IpAddr) -> Result<Self, rusqlite::Error> {
+    pub fn get_by_address(store: &Store, ip: IpAddr) -> Result<Self, rusqlite::Error> {
         // Delegations never overlap, so only the one with the highest first address at or below
         // `ip` may hold it.
         let address = ip_to_bytes(ip);
-        let (public_key, last): ([u8; 32], Vec<u8>) = conn.query_row(
+        let (public_key, last): ([u8; 32], Vec<u8>) = store.query_row(
             "SELECT public_key, last FROM delegations
              WHERE length(address) = length(?1) AND address <= ?1
              ORDER BY address DESC LIMIT 1",
@@ -337,23 +537,38 @@ impl DatabasePeer {
         if address > last {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
-        Self::get_by_key(conn, &public_key)
-            .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+        Self::get_from_public_key(store, &Key(public_key))
     }
 
-    /// The enabled, redeemed peers that the peer sees: those whose CIDR lies within the peer's own
-    /// CIDR, within an infra CIDR, which every peer sees, or within a CIDR associated with a CIDR
-    /// that holds the peer's CIDR, its own or one of its ancestors. A peer's CIDR is that of its
-    /// delegations, so a peer without a delegation is seen by none, and sees only the peers of
-    /// the infra CIDRs.
-    pub fn get_all_allowed_peers(&self, conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(conn)?);
-        let associations = DatabaseAssociation::list(conn)?;
+    pub fn get_from_public_key(store: &Store, public_key: &Key) -> Result<Self, rusqlite::Error> {
+        Self::query_one(
+            store,
+            &format!(
+                "SELECT {} FROM peers WHERE public_key = ?1",
+                COLUMNS.join(", ")
+            ),
+            params![public_key.0],
+        )
+    }
+
+    /// The enabled, redeemed peers that the peer sees: the server's own peer, the one with the
+    /// public key `server_key`, which every peer sees, and those whose CIDR lies within the peer's
+    /// own CIDR, within an infra CIDR, which every peer sees, or within a CIDR associated with a
+    /// CIDR that holds the peer's CIDR, its own or one of its ancestors. A peer's CIDR is that of
+    /// its delegations, so a peer without a delegation is seen by none, and sees only the
+    /// coordinator and the peers of the infra CIDRs.
+    pub fn get_all_allowed_peers(
+        &self,
+        store: &Store,
+        server_key: &Key,
+    ) -> Result<Vec<Self>, ServerError> {
+        let server_key = server_key.to_base64();
+        let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(store)?);
+        let associations = DatabaseAssociation::list(store)?;
         let cidr_of = |peer: &Self| cidr_of_delegations(&peer.delegations, &cidrs);
 
         // The CIDRs whose peers, and those of their descendants, the peer sees.
-        let mut visible = DatabaseCidr::infra(conn)?;
+        let mut visible = DatabaseCidr::infra(store)?;
         if let Some(own) = cidr_of(self) {
             visible.push(own);
             let holds_own = |cidr: &Prefix| cidr.contains(&own);
@@ -367,75 +582,68 @@ impl DatabasePeer {
             }
         }
 
-        Ok(Self::list_enabled(conn)?
+        Ok(Self::list_enabled(store)?
             .into_iter()
             .filter(|peer| {
-                cidr_of(peer).is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr)))
+                peer.public_key == server_key
+                    || cidr_of(peer)
+                        .is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr)))
             })
             .collect())
     }
 
-    /// Every peer, ordered by hosts fallback address, those without one last.
-    pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let latched = Self::latched(conn)?;
-        Ok(store::load_peers(conn)?
-            .into_iter()
-            .map(|mut contents| {
-                contents.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
-                Self {
-                    requires_tls: latched.contains(&contents.public_key),
-                    inner: contents,
-                }
-            })
-            .collect())
+    /// Every peer, ordered by hosts fallback address.
+    pub fn list(store: &Store) -> Result<Vec<Self>, ServerError> {
+        Ok(Self::query(
+            store,
+            &format!("SELECT {} FROM peers", COLUMNS.join(", ")),
+            params![],
+        )?)
     }
 
-    /// The public keys of the peers latched to TLS.
-    fn latched(conn: &Connection) -> Result<HashSet<String>, rusqlite::Error> {
-        let mut stmt = conn.prepare_cached("SELECT public_key FROM peers WHERE tls = 1")?;
-        let keys = stmt.query_map([], |row| store::row_key(row, 0))?;
-        keys.collect()
+    pub fn list_enabled(store: &Store) -> Result<Vec<Self>, ServerError> {
+        Ok(Self::query(
+            store,
+            &format!(
+                "SELECT {} FROM peers WHERE peers.is_redeemed = 1 AND peers.is_disabled = 0",
+                COLUMNS.join(", ")
+            ),
+            params![],
+        )?)
     }
 
-    pub fn list_enabled(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        Ok(Self::list(conn)?
-            .into_iter()
-            .filter(|peer| peer.is_redeemed && !peer.is_disabled)
-            .collect())
+    /// When the next invitation expires, if any does.
+    pub fn next_invite_expiry(store: &Store) -> Result<Option<SystemTime>, ServerError> {
+        let next: Option<u64> = store.query_row(
+            "SELECT min(invite_expires) FROM peers WHERE is_redeemed = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(next.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)))
     }
 
-    /// When the first of the invitations expires, if any does.
-    pub fn next_invite_expiry(conn: &Connection) -> Result<Option<SystemTime>, ServerError> {
-        Ok(store::load_peers(conn)?
-            .into_iter()
-            .filter(|peer| !peer.is_redeemed)
-            .filter_map(|peer| peer.invite_expires)
-            .min())
-    }
-
-    /// Deletes the invitations that expired before now, each with what is pinned to its key.
-    pub fn delete_expired_invites(conn: &Connection) -> Result<usize, ServerError> {
-        let now = SystemTime::now();
-        let expired: Vec<[u8; 32]> = store::load_peers(conn)?
-            .into_iter()
-            .filter(|peer| !peer.is_redeemed && peer.invite_expires.is_some_and(|t| t < now))
-            .filter_map(|peer| key_to_bytes(&peer.public_key).ok())
-            .collect();
-        for key in &expired {
-            store::forget_peer(conn, key)?;
-        }
-        Ok(expired.len())
-    }
-}
-
-/// The error of a change that the server's node refuses with `refusal`: the delegations that it
-/// refuses are explained, as [`check_new_delegations`] explains those that break the rules.
-fn refused(refusal: Refusal) -> ServerError {
-    match refusal {
-        Refusal::Pinned { .. } | Refusal::Overlapping | Refusal::OutsideNetwork { .. } => {
-            ServerError::Delegation(refusal.to_string())
-        },
-        _ => ServerError::InvalidQuery,
+    /// Deletes the invitations that expired, with everything that the node holds of them, as
+    /// [`innernet_node::store::forget_peer`] does. Returns how many it deleted.
+    pub fn delete_expired_invites(store: &Store) -> Result<usize, ServerError> {
+        let unix_now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Something is horribly wrong with system time.");
+        atomically(store, || {
+            let expired: Vec<Vec<u8>> = store
+                .prepare(
+                    "SELECT public_key FROM peers WHERE is_redeemed = 0 AND invite_expires < ?1",
+                )?
+                .query_map(params![unix_now.as_secs()], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for key in &expired {
+                let key: [u8; 32] = key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ServerError::InvalidQuery)?;
+                node_store::forget_peer(store, &key)?;
+            }
+            Ok(expired.len())
+        })
     }
 }
 
@@ -445,14 +653,15 @@ fn refused(refusal: Refusal) -> ServerError {
 /// determine, or `None` for a peer without a delegation. A delegation that breaks the rules is
 /// refused as [`ServerError::Delegation`], which explains why.
 pub(crate) fn check_new_delegations(
-    conn: &Connection,
+    store: &Store,
     delegations: &[Prefix],
     holder: Option<&[u8; 32]>,
 ) -> Result<Option<Prefix>, ServerError> {
-    let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(conn)?);
-    let mut stmt = conn.prepare_cached(
-        "SELECT d.address, d.prefix_len, p.public_key, p.name
+    let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(store)?);
+    let mut stmt = store.prepare_cached(
+        "SELECT d.address, d.prefix_len, p.public_key, o.name
          FROM delegations d JOIN peers p ON p.public_key = d.public_key
+              LEFT JOIN offered_names o ON o.public_key = p.public_key
          WHERE length(d.address) = length(?1) AND d.address <= ?2 AND ?1 <= d.last
            AND p.public_key IS NOT ?3",
     )?;
@@ -499,23 +708,183 @@ pub(crate) fn check_new_delegations(
     })
 }
 
+/// Delegates `prefix` to the peer with the public key `key`. No address is delegated twice,
+/// whether to the same peer or to two, so a prefix that overlaps a delegation is refused.
+pub(crate) fn insert_delegation(
+    store: &Store,
+    key: &[u8; 32],
+    prefix: &Prefix,
+) -> Result<(), ServerError> {
+    let overlapping: Option<Vec<u8>> = store
+        .query_row(
+            "SELECT address FROM delegations
+             WHERE last >= ?1 AND address <= ?2 AND length(address) = length(?1)",
+            params![ip_to_bytes(prefix.first()), ip_to_bytes(prefix.last())],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if overlapping.is_some() {
+        return Err(ServerError::Delegation(format!(
+            "{prefix} overlaps a delegation"
+        )));
+    }
+    store.execute(
+        "INSERT INTO delegations (address, prefix_len, last, public_key) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            ip_to_bytes(prefix.first()),
+            prefix.prefix_len(),
+            ip_to_bytes(prefix.last()),
+            key
+        ],
+    )?;
+    Ok(())
+}
+
+/// Peers by public key, and the public key of the only one, as the database holds it, if there is
+/// only one.
+type Index<'a> = (HashMap<String, &'a mut DatabasePeer>, Option<[u8; 32]>);
+
+/// The peers of `peers` by public key, and the public key of the only one, as the database holds
+/// it, so that a single peer is looked up by its key, and more than one by reading every row.
+fn index(peers: &mut [DatabasePeer]) -> Result<Index<'_>, rusqlite::Error> {
+    let by_key: HashMap<String, &mut DatabasePeer> = peers
+        .iter_mut()
+        .map(|peer| (peer.public_key.clone(), peer))
+        .collect();
+    let only_key = match by_key.keys().next() {
+        Some(key) if by_key.len() == 1 => Some(
+            key_to_bytes(key)
+                .map_err(|_| rusqlite::Error::InvalidParameterName("public key".into()))?,
+        ),
+        _ => None,
+    };
+    Ok((by_key, only_key))
+}
+
+/// Fills in each of `peers` from the database: the name offered to it, its delegations, its
+/// endpoint and candidates, and its last accepted announcement, decoded.
+fn load(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    load_offered_names(store, peers)?;
+    load_delegations(store, peers)?;
+    load_announcements(store, peers)?;
+    load_endpoints(store, peers)
+}
+
+/// Fills in the name offered to each of `peers` from the database.
+fn load_offered_names(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    let (mut by_key, only_key) = index(peers)?;
+    let mut stmt = store.prepare_cached(
+        "SELECT public_key, name FROM offered_names WHERE ?1 IS NULL OR public_key = ?1",
+    )?;
+    let mut rows = stmt.query(params![only_key])?;
+    while let Some(row) = rows.next()? {
+        if let Some(peer) = by_key.get_mut(&row_key(row, 0)?) {
+            let name: String = row.get(1)?;
+            peer.inner.name = Some(name.parse().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(1, "hostname".into(), Type::Text)
+            })?);
+        }
+    }
+    Ok(())
+}
+
+/// Fills in the last announcement of each of `peers` that the node core accepted, as it stores it
+/// decoded.
+fn load_announcements(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    let (mut by_key, only_key) = index(peers)?;
+    for (public_key, stored) in node_store::load_announcements(store, only_key.as_ref())? {
+        if let Some(peer) = by_key.get_mut(&public_key) {
+            peer.announced = Some(stored.announcement);
+        }
+    }
+    Ok(())
+}
+
+/// Offers `name` to the peer with the public key `key`, in place of any name offered to it, or no
+/// name if `name` is `None`.
+fn offer_name(store: &Store, key: &[u8; 32], name: Option<&str>) -> Result<(), ServerError> {
+    store.execute(
+        "DELETE FROM offered_names WHERE public_key = ?1",
+        params![key],
+    )?;
+    if let Some(name) = name {
+        store.execute(
+            "INSERT INTO offered_names (public_key, name) VALUES (?1, ?2)",
+            params![key, name],
+        )?;
+    }
+    Ok(())
+}
+
+/// Fills in the delegations of each of `peers` from the database, in their order.
+fn load_delegations(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    let (mut by_key, only_key) = index(peers)?;
+    let mut stmt = store.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM delegations
+         WHERE ?1 IS NULL OR public_key = ?1
+         ORDER BY length(address), address",
+    )?;
+    let mut rows = stmt.query(params![only_key])?;
+    while let Some(row) = rows.next()? {
+        if let Some(peer) = by_key.get_mut(&row_key(row, 0)?) {
+            peer.inner
+                .delegations
+                .push(prefix_from_row(row.get(1)?, row.get(2)?)?);
+        }
+    }
+    Ok(())
+}
+
+/// Fills in the endpoint and candidates of each of `peers` that the server records apart from
+/// its announcements, those that a peer that has never announced set.
+fn load_endpoints(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    let (mut by_key, only_key) = index(peers)?;
+    for (public_key, endpoints) in node_store::load_endpoints(store, only_key.as_ref())? {
+        if let Some(peer) = by_key.get_mut(&public_key) {
+            peer.inner.endpoint = endpoints.endpoint;
+            peer.inner.candidates = endpoints.candidates;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test;
     use innernet_shared::Error;
-    use std::time::Duration;
+    use ipnet::IpNet;
+
+    /// Addresses of the user CIDR: the IP of a new peer, a wider prefix, an address within it,
+    /// the first address past it, and an address between user2's IP and the prefix.
+    fn user_addresses() -> [&'static str; 5] {
+        if cfg!(feature = "v6-test") {
+            [
+                "fd00:1337::3:0:0:9",
+                "fd00:1337::3:0:1:0/112",
+                "fd00:1337::3:0:1:ff",
+                "fd00:1337::3:0:2:0",
+                "fd00:1337::3:0:0:ff",
+            ]
+        } else {
+            [
+                "10.80.128.9",
+                "10.80.130.0/24",
+                "10.80.130.200",
+                "10.80.131.0",
+                "10.80.129.200",
+            ]
+        }
+    }
 
     #[test]
     fn test_delegations_follow_their_peer() -> Result<(), Error> {
         let server = test::Server::new()?;
-        let store = server.db();
-        let store = store.lock();
-        let (ip, other) = if cfg!(feature = "v6-test") {
-            ("fd00:1337::3:0:0:9", "fd00:1337::3:0:0:a")
-        } else {
-            ("10.80.128.9", "10.80.128.10")
-        };
+        let store = server.db.lock();
+        let [ip, wider, within, past, between] = user_addresses();
         let delegations = |key: &Key| -> Result<i64, rusqlite::Error> {
             store.query_row(
                 "SELECT count(*) FROM delegations WHERE public_key = ?1",
@@ -531,55 +900,259 @@ mod tests {
             },
         )?;
         let old_key = Key::from_base64(&invitee.public_key)?;
-        assert_eq!(delegations(&old_key)?, 1);
-        assert_eq!(
-            DatabasePeer::get_by_address(&store, ip.parse()?)?.public_key,
-            invitee.public_key
-        );
-        assert!(matches!(
-            DatabasePeer::get_by_address(&store, other.parse()?),
-            Err(rusqlite::Error::QueryReturnedNoRows)
-        ));
+        insert_delegation(&store, &old_key.0, &wider.parse()?)?;
 
-        // The delegation follows the peer to its new key.
+        // The peer is found by any address of its delegations, and by no other.
+        let found = DatabasePeer::get_by_address(&store, within.parse()?)?;
+        assert_eq!(found.public_key, invitee.public_key);
+        assert_eq!(
+            found.delegations,
+            [Prefix::host(ip.parse()?), wider.parse()?]
+        );
+        assert_eq!(found.hosts_fallback(), Some(ip.parse()?));
+        for address in [past, between] {
+            assert!(matches!(
+                DatabasePeer::get_by_address(&store, address.parse()?),
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            ));
+        }
+
+        // The invitation is a peer of the node, which pins what it is assigned to its key.
+        let rows = |table: &str, key: &Key| -> Result<i64, rusqlite::Error> {
+            store.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE public_key = ?1"),
+                [key.0],
+                |r| r.get(0),
+            )
+        };
+        assert_eq!(rows("prefix_pins", &old_key)?, 1);
+        assert_eq!(rows("announcements", &old_key)?, 1);
+
+        // The delegations follow the peer to its new key, while what the node held of the
+        // invitation goes, and the node takes the peer anew under its key.
         let new_key = wireguard_control::KeyPair::generate().public;
         invitee.redeem(&store, &new_key.to_base64())?;
         assert_eq!(delegations(&old_key)?, 0);
-        assert_eq!(delegations(&new_key)?, 1);
+        assert_eq!(delegations(&new_key)?, 2);
+        for table in ["prefix_pins", "announcements", "peers"] {
+            assert_eq!(rows(table, &old_key)?, 0, "{table}");
+        }
+        assert_eq!(rows("prefix_pins", &new_key)?, 2);
+        assert_eq!(rows("announcements", &new_key)?, 1);
+        let redeemed = DatabasePeer::get_by_address(&store, within.parse()?)?;
+        assert_eq!(redeemed.public_key, new_key.to_base64());
+
+        // They go with their peer when it is deleted, as an expired invitation is.
+        let expired = DatabasePeer::create(
+            &store,
+            PeerContents {
+                is_redeemed: false,
+                invite_expires: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                ..test::user_peer_contents("expired", between)?
+            },
+        )?;
+        let expired_key = Key::from_base64(&expired.public_key)?;
+        assert_eq!(delegations(&expired_key)?, 1);
         assert_eq!(
-            DatabasePeer::get_by_address(&store, ip.parse()?)?.public_key,
-            new_key.to_base64()
+            DatabasePeer::next_invite_expiry(&store)?,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
         );
+        assert_eq!(DatabasePeer::delete_expired_invites(&store)?, 1);
+        assert_eq!(delegations(&expired_key)?, 0);
+        assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
+        assert!(DatabasePeer::get_by_address(&store, between.parse()?).is_err());
         Ok(())
     }
 
     #[test]
-    fn test_invitations_expire() -> Result<(), Error> {
+    fn test_delegations_never_overlap_nor_change() -> Result<(), Error> {
         let server = test::Server::new()?;
-        let store = server.db();
-        let store = store.lock();
-        assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
+        let store = server.db.lock();
+        let [_, wider, ..] = user_addresses();
+        let user1 = test::peer(&store, test::USER1_PEER_ID);
+        let user2 = test::peer(&store, test::USER2_PEER_ID);
+        let user1_key = Key::from_base64(&user1.public_key)?;
+        let user2_key = Key::from_base64(&user2.public_key)?;
+        insert_delegation(&store, &user1_key.0, &wider.parse()?)?;
+        let wider: Prefix = wider.parse()?;
+        let narrower = Prefix::new(IpNet::new(wider.first(), wider.prefix_len() + 1)?)?;
+        let enclosing = Prefix::new(IpNet::new(wider.first(), wider.prefix_len() - 1)?.trunc())?;
 
-        // An invitation that has expired is the next to expire, and is deleted with its pin, so
-        // that its address can be offered again.
+        // No other delegation shares an address with one, whether of the same peer or not.
+        for (key, prefix) in [
+            (&user2_key, wider),
+            (&user2_key, narrower),
+            (&user2_key, enclosing),
+            (&user1_key, narrower),
+            (&user2_key, user1.delegations[0]),
+        ] {
+            assert!(
+                insert_delegation(&store, &key.0, &prefix).is_err(),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            test::peer(&store, test::USER1_PEER_ID).delegations,
+            [user1.delegations[0], wider]
+        );
+
+        // The server explains the delegations it refuses to a new peer.
+        let taken = test::user_peer_contents("user3", &wider.last().to_string())?;
+        match DatabasePeer::create(&store, taken) {
+            Err(ServerError::DelegationTaken {
+                reason,
+                prefix,
+                held,
+                holder,
+            }) => {
+                assert!(reason.contains("delegated to peer user1"), "{reason}");
+                assert_eq!((prefix, held), (Prefix::host(wider.last()), wider));
+                assert_eq!(holder, user1.public_key);
+            },
+            other => panic!("{other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_peers_without_a_delegation() -> Result<(), Error> {
+        // A peer whose delegations are all gone has no address: it is listed last, and the view
+        // of plain-HTTP sessions leaves it out.
+        let server = test::Server::new()?;
+        let store = server.db.lock();
+        let cidrs = DatabaseCidr::list(&store)?;
+        let user1 = test::peer(&store, test::USER1_PEER_ID);
+        let legacy = user1.legacy(test::USER1_PEER_ID, &cidrs).unwrap();
+        assert_eq!(Some(legacy.ip), user1.hosts_fallback());
+        assert_eq!(legacy.cidr_id, test::USER_CIDR_ID);
+        store.execute(
+            "DELETE FROM delegations WHERE public_key = ?1",
+            [Key::from_base64(&user1.public_key)?.0],
+        )?;
+        let user1 =
+            DatabasePeer::get_from_public_key(&store, &Key::from_base64(&user1.public_key)?)?;
+        assert!(user1.delegations.is_empty());
+        assert!(user1.legacy(test::USER1_PEER_ID, &cidrs).is_none());
+        let listed = DatabasePeer::list(&store)?;
+        assert_eq!(listed.last().unwrap().public_key, user1.public_key);
+        assert!(listed[..listed.len() - 1]
+            .windows(2)
+            .all(|pair| pair[0].hosts_fallback() < pair[1].hosts_fallback()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_plain_http_ids() -> Result<(), Error> {
+        // The view of plain-HTTP sessions numbers the peers and the CIDRs as it answers: every
+        // peer names a CIDR of the view, every CIDR a parent of the view, and the IDs are the
+        // same as long as the database is.
+        let server = test::Server::new()?;
+        let store = server.db.lock();
+        let view = || -> Result<_, Error> {
+            let cidrs = DatabaseCidr::list(&store)?;
+            let ids = DatabasePeer::plain_http_ids(&store)?;
+            let peers: Vec<_> = DatabasePeer::list(&store)?
+                .iter()
+                .filter_map(|peer| peer.legacy(ids[&peer.public_key], &cidrs))
+                .collect();
+            let cidrs: Vec<_> = cidrs.iter().map(|cidr| cidr.legacy(&cidrs)).collect();
+            Ok((peers, cidrs))
+        };
+        let (peers, cidrs) = view()?;
+        assert_eq!(view()?, (peers.clone(), cidrs.clone()));
+        let cidr_ids: Vec<i64> = cidrs.iter().map(|cidr| cidr.id).collect();
+        assert_eq!(cidr_ids, (1..=cidrs.len() as i64).collect::<Vec<_>>());
+        assert!(peers.iter().all(|peer| cidr_ids.contains(&peer.cidr_id)));
+        assert!(cidrs
+            .iter()
+            .all(|cidr| cidr.parent.is_none_or(|parent| cidr_ids.contains(&parent))));
+        let peer_ids: Vec<i64> = peers.iter().map(|peer| peer.id).collect();
+        assert_eq!(peer_ids, (1..=peers.len() as i64).collect::<Vec<_>>());
+
+        // A new CIDR between the admin CIDR and the developer CIDR renumbers those after it.
+        if cfg!(feature = "v6-test") {
+            return Ok(());
+        }
+        DatabaseCidr::create(&store, "between".into(), "10.80.2.0/24".parse()?)?;
+        let (peers, cidrs) = view()?;
+        let between = cidrs.iter().find(|cidr| cidr.name == "between").unwrap();
+        assert_eq!(
+            (between.id, between.parent),
+            (test::DEVELOPER_CIDR_ID, Some(test::ROOT_CIDR_ID))
+        );
+        let developer = cidrs.iter().find(|cidr| cidr.name == "developer").unwrap();
+        assert_eq!(developer.id, test::DEVELOPER_CIDR_ID + 1);
+        let cidr_ids: Vec<i64> = cidrs.iter().map(|cidr| cidr.id).collect();
+        assert!(peers.iter().all(|peer| cidr_ids.contains(&peer.cidr_id)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_endpoints_follow_their_peer() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let store = server.db.lock();
+        // The endpoints that the peers set, apart from those that their announcements state.
+        let endpoints = || -> Result<i64, rusqlite::Error> {
+            store.query_row(
+                "SELECT count(*) FROM endpoints WHERE kind IN (0, 1)",
+                [],
+                |r| r.get(0),
+            )
+        };
         let ip = if cfg!(feature = "v6-test") {
-            "fd00:1337::2:0:0:9"
+            "fd00:1337::3:0:0:9"
         } else {
-            "10.80.64.9"
+            "10.80.128.9"
         };
-        let expires = SystemTime::now() - Duration::from_secs(60);
-        let invitation = PeerContents {
-            is_redeemed: false,
-            invite_expires: Some(expires),
-            ..test::developer_peer_contents("invited", ip)?
+        let mut invitee = DatabasePeer::create(
+            &store,
+            PeerContents {
+                is_redeemed: false,
+                ..test::user_peer_contents("invitee", ip)?
+            },
+        )?;
+        // The server's own peer has an endpoint.
+        let others = endpoints()?;
+
+        // Endpoints of every shape round-trip, and the candidates keep their order.
+        let endpoint: Endpoint = "vpn.example.com:51820".parse().unwrap();
+        let candidates: Vec<Endpoint> = vec![
+            "[2001:db8::1]:4000".parse().unwrap(),
+            "192.0.2.1:1".parse().unwrap(),
+            "0.0.0.0:51820".parse().unwrap(),
+        ];
+        invitee.set_endpoint(&store, Some(endpoint.clone()))?;
+        invitee.set_candidates(&store, candidates.clone())?;
+        let stored = invitee.reload(&store)?;
+        assert_eq!(stored.endpoint, Some(endpoint.clone()));
+        assert_eq!(stored.candidates, candidates);
+        assert_eq!(endpoints()?, others + 4);
+
+        // They follow the peer to its new key.
+        let new_key = wireguard_control::KeyPair::generate().public;
+        invitee.redeem(&store, &new_key.to_base64())?;
+        let redeemed = DatabasePeer::get_from_public_key(&store, &new_key)?;
+        assert_eq!(redeemed.endpoint, Some(endpoint.clone()));
+        assert_eq!(redeemed.candidates, candidates);
+
+        // They go with their peer when it is deleted, as an expired invitation is.
+        let expired_ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::3:0:0:a"
+        } else {
+            "10.80.128.10"
         };
-        DatabasePeer::create(&store, invitation)?;
-        let next = DatabasePeer::next_invite_expiry(&store)?.unwrap();
-        assert!(next <= expires && next > expires - Duration::from_secs(1));
+        let mut expired = DatabasePeer::create(
+            &store,
+            PeerContents {
+                is_redeemed: false,
+                invite_expires: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                ..test::user_peer_contents("expired", expired_ip)?
+            },
+        )?;
+        expired.set_endpoint(&store, Some(endpoint))?;
+        assert_eq!(endpoints()?, others + 5);
         assert_eq!(DatabasePeer::delete_expired_invites(&store)?, 1);
-        assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
-        assert!(DatabasePeer::get_by_address(&store, ip.parse()?).is_err());
-        DatabasePeer::create(&store, test::developer_peer_contents("again", ip)?)?;
+        assert_eq!(endpoints()?, others + 4);
         Ok(())
     }
 }

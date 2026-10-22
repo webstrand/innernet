@@ -1,9 +1,26 @@
+use super::{ip_to_bytes, prefix_from_row};
 use crate::ServerError;
-use innernet_node::store::{ip_to_bytes, prefix_from_row};
+use innernet_node::Store;
 use innernet_shared::{
     parent_cidr, smallest_cidr_holding, Cidr, LegacyCidr, LegacyCidrContents, Prefix,
 };
-use rusqlite::{params, Connection, OptionalExtension as _};
+use rusqlite::{params, OptionalExtension as _};
+
+/// The table of CIDRs of servers that predate the rebuild of the database, which names each CIDR,
+/// and its parent, by an ID.
+#[cfg(test)]
+pub static ORIGIN_TABLE_SQL: &str = "CREATE TABLE cidrs (
+      id               INTEGER PRIMARY KEY,
+      name             TEXT NOT NULL UNIQUE,
+      ip               TEXT NOT NULL,
+      prefix           INTEGER NOT NULL,
+      parent           INTEGER REFERENCES cidrs,
+      UNIQUE(ip, prefix),
+      FOREIGN KEY (parent)
+         REFERENCES cidrs (id)
+            ON UPDATE RESTRICT
+            ON DELETE RESTRICT
+    )";
 
 /// A CIDR, identified by its prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,8 +31,8 @@ pub struct DatabaseCidr {
 
 impl DatabaseCidr {
     /// Marks the CIDR `prefix` infra, so that every peer sees its peers.
-    pub fn set_infra(conn: &Connection, prefix: &Prefix) -> Result<(), ServerError> {
-        conn.execute(
+    pub fn set_infra(store: &Store, prefix: &Prefix) -> Result<(), ServerError> {
+        store.execute(
             "UPDATE cidrs SET infra = 1 WHERE address = ?1 AND prefix_len = ?2",
             params![ip_to_bytes(prefix.first()), prefix.prefix_len()],
         )?;
@@ -23,9 +40,9 @@ impl DatabaseCidr {
     }
 
     /// The infra CIDRs, whose peers every peer sees.
-    pub fn infra(conn: &Connection) -> Result<Vec<Prefix>, ServerError> {
+    pub fn infra(store: &Store) -> Result<Vec<Prefix>, ServerError> {
         let mut stmt =
-            conn.prepare_cached("SELECT address, prefix_len FROM cidrs WHERE infra = 1")?;
+            store.prepare_cached("SELECT address, prefix_len FROM cidrs WHERE infra = 1")?;
         let prefixes = stmt
             .query_map([], |row| prefix_from_row(row.get(0)?, row.get(1)?))?
             .collect::<Result<_, _>>()?;
@@ -76,9 +93,9 @@ impl DatabaseCidr {
     /// it. It must not hold another CIDR, since that would move the CIDRs that it holds in the
     /// tree. Its parent must not be the CIDR of a peer, since peers belong only to CIDRs without
     /// children.
-    pub fn create(conn: &Connection, name: String, prefix: Prefix) -> Result<Self, ServerError> {
+    pub fn create(store: &Store, name: String, prefix: Prefix) -> Result<Self, ServerError> {
         log::debug!("creating CIDR {name} ({prefix})");
-        let cidrs = Self::list(conn)?;
+        let cidrs = Self::list(store)?;
         if let Some(held) = cidrs.iter().find(|cidr| prefix.contains(&cidr.prefix)) {
             log::warn!(
                 "tried to add the CIDR {prefix}, which is or holds the CIDR {} ({}).",
@@ -89,13 +106,13 @@ impl DatabaseCidr {
         }
         let prefixes = Self::prefixes(&cidrs);
         if let Some(parent) = parent_cidr(&prefix, &prefixes) {
-            if holds_peers(conn, &parent, &prefixes)? {
+            if holds_peers(store, &parent, &prefixes)? {
                 log::warn!("tried to add a CIDR to the parent {parent}, which has peers.");
                 return Err(ServerError::InvalidQuery);
             }
         }
 
-        conn.execute(
+        store.execute(
             "INSERT INTO cidrs (address, prefix_len, name) VALUES (?1, ?2, ?3)",
             params![ip_to_bytes(prefix.first()), prefix.prefix_len(), name],
         )?;
@@ -103,8 +120,8 @@ impl DatabaseCidr {
     }
 
     /// Renames the CIDR. Nothing else of a CIDR changes.
-    pub fn rename(&mut self, conn: &Connection, name: String) -> Result<(), ServerError> {
-        conn.execute(
+    pub fn rename(&mut self, store: &Store, name: String) -> Result<(), ServerError> {
+        store.execute(
             "UPDATE cidrs SET name = ?3 WHERE address = ?1 AND prefix_len = ?2",
             params![
                 ip_to_bytes(self.prefix.first()),
@@ -117,8 +134,8 @@ impl DatabaseCidr {
     }
 
     /// Deletes the CIDR `prefix`, which must have no child CIDR, no peer, and no association.
-    pub fn delete(conn: &Connection, prefix: &Prefix) -> Result<(), ServerError> {
-        let cidrs = Self::list(conn)?;
+    pub fn delete(store: &Store, prefix: &Prefix) -> Result<(), ServerError> {
+        let cidrs = Self::list(store)?;
         if !cidrs.iter().any(|cidr| cidr.prefix == *prefix) {
             return Err(ServerError::NotFound);
         }
@@ -130,12 +147,12 @@ impl DatabaseCidr {
             log::warn!("tried to delete the CIDR {prefix}, which has child CIDRs.");
             return Err(ServerError::InvalidQuery);
         }
-        if holds_peers(conn, prefix, &prefixes)? {
+        if holds_peers(store, prefix, &prefixes)? {
             log::warn!("tried to delete the CIDR {prefix}, which has peers.");
             return Err(ServerError::InvalidQuery);
         }
         // An association that names the CIDR refuses the deletion.
-        conn.execute(
+        store.execute(
             "DELETE FROM cidrs WHERE address = ?1 AND prefix_len = ?2",
             params![ip_to_bytes(prefix.first()), prefix.prefix_len()],
         )?;
@@ -150,8 +167,8 @@ impl DatabaseCidr {
     }
 
     /// The CIDR `prefix`, or [`ServerError::NotFound`].
-    pub fn get(conn: &Connection, prefix: &Prefix) -> Result<Self, ServerError> {
-        conn.query_row(
+    pub fn get(store: &Store, prefix: &Prefix) -> Result<Self, ServerError> {
+        store.query_row(
             "SELECT address, prefix_len, name FROM cidrs WHERE address = ?1 AND prefix_len = ?2",
             params![ip_to_bytes(prefix.first()), prefix.prefix_len()],
             Self::from_row,
@@ -161,8 +178,8 @@ impl DatabaseCidr {
     }
 
     /// Every CIDR, ordered by prefix.
-    pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let mut stmt = conn.prepare_cached(
+    pub fn list(store: &Store) -> Result<Vec<Self>, ServerError> {
+        let mut stmt = store.prepare_cached(
             "SELECT address, prefix_len, name FROM cidrs
              ORDER BY length(address), address, prefix_len",
         )?;
@@ -173,8 +190,8 @@ impl DatabaseCidr {
 
 /// Whether the CIDR `cidr`, one of `cidrs`, is the CIDR of a peer: whether it is the smallest of
 /// `cidrs` that holds a delegation.
-fn holds_peers(conn: &Connection, cidr: &Prefix, cidrs: &[Prefix]) -> Result<bool, ServerError> {
-    let mut stmt = conn.prepare_cached(
+fn holds_peers(store: &Store, cidr: &Prefix, cidrs: &[Prefix]) -> Result<bool, ServerError> {
+    let mut stmt = store.prepare_cached(
         "SELECT address, prefix_len FROM delegations
          WHERE length(address) = length(?1) AND address <= ?2 AND ?1 <= last",
     )?;

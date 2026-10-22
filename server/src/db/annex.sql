@@ -1,8 +1,15 @@
--- The coordinator's annex: what only the coordinator keeps, beside the tables of every node.
+-- The coordinator's annex to the node's schema: what only the coordinator holds.
+
+-- The name that the coordinator offers each peer, in canonical hostname(7) format, of which the
+-- peer claims its name in its announcements, and which names a peer that has never announced. No
+-- name is offered to two peers.
+CREATE TABLE offered_names (
+  public_key BLOB PRIMARY KEY REFERENCES peers ON UPDATE CASCADE ON DELETE CASCADE,
+  name       TEXT NOT NULL UNIQUE
+) STRICT, WITHOUT ROWID;
 
 -- The associations of CIDRs, whose peers see each other's: each names its two CIDRs by their
--- prefixes, the lower first, in the order of prefixes, so that a pair is held once. A CIDR is
--- deleted only once no association names it.
+-- prefixes, the lower first, in the order of prefixes, so that a pair is held once.
 CREATE TABLE associations (
   address_1    BLOB NOT NULL,
   prefix_len_1 INTEGER NOT NULL,

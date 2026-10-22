@@ -12,8 +12,7 @@ use innernet_node::{
     events::EventSource,
     realize::{DnsService, Realized, WireGuard},
     runtime::{self, Link, Node, Round},
-    snapshot::{self, Snapshot},
-    store,
+    snapshot::Snapshot,
 };
 use innernet_shared::{
     interface_config::{ResolvedInvitation, FEATURE_TLS},
@@ -443,7 +442,7 @@ impl Link for RemoteLink<'_> {
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {
-        Ok(snapshot::snapshot(store::load_peers(self.store.store())?))
+        self.store.snapshot()
     }
 
     /// Reports `candidates` to a coordinator that the last sync reached.
