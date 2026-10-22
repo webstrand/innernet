@@ -132,14 +132,22 @@ CREATE UNIQUE INDEX one_endpoint_per_key ON endpoints (public_key) WHERE kind = 
 -- The last announcement accepted from each peer, as the node decoded it once it had checked its
 -- signature, if it has one: its timestamp, whether it was signed, and the statements that the node
 -- understands. Its claims are the pins: the claimed name is the name of the peer, and the claimed
--- delegation the claimed prefixes of `prefix_pins`. The primary IP is here; the allowed IPs and the
--- endpoints are in the table that follows and in `endpoints`. The signed bytes aren't kept here.
+-- delegation the claimed prefixes of `prefix_pins`. The primary IP and the nameserver are here;
+-- the allowed IPs and the endpoints are in the table that follows and in `endpoints`. The signed
+-- bytes aren't kept here.
 CREATE TABLE announcements (
   public_key BLOB PRIMARY KEY CHECK (length(public_key) = 32)
              REFERENCES peers ON DELETE RESTRICT,
   timestamp  INTEGER NOT NULL CHECK (timestamp >= 0),
   signed     INTEGER NOT NULL CHECK (signed IN (0, 1)),
-  primary_ip BLOB CHECK (length(primary_ip) IN (4, 16))
+  primary_ip BLOB CHECK (length(primary_ip) IN (4, 16)),
+  -- The nameserver that the peer offers for the names under its own, if any: its address, port
+  -- and zone, all three or none.
+  nameserver_address BLOB CHECK (length(nameserver_address) IN (4, 16)),
+  nameserver_port    INTEGER CHECK (nameserver_port BETWEEN 1 AND 65535),
+  nameserver_zone    TEXT,
+  CHECK ((nameserver_address IS NULL) = (nameserver_port IS NULL)
+     AND (nameserver_address IS NULL) = (nameserver_zone IS NULL))
 ) STRICT, WITHOUT ROWID;
 
 -- The allowed IPs that the announcements state, as stated, before they are shrunk to the claimed

@@ -266,7 +266,6 @@ pub async fn fetch(
     bring_up_interface: bool,
     events: &EventSource,
 ) -> Result<Round, Error> {
-    hosts_opts.warn_of_hosts_file_options();
     // The client never writes the config after installation, and reads it anew on every fetch, so
     // that a fetch applies what the operator edited in it. A config that fails to read fails the
     // fetch before anything is applied, which leaves the interface as the last fetch left it.
@@ -341,6 +340,7 @@ pub async fn fetch(
         info: config.interface.clone(),
         listen_port,
         nat: nat.clone(),
+        host_suffix: hosts_opts.host_suffix.clone(),
         snapshot_config: SnapshotConfig::default(),
         tunnel: Box::new(WireGuard {
             interface: *interface,

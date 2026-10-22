@@ -162,6 +162,21 @@ pub struct InterfaceInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_addresses: Vec<IpAddr>,
 
+    /// The address and port of the nameserver that the node announces for its own name and the
+    /// names under it, which must lie within the delegation that it claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce_nameserver: Option<SocketAddr>,
+
+    /// The domain that the nameserver of `announce_nameserver` answers for, a canonical domain, or
+    /// `None` for the node's own hostname, as its host suffix names it. Peers forward queries for
+    /// their own hostname of the node to the nameserver with this domain in its place.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_zone"
+    )]
+    pub announce_zone: Option<String>,
+
     /// How long, in milliseconds, the node waits once the host's addresses change before it runs a
     /// round, so that the changes of a burst, such as those of a link that comes up, take one
     /// round. 200 when unset.
@@ -171,6 +186,20 @@ pub struct InterfaceInfo {
 
 /// How long a node waits for the host's addresses to settle when its config doesn't say.
 pub const DEFAULT_ADDRESS_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Reads a zone, which must be a canonical domain.
+fn deserialize_zone<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let zone = String::deserialize(deserializer)?;
+    if !innernet_domain::is_canonical_domain(&zone) {
+        return Err(serde::de::Error::custom(format!(
+            "the zone {:?} is not a canonical domain",
+            zone
+        )));
+    }
+    Ok(Some(zone))
+}
 
 fn yes() -> bool {
     true
@@ -192,6 +221,8 @@ impl InterfaceInfo {
             delegation: None,
             allowed_ips: None,
             extra_addresses: vec![],
+            announce_nameserver: None,
+            announce_zone: None,
             address_settle_ms: None,
         }
     }
@@ -542,6 +573,8 @@ impl Invitation {
             delegation: None,
             allowed_ips: None,
             extra_addresses: vec![],
+            announce_nameserver: None,
+            announce_zone: None,
             address_settle_ms: None,
         };
         Ok(ResolvedInvitation {
@@ -615,6 +648,44 @@ mod tests {
         assert!(config.server.has_feature(FEATURE_TLS));
         let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(config.server.features, ["tls", "from-the-future"]);
+    }
+
+    #[test]
+    fn test_announce_nameserver() {
+        // A config without a nameserver is written back without one.
+        let config: InterfaceConfig = toml::from_str(INVITATION).unwrap();
+        assert_eq!(config.interface.announce_nameserver, None);
+        assert_eq!(config.interface.announce_zone, None);
+        assert!(!toml::to_string(&config).unwrap().contains("announce-"));
+
+        let with = |lines: &str| {
+            toml::from_str::<InterfaceConfig>(
+                &INVITATION.replace("[interface]", &format!("[interface]\n{lines}")),
+            )
+        };
+        let config =
+            with("announce-nameserver = \"10.0.0.2:53\"\nannounce-zone = \"example.com\"").unwrap();
+        assert_eq!(
+            config.interface.announce_nameserver,
+            Some("10.0.0.2:53".parse().unwrap())
+        );
+        assert_eq!(
+            config.interface.announce_zone.as_deref(),
+            Some("example.com")
+        );
+        let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            config.interface.announce_zone.as_deref(),
+            Some("example.com")
+        );
+
+        // A zone that isn't a canonical domain is refused with the config.
+        for zone in ["Example.com", "example.com.", "", "10.0.0.1"] {
+            assert!(
+                with(&format!("announce-zone = {zone:?}")).is_err(),
+                "{zone}"
+            );
+        }
     }
 
     #[test]

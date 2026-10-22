@@ -915,7 +915,10 @@ fn introduced_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innernet_shared::{announcement::Claims, Cidr, LegacyCidrContents, LegacyPeerContents};
+    use innernet_shared::{
+        announcement::{Claims, Nameserver},
+        Cidr, LegacyCidrContents, LegacyPeerContents,
+    };
     use once_cell::sync::Lazy;
     static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
         vec![PeerContents {
@@ -1925,7 +1928,10 @@ mod tests {
                 "peer.example.com:1".parse().unwrap(),
                 "192.0.2.1:51820".parse().unwrap(),
             ],
-            nameserver: None,
+            nameserver: Some(Nameserver {
+                address: "10.0.1.53:53".parse().unwrap(),
+                zone: "example.com".into(),
+            }),
         };
         let signed = sign(&first);
         assert!(store
@@ -1948,6 +1954,7 @@ mod tests {
             assert_eq!(effective.name, first.claims.name);
             assert_eq!(effective.endpoint.as_ref(), first.endpoints.first());
             assert_eq!(effective.candidates, first.endpoints[1..]);
+            assert_eq!(effective.nameserver, first.nameserver);
             assert_eq!(pins(store), first.claims.delegation);
         };
         announced(&store);
@@ -2068,6 +2075,14 @@ mod tests {
             .accept_announcement(&key, &signed, &all_types)
             .is_err());
         assert_eq!(store.announcement(&key).unwrap(), Some(own.clone()));
+
+        // The database refuses to keep a part of a nameserver.
+        for change in [
+            "UPDATE announcements SET nameserver_port = NULL",
+            "UPDATE announcements SET nameserver_zone = NULL",
+        ] {
+            assert!(store.store.execute(change, []).is_err(), "{change}");
+        }
     }
 
     #[test]

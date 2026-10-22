@@ -7,7 +7,10 @@
 //! base64 text, as a state's public keys are deserialized.
 
 use crate::claims::Claim;
-use innernet_shared::{announcement::Announcement, Cidr, Endpoint, Hostname, PeerContents, Prefix};
+use innernet_shared::{
+    announcement::{Announcement, Nameserver},
+    Cidr, Endpoint, Hostname, PeerContents, Prefix,
+};
 use ipnet::IpNet;
 use rusqlite::{params, types::Type, Connection, OptionalExtension as _, Row};
 use std::{
@@ -224,16 +227,34 @@ pub fn write_announcement(
         allowed_ips,
         primary_ip,
         endpoints,
-        nameserver: _,
+        nameserver,
     } = announcement;
     let timestamp = i64::try_from(*timestamp)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     conn.execute(
-        "INSERT INTO announcements (public_key, timestamp, signed, primary_ip)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO announcements
+           (public_key, timestamp, signed, primary_ip,
+            nameserver_address, nameserver_port, nameserver_zone)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (public_key) DO UPDATE SET timestamp = excluded.timestamp,
-           signed = excluded.signed, primary_ip = excluded.primary_ip",
-        params![key, timestamp, signed, primary_ip.map(ip_to_bytes)],
+           signed = excluded.signed, primary_ip = excluded.primary_ip,
+           nameserver_address = excluded.nameserver_address,
+           nameserver_port = excluded.nameserver_port, nameserver_zone = excluded.nameserver_zone",
+        params![
+            key,
+            timestamp,
+            signed,
+            primary_ip.map(ip_to_bytes),
+            nameserver
+                .as_ref()
+                .map(|nameserver| ip_to_bytes(nameserver.address.ip())),
+            nameserver
+                .as_ref()
+                .map(|nameserver| nameserver.address.port()),
+            nameserver
+                .as_ref()
+                .map(|nameserver| nameserver.zone.as_str()),
+        ],
     )?;
     conn.execute(
         "DELETE FROM announced_allowed_ips WHERE public_key = ?1",
@@ -356,26 +377,39 @@ pub struct StoredAnnouncement {
 /// The last announcement accepted from every peer, or only from the peer with the public key
 /// `only`, by public key, as the node stores it decoded: its timestamp and its statements, with
 /// the announced endpoints in their order, and its claims, the claimed prefixes pinned to the
-/// peer's key and the name of the peer. A stored name that isn't valid is none.
+/// peer's key and the name of the peer. A stored name or nameserver that isn't valid is none.
 pub fn load_announcements(
     conn: &Connection,
     only: Option<&[u8; 32]>,
 ) -> Result<HashMap<String, StoredAnnouncement>, rusqlite::Error> {
     let mut announcements: HashMap<String, StoredAnnouncement> = HashMap::new();
     let mut stmt = conn.prepare_cached(
-        "SELECT a.public_key, a.timestamp, a.signed, a.primary_ip, p.name
+        "SELECT a.public_key, a.timestamp, a.signed, a.primary_ip,
+                a.nameserver_address, a.nameserver_port, a.nameserver_zone, p.name
          FROM announcements a JOIN peers p ON p.public_key = a.public_key
          WHERE ?1 IS NULL OR a.public_key = ?1",
     )?;
     let mut rows = stmt.query(params![only])?;
     while let Some(row) = rows.next()? {
+        let nameserver = match (
+            row_ip(row, 4)?,
+            row.get::<_, Option<u16>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ) {
+            (Some(ip), Some(port), Some(zone)) => Some(Nameserver {
+                address: SocketAddr::new(ip, port),
+                zone,
+            }),
+            _ => None,
+        };
         let mut announcement = Announcement {
             timestamp: row.get(1)?,
             primary_ip: row_ip(row, 3)?,
+            nameserver: nameserver.filter(|nameserver| nameserver.check().is_ok()),
             ..Default::default()
         };
         announcement.claims.name = row
-            .get::<_, Option<String>>(4)?
+            .get::<_, Option<String>>(7)?
             .and_then(|name| Hostname::try_from(name).ok());
         announcements.insert(
             row_key(row, 0)?,

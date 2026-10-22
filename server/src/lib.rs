@@ -290,6 +290,7 @@ pub async fn serve(
             exclude_nat_candidates: vec![],
             no_nat_candidates: false,
         },
+        host_suffix: hosts_opts.host_suffix.clone(),
         snapshot_config: SnapshotConfig {
             route_primary_ip: true,
         },
@@ -543,6 +544,7 @@ mod tests {
             info: config.interface.clone(),
             listen_port: config.listen_port(),
             nat: NatOpts::all_disabled(),
+            host_suffix: None,
             snapshot_config: SnapshotConfig::default(),
             tunnel: Box::new(WireGuard {
                 interface,

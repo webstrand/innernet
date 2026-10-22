@@ -23,7 +23,7 @@ use innernet_shared::{
     announcement::{self, Announcement, SignedAnnouncement},
     get_local_addrs,
     interface_config::{DnsInfo, InterfaceInfo},
-    Endpoint, NatOpts, PeerContents, Prefix,
+    peer_hostname, Endpoint, NatOpts, PeerContents, Prefix,
 };
 use std::{future::pending, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::Notify, time::Instant};
@@ -92,6 +92,8 @@ pub struct Node {
     pub listen_port: u16,
     /// Which addresses of the host are no candidates, and whether the node traverses NATs.
     pub nat: NatOpts,
+    /// The host suffix, under which the node names the peers, itself included.
+    pub host_suffix: Option<String>,
     pub snapshot_config: SnapshotConfig,
     pub tunnel: Box<dyn TunnelBackend + Send>,
     /// The DNS server of the node, if the node runs one, as `dns` configures it.
@@ -153,8 +155,9 @@ impl Node {
 
     /// Announces the node through `link`, as [`own::own_announcement`] makes the announcement of
     /// what the coordinator assigns it, with the endpoints at the other addresses of the host as
-    /// its candidates. An announcement that would change nothing but its timestamp isn't made,
-    /// nor one to a coordinator that accepts none, or whose claim types the node can't tell.
+    /// its candidates and the nameserver that [`own::own_nameserver`] selects. An announcement
+    /// that would change nothing but its timestamp isn't made, nor one to a coordinator that
+    /// accepts none, or whose claim types the node can't tell.
     pub async fn announce(&self, link: &mut impl Link) -> Result<(), Error> {
         let Some(claim_types) = link.claim_types().filter(|types| !types.is_empty()) else {
             return Ok(());
@@ -164,7 +167,7 @@ impl Node {
             .assignment()?
             .context("the coordinator reports no record of this node")?;
         let last = link.last_announced(&own_key)?;
-        let announcement = own::own_announcement(
+        let mut announcement = own::own_announcement(
             &self.info,
             &own,
             self.candidates()?,
@@ -172,6 +175,15 @@ impl Node {
             &claim_types,
             last,
             announcement::timestamp_now(),
+        );
+        let hostname = own
+            .name
+            .as_deref()
+            .and_then(|name| peer_hostname(&self.interface, self.host_suffix.as_deref(), name));
+        announcement.nameserver = own::own_nameserver(
+            &self.info,
+            &announcement.claims.delegation,
+            hostname.as_deref(),
         );
         if own::is_unchanged(&announcement, link.current_announcement().as_ref()) {
             log::debug!("this node's announcement is unchanged, so it isn't made again.");

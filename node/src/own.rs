@@ -1,7 +1,7 @@
 //! The node's own announcement, which every node signs alike, whatever its role.
 
 use innernet_shared::{
-    announcement::{self, Announcement, AnnouncementError, Claims, SignedAnnouncement},
+    announcement::{self, Announcement, AnnouncementError, Claims, Nameserver, SignedAnnouncement},
     interface_config::InterfaceInfo,
     xeddsa, Endpoint, Error, PeerContents, Prefix,
 };
@@ -167,6 +167,45 @@ pub fn own_announcement(
         primary_ip: Some(primary_ip),
         endpoints,
         nameserver: None,
+    }
+}
+
+/// The nameserver that the node announces: the one of `announce-nameserver`, which must lie
+/// within one of `delegation`, the prefixes that it claims, for the zone of `announce-zone`, or
+/// `own_hostname`, the node's own hostname, by default. A nameserver that can't be announced is
+/// skipped with a warning, given once, since the config would repeat it on every round.
+pub fn own_nameserver(
+    interface: &InterfaceInfo,
+    delegation: &[Prefix],
+    own_hostname: Option<&str>,
+) -> Option<Nameserver> {
+    let address = interface.announce_nameserver?;
+    if !delegation
+        .iter()
+        .any(|prefix| prefix.contains_addr(&address.ip()))
+    {
+        warn_once(format!(
+            "not announcing the nameserver at {address}, which lies within no claimed prefix."
+        ));
+        return None;
+    }
+    let Some(zone) = interface.announce_zone.as_deref().or(own_hostname) else {
+        warn_once(format!(
+            "not announcing the nameserver at {address}, since the node has no hostname to \
+             serve as its zone; announce-zone sets one."
+        ));
+        return None;
+    };
+    let nameserver = Nameserver {
+        address,
+        zone: zone.to_string(),
+    };
+    match nameserver.check() {
+        Ok(()) => Some(nameserver),
+        Err(e) => {
+            warn_once(format!("not announcing the nameserver at {address}: {e}."));
+            None
+        },
     }
 }
 
@@ -406,5 +445,52 @@ mod tests {
         assert!(announcement.claims.delegation.is_empty());
         assert!(announcement.allowed_ips.is_empty());
         assert!(check(&announcement).is_err());
+    }
+
+    #[test]
+    fn test_own_nameserver() {
+        let delegations: Vec<Prefix> = vec!["10.0.1.0/24".parse().unwrap()];
+        let nameserver = |interface: serde_json::Value, hostname: Option<&str>| {
+            own_nameserver(&config(interface), &delegations, hostname)
+        };
+
+        // None is announced unless the config sets one.
+        assert_eq!(nameserver(serde_json::json!({}), Some("own.wg0.wg")), None);
+
+        // The zone defaults to the node's own hostname, and the config may set another.
+        let at = serde_json::json!({ "announce-nameserver": "10.0.1.53:53" });
+        let announced = nameserver(at.clone(), Some("own.wg0.wg")).unwrap();
+        assert_eq!(announced.address, "10.0.1.53:53".parse().unwrap());
+        assert_eq!(announced.zone, "own.wg0.wg");
+        let zoned = serde_json::json!({
+            "announce-nameserver": "10.0.1.53:53",
+            "announce-zone": "example.com",
+        });
+        assert_eq!(
+            nameserver(zoned.clone(), Some("own.wg0.wg")).unwrap().zone,
+            "example.com"
+        );
+        assert_eq!(nameserver(zoned, None).unwrap().zone, "example.com");
+
+        // Without a hostname or a zone, outside the claimed prefixes, or unreachable, none is
+        // announced.
+        assert_eq!(nameserver(at, None), None);
+        for address in ["10.0.2.53:53", "10.0.1.53:0"] {
+            assert_eq!(
+                nameserver(
+                    serde_json::json!({ "announce-nameserver": address }),
+                    Some("own.wg0.wg")
+                ),
+                None
+            );
+        }
+        // A hostname that ends in a number, without a host suffix, is no zone.
+        assert_eq!(
+            nameserver(
+                serde_json::json!({ "announce-nameserver": "10.0.1.53:53" }),
+                Some("10")
+            ),
+            None
+        );
     }
 }

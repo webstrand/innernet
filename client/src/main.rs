@@ -914,6 +914,15 @@ fn print_peer(
                     assigned.display_delegations()
                 );
             }
+            if let Some(nameserver) = &peer.nameserver {
+                println_pad!(
+                    pad,
+                    "  {}: {} for {}",
+                    "nameserver".bold(),
+                    nameserver.address,
+                    nameserver.zone
+                );
+            }
         }
         if let Some(info) = info {
             if let Some(endpoint) = info.config.endpoint {
@@ -974,6 +983,13 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         tree: false,
         interface: None,
     });
+
+    if let Command::Install { hosts, .. }
+    | Command::Fetch { hosts, .. }
+    | Command::Up { hosts, .. } = &command
+    {
+        hosts.warn_of_hosts_file_options();
+    }
 
     // Binds the config of the admin client of `interface`, and its client of the API.
     macro_rules! admin_client {
