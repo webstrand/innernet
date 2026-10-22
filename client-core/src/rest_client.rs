@@ -5,7 +5,7 @@ use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo},
     media_type, parent_cidr,
     problem::{self, Problem},
-    smallest_cidr_holding, tls, Association, Cidr, CidrDeletion, LegacyAssociation,
+    smallest_cidr_holding, tls, wg, Association, Cidr, CidrDeletion, LegacyAssociation,
     LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
     LegacyState, PeerContents, PeerUpdate, Prefix, ServerCapabilities, State, TaggedCidr,
     TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
@@ -66,6 +66,8 @@ pub struct RestClient<'a> {
     record_port: Option<Recorder<'a, u16>>,
     /// How long the client waits for the server.
     timeout: Duration,
+    /// The interface that carries the requests, whose MTU must carry QUIC, if known.
+    interface: Option<InterfaceName>,
 }
 
 impl<'a> RestClient<'a> {
@@ -89,7 +91,17 @@ impl<'a> RestClient<'a> {
             latch: None,
             record_port: None,
             timeout: TIMEOUT,
+            interface: None,
         })
+    }
+
+    /// The client, whose requests `interface` carries, so that a request over QUIC fails clearly
+    /// when the MTU of the interface is too small for QUIC.
+    pub fn on_interface(self, interface: &InterfaceName) -> Self {
+        Self {
+            interface: Some(*interface),
+            ..self
+        }
     }
 
     /// Create a [`Self`] to communicate with the innernet server of `interface`, whose data store
@@ -105,7 +117,7 @@ impl<'a> RestClient<'a> {
         let (speaks_tls, quic_port) = DataStore::open(data_dir, interface, config)
             .and_then(|store| Ok((store.speaks_tls(server_key)?, store.quic_port(server_key)?)))
             .map_err(RestError::DataStore)?;
-        let client = Self::new(config, speaks_tls)?;
+        let client = Self::new(config, speaks_tls)?.on_interface(interface);
         client.quic_port.set(quic_port.or(config.server.quic_port));
         // A data store that the client first made without an invitation records the coordinator
         // only once the server reports it, after which `fetch` records what the client learned.
@@ -566,6 +578,9 @@ impl<'a> RestClient<'a> {
             let Some(port) = self.tls_port().await? else {
                 continue;
             };
+            if let Some(interface) = &self.interface {
+                wg::check_quic_mtu(interface, self.address).map_err(RestError::Mtu)?;
+            }
             let body = form
                 .as_ref()
                 .map(cbor::to_vec)
@@ -1059,6 +1074,9 @@ pub enum RestError {
     ServerDowngraded,
     #[error("Error reading the data store: {0:#}")]
     DataStore(anyhow::Error),
+    /// The MTU of the interface is too small for QUIC.
+    #[error("{0}")]
+    Mtu(anyhow::Error),
     #[error(
         "The peer has changed since it was listed, so the change was not made. Running the \
          command again lists the peers anew."

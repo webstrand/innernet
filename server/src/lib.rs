@@ -239,7 +239,7 @@ impl AdminClient {
     }
 
     pub fn rest_client(&self) -> Result<RestClient<'_>, Error> {
-        Ok(RestClient::new(&self.config, true)?)
+        Ok(RestClient::new(&self.config, true)?.on_interface(&self.interface))
     }
 
     /// `error`, which a command met, explained if the coordinator didn't answer.
@@ -326,6 +326,10 @@ pub async fn serve(
         events: EventSource::default(),
     };
     let endpoints = follow_endpoints(tunnel.events());
+    // QUIC never completes a handshake over an interface whose MTU can't carry its datagrams.
+    tunnel
+        .capabilities()
+        .check_quic_mtu(&interface, config.address)?;
     log::info!("the TLS API's QUIC port is {quic_port}.");
     let db = Arc::new(Mutex::new(store));
     let changed = StoreChanged::default();

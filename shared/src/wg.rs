@@ -265,9 +265,69 @@ impl PeerInfoExt for PeerInfo {
     }
 }
 
+/// The smallest UDP payload that QUIC sends: every datagram that opens a connection is padded to
+/// it (RFC 9000, section 14), and an implementation never sends less.
+const QUIC_MIN_UDP_PAYLOAD: u32 = 1200;
+
+/// The smallest MTU of an interface that carries QUIC to or from `address`: the smallest UDP
+/// payload of QUIC, with the UDP header and the IP header of the address's family.
+pub fn quic_min_mtu(address: IpAddr) -> u32 {
+    let ip_header = if address.is_ipv4() { 20 } else { 40 };
+    QUIC_MIN_UDP_PAYLOAD + 8 + ip_header
+}
+
+/// The MTU of `interface`, where it can be read cheaply: from sysfs, on Linux. Elsewhere, and if
+/// the interface is gone, `None`.
+pub fn interface_mtu(interface: &InterfaceName) -> Option<u32> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = format!("/sys/class/net/{interface}/mtu");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Fails if the MTU of `interface`, which carries the TLS API to or from `address`, is known to be
+/// too small for QUIC, which would never complete a handshake over it, as [`check_mtu`] checks it.
+pub fn check_quic_mtu(interface: &InterfaceName, address: IpAddr) -> Result<(), Error> {
+    check_mtu(interface, interface_mtu(interface), address)
+}
+
+/// Fails if `mtu`, the MTU of `interface`, if known, which carries the TLS API to or from
+/// `address`, is too small for QUIC, which would never complete a handshake over it.
+pub fn check_mtu(
+    interface: &InterfaceName,
+    mtu: Option<u32>,
+    address: IpAddr,
+) -> Result<(), Error> {
+    let required = quic_min_mtu(address);
+    match mtu {
+        Some(mtu) if mtu < required => Err(anyhow::anyhow!(
+            "the MTU of interface {interface} is {mtu}, but the TLS API runs over QUIC, which \
+             needs an MTU of at least {required} to reach {address}; the operator must raise the \
+             MTU, as with --mtu"
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quic_mtu() {
+        let interface: InterfaceName = "test".parse().unwrap();
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+        assert_eq!(quic_min_mtu(v4), 1228);
+        assert_eq!(quic_min_mtu(v6), 1248);
+        // The default MTU of innernet's interfaces, 1280, carries QUIC in either family.
+        assert!(check_mtu(&interface, Some(1280), v6).is_ok());
+        assert!(check_mtu(&interface, Some(1228), v4).is_ok());
+        assert!(check_mtu(&interface, None, v4).is_ok());
+        let error = check_mtu(&interface, Some(1240), v6).unwrap_err();
+        assert!(error.to_string().contains("at least 1248"), "{error}");
+    }
 
     const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
 

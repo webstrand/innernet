@@ -2,6 +2,9 @@
 //! tunnel, and a [`NamePublisher`], which publishes the names. Each is a trait, implemented by
 //! [`WireGuard`] and [`DnsServer`]; another backend, such as an in-process WireGuard without a
 //! network device, or another publisher, implements the same trait.
+//!
+//! Decisions that depend on the backend live in the adapter, which reports what the core and the
+//! host need to know of it as its [`Capabilities`].
 
 use crate::{
     dns::{Names, Server},
@@ -10,10 +13,30 @@ use crate::{
     snapshot::Snapshot,
 };
 use innernet_shared::{
-    interface_config::DnsInfo, wg::DeviceExt as _, Endpoint, Error, PeerChange, PeerContents,
+    interface_config::DnsInfo,
+    wg::{self, DeviceExt as _},
+    Endpoint, Error, PeerChange, PeerContents,
 };
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
+
+/// What a tunnel backend can tell of itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The MTU of the tunnel, if the backend knows it.
+    pub mtu: Option<u32>,
+}
+
+impl Capabilities {
+    /// Fails if the MTU of the tunnel, which carries the TLS API to or from `address`, is known to
+    /// be too small for QUIC, which would never complete a handshake over it.
+    pub fn check_quic_mtu(&self, tunnel: &InterfaceName, address: IpAddr) -> Result<(), Error> {
+        wg::check_mtu(tunnel, self.mtu, address)
+    }
+}
 
 /// What a tunnel backend changed of a peer when it realized a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +51,9 @@ pub struct Realized {
 
 /// The tunnel of a node, which holds the peers of a snapshot.
 pub trait TunnelBackend {
+    /// What the backend can tell of itself.
+    fn capabilities(&self) -> Capabilities;
+
     /// Brings the tunnel in line with `snapshot`: it holds every enabled peer of the snapshot, as
     /// the snapshot configures it, and no other. Returns what it changed of each peer.
     fn realize(&mut self, snapshot: &Snapshot) -> Result<Vec<Realized>, Error>;
@@ -62,6 +88,12 @@ pub struct WireGuard {
 }
 
 impl TunnelBackend for WireGuard {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            mtu: wg::interface_mtu(&self.interface),
+        }
+    }
+
     /// Diffs the peers of the interface with those of `snapshot`, and applies the difference.
     fn realize(&mut self, snapshot: &Snapshot) -> Result<Vec<Realized>, Error> {
         let device = Device::get(&self.interface, self.backend)?;

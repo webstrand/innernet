@@ -190,7 +190,8 @@ async fn update_keypair(
         config.server.internal_endpoint
     );
     let redeemed = async {
-        let rest_client = RestClient::new(&invitation, invitation.server.has_feature(FEATURE_TLS))?;
+        let rest_client = RestClient::new(&invitation, invitation.server.has_feature(FEATURE_TLS))?
+            .on_interface(interface);
         rest_client
             .http_form::<_, ()>(
                 "POST",
