@@ -16,7 +16,8 @@ use innernet_shared::{
 };
 use ipnet::IpNet;
 use std::{
-    io::IsTerminal,
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::fs::OpenOptionsExt,
 };
@@ -26,7 +27,7 @@ use wireguard_control::KeyPair;
 /// as the config is, of the schema of every node and the coordinator's annex, for the network
 /// `network`.
 fn create_database(database_path: &Path, network: IpNet) -> Result<Store, Error> {
-    std::fs::OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -148,6 +149,18 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
             .with_prompt("Network name")
             .interact()?
     };
+    // A network is never initialized over an existing one, whose config holds the server's
+    // private key.
+    let config_path = conf.config_path(&name);
+    let database_path = conf.database_path(&name);
+    for path in [&config_path, &database_path] {
+        if path.exists() {
+            bail!(
+                "network {name} already exists: {} is present.",
+                path.display()
+            );
+        }
+    }
 
     let root_cidr: IpNet = if let Some(cidr) = opts.network_cidr {
         cidr
@@ -215,7 +228,6 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
         .hosts()
         .find(|ip| root_cidr.is_assignable(ip))
         .unwrap();
-    let config_path = conf.config_path(&name);
     let our_keypair = KeyPair::generate();
 
     let network_name = name.to_string().parse()?;
@@ -233,8 +245,6 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
             bootstrap_endpoint: Some(endpoint.clone()),
         },
     );
-    config.write_to_path(config_path)?;
-
     let db_init_data = DbInitData {
         network_name: name.to_string(),
         network_cidr: root_cidr,
@@ -244,17 +254,25 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
         endpoint,
     };
 
-    // TODO(bschwind) - Clean up the config file and database
-    //                  if any errors occur in these init calls.
-
-    let database_path = conf.database_path(&name);
-    let store = create_database(&database_path, root_cidr).map_err(|e| {
-        anyhow!(
-            "failed to create database {} {e:#}",
-            "(are you not running as root?)".bold()
-        )
-    })?;
-    populate_database(&store, db_init_data)?;
+    // A network that fails to initialize leaves nothing behind, so that initializing it again
+    // isn't refused as an existing one.
+    let created = config.write_to_path(&config_path).and_then(|()| {
+        let store = create_database(&database_path, root_cidr)
+            .context("failed to create the database (are you not running as root?)")?;
+        populate_database(&store, db_init_data)
+    });
+    if let Err(e) = created {
+        let journal_path = database_path.with_extension("db-journal");
+        for path in [&config_path, &database_path, &journal_path] {
+            match fs::remove_file(path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    log::warn!("failed to remove {}: {e}", path.display());
+                },
+                _ => {},
+            }
+        }
+        return Err(e);
+    }
 
     println!(
         "{} Created database at {}\n",

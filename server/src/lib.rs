@@ -524,6 +524,60 @@ mod tests {
         Ok(())
     }
 
+    fn init_opts() -> Result<crate::initialize::InitializeOpts, Error> {
+        Ok(crate::initialize::InitializeOpts {
+            network_name: Some("test".parse()?),
+            network_cidr: Some("10.80.0.0/15".parse()?),
+            external_endpoint: Some(
+                "155.155.155.155:54321"
+                    .parse()
+                    .map_err(|e: &str| anyhow!(e))?,
+            ),
+            listen_port: Some(54321),
+            quic_port: Some(54322),
+            auto_external_endpoint: false,
+        })
+    }
+
+    #[test]
+    fn test_init_wizard_existing_network() -> Result<(), Error> {
+        // The database is readable by its owner only, and a network is never initialized over an
+        // existing one, whose config and database stay as they were.
+        let dir = tempfile::tempdir()?;
+        let conf = ServerConfig::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        crate::initialize::init_wizard(&conf, init_opts()?)?;
+        let interface = "test".parse()?;
+        let database_path = conf.database_path(&interface);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&database_path)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let config = std::fs::read(conf.config_path(&interface))?;
+        let database = std::fs::read(&database_path)?;
+        assert!(crate::initialize::init_wizard(&conf, init_opts()?).is_err());
+        assert_eq!(std::fs::read(conf.config_path(&interface))?, config);
+        assert_eq!(std::fs::read(&database_path)?, database);
+
+        // So is one whose database alone is left.
+        std::fs::remove_file(conf.config_path(&interface))?;
+        assert!(crate::initialize::init_wizard(&conf, init_opts()?).is_err());
+        assert!(!conf.config_path(&interface).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_wizard_failure_leaves_nothing() -> Result<(), Error> {
+        // The database can't be created where a file stands in for its directory, and the config
+        // written before it is removed.
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("data");
+        std::fs::write(&data_dir, b"")?;
+        let conf = ServerConfig::new(dir.path().to_path_buf(), data_dir);
+        assert!(crate::initialize::init_wizard(&conf, init_opts()?).is_err());
+        assert!(!conf.config_path(&"test".parse()?).exists());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_server_announces_itself() -> Result<(), Error> {
         // The server signs the announcement of its own peer, as every peer signs its own: its
