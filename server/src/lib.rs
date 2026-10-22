@@ -25,7 +25,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 use wireguard_control::{InterfaceName, Key};
 
@@ -303,7 +302,7 @@ pub async fn serve(
     let triggers = Triggers {
         changed: Some(changed.clone()),
         interval: None,
-        addresses: addresses::Watcher::new(ADDRESS_SETTLE)
+        addresses: addresses::Watcher::new(config.interface.address_settle())
             .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
             .ok(),
     };
@@ -340,9 +339,6 @@ pub async fn serve(
         result = coordinator.join() => result,
     }
 }
-
-/// How long the watcher of the host's addresses waits for a burst of changes to settle.
-const ADDRESS_SETTLE: Duration = Duration::from_millis(200);
 
 /// The endpoints at which the tunnel observes the peers, as `events` report them.
 fn follow_endpoints(mut events: TunnelEvents) -> Endpoints {

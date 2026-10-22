@@ -161,7 +161,16 @@ pub struct InterfaceInfo {
     /// `address`, each within the delegation that it claims.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_addresses: Vec<IpAddr>,
+
+    /// How long, in milliseconds, the node waits once the host's addresses change before it runs a
+    /// round, so that the changes of a burst, such as those of a link that comes up, take one
+    /// round. 200 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_settle_ms: Option<u64>,
 }
+
+/// How long a node waits for the host's addresses to settle when its config doesn't say.
+pub const DEFAULT_ADDRESS_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 fn yes() -> bool {
     true
@@ -183,7 +192,14 @@ impl InterfaceInfo {
             delegation: None,
             allowed_ips: None,
             extra_addresses: vec![],
+            address_settle_ms: None,
         }
+    }
+
+    /// How long the node waits for the host's addresses to settle once they change.
+    pub fn address_settle(&self) -> std::time::Duration {
+        self.address_settle_ms
+            .map_or(DEFAULT_ADDRESS_SETTLE, std::time::Duration::from_millis)
     }
 }
 
@@ -526,6 +542,7 @@ impl Invitation {
             delegation: None,
             allowed_ips: None,
             extra_addresses: vec![],
+            address_settle_ms: None,
         };
         Ok(ResolvedInvitation {
             config: InterfaceConfig::new(interface, self.server),
@@ -811,6 +828,18 @@ mod tests {
                 .to_string()
                 .contains("neither a peer's public key nor a peer IP"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn test_address_settle() {
+        let config = parse("").unwrap();
+        assert_eq!(config.interface.address_settle(), DEFAULT_ADDRESS_SETTLE);
+        let text = INVITATION.replace("[interface]\n", "[interface]\naddress-settle-ms = 50\n");
+        let config: InterfaceConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            config.interface.address_settle(),
+            std::time::Duration::from_millis(50)
         );
     }
 

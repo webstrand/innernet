@@ -19,7 +19,7 @@ use innernet_node::{
     runtime::{self, Triggers},
 };
 use innernet_shared::{
-    interface_config::{InterfaceConfig, Invitation},
+    interface_config::{InterfaceConfig, Invitation, DEFAULT_ADDRESS_SETTLE},
     prompts, wg,
     wg::PeerInfoExt,
     AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DelegationOpts, DeleteCidrOpts,
@@ -502,10 +502,16 @@ async fn up(
                     events: EventSource::default(),
                     dns: Some(DnsService::new(*interface, hosts.host_suffix.clone())),
                 };
+                // The watcher waits as the config read when the loop starts says; every round
+                // reads the rest of the config anew.
+                let settle = InterfaceConfig::from_interface(&config_dir, &interface)
+                    .map_or(DEFAULT_ADDRESS_SETTLE, |config| {
+                        config.interface.address_settle()
+                    });
                 let triggers = Triggers {
                     changed: None,
                     interval: Some(interval),
-                    addresses: addresses::Watcher::new(ADDRESS_SETTLE)
+                    addresses: addresses::Watcher::new(settle)
                         .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
                         .ok(),
                 };
@@ -528,9 +534,6 @@ async fn up(
         }
     }
 }
-
-/// How long the watcher of the host's addresses waits for a burst of changes to settle.
-const ADDRESS_SETTLE: Duration = Duration::from_millis(200);
 
 fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Error> {
     let config = InterfaceConfig::get_path(&opts.config_dir, interface);
