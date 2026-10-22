@@ -18,11 +18,13 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
-use wireguard_control::Key;
+use wireguard_control::{InterfaceName, Key};
 
 /// What the coordinator serves, as its host configures it.
 #[derive(Clone, Debug)]
 pub struct CoordinatorConfig {
+    /// The name of the network.
+    pub network_name: InterfaceName,
     /// The address at which the coordinator serves its API: the primary IP of its node.
     pub address: IpAddr,
     /// The UDP port of the TLS API, at `address`.
@@ -64,6 +66,7 @@ impl Coordinator {
         let context = Context {
             db: db.clone(),
             endpoints: hooks.endpoints,
+            interface: config.network_name,
             public_key,
             internal_address: config.address,
             quic_port: config.quic_port,
@@ -153,6 +156,8 @@ pub struct Context {
     pub db: Db,
     /// The endpoints at which the tunnel of the coordinator's node observes the peers.
     pub endpoints: Endpoints,
+    /// The name of the network.
+    pub interface: InterfaceName,
     pub public_key: Key,
     /// The address that the server serves its API on, within the delegations of its own peer.
     pub internal_address: IpAddr,
@@ -280,9 +285,16 @@ pub(crate) enum ConnectionMode {
 }
 
 /// The routes of the TLS API, each of which allows anonymous connections or requires a client
-/// key. A route names a resource, such as `/user`, under which the handler finds the rest.
+/// key. A route names a resource, such as `/user`, under which the handler finds the rest, or a
+/// public route, which has no path prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
+    /// `GET /server`, public.
+    Server,
+    /// `GET /whoami`, public.
+    Whoami,
+    /// `GET /capabilities`, public.
+    Capabilities,
     /// `/user/...`, what every peer may do.
     User,
     /// `/admin/...`, what only admins may do.
@@ -290,11 +302,15 @@ enum Route {
 }
 
 impl Route {
-    /// The route of a request for the path `components`, if the server has one.
-    fn of(components: &VecDeque<String>) -> Option<Self> {
-        match components.front().map(String::as_str) {
-            Some("user") => Some(Route::User),
-            Some("admin") => Some(Route::Admin),
+    /// The route of a request with `method` for the path `components`, if the server has one.
+    fn of(method: &hyper::Method, components: &VecDeque<String>) -> Option<Self> {
+        let get = method == hyper::Method::GET;
+        match (components.front().map(String::as_str), components.len()) {
+            (Some("server"), 1) if get => Some(Route::Server),
+            (Some("whoami"), 1) if get => Some(Route::Whoami),
+            (Some("capabilities"), 1) if get => Some(Route::Capabilities),
+            (Some("user"), _) => Some(Route::User),
+            (Some("admin"), _) => Some(Route::Admin),
             _ => None,
         }
     }
@@ -302,6 +318,7 @@ impl Route {
     /// Whether a connection without a client key may use the route.
     fn allows_anonymous(self) -> bool {
         match self {
+            Route::Server | Route::Whoami | Route::Capabilities => true,
             Route::User | Route::Admin => false,
         }
     }
@@ -319,7 +336,7 @@ async fn tls_routes(
     mode: ConnectionMode,
     mut components: VecDeque<String>,
 ) -> Result<Response<Body>, ServerError> {
-    let route = Route::of(&components);
+    let route = Route::of(req.method(), &components);
     let client_key = match mode {
         ConnectionMode::Authenticated(key) => Some(key),
         _ => None,
@@ -329,13 +346,24 @@ async fn tls_routes(
     }
     let route = route.ok_or(ServerError::NotFound)?;
     let representation = util::negotiate(&req)?;
-    components.pop_front();
-    let client_key = client_key.ok_or(ServerError::ClientKeyRequired)?;
-    let mut session = get_session(&req, context, remote_addr.ip(), Some(&client_key), false)?;
-    session.representation = Some(representation);
+    let address = remote_addr.ip();
     match route {
-        Route::User => api::user::routes(req, components, session).await,
-        Route::Admin => api::admin::routes(req, components, session).await,
+        Route::Server => api::public::server(&context, representation),
+        Route::Whoami => {
+            api::public::whoami(&context, address, client_key.as_ref(), representation)
+        },
+        Route::Capabilities => api::public::capabilities(&context, representation),
+        Route::User | Route::Admin => {
+            components.pop_front();
+            let client_key = client_key.ok_or(ServerError::ClientKeyRequired)?;
+            let mut session = get_session(&req, context, address, Some(&client_key), false)?;
+            session.representation = Some(representation);
+            if route == Route::User {
+                api::user::routes(req, components, session).await
+            } else {
+                api::admin::routes(req, components, session).await
+            }
+        },
     }
 }
 

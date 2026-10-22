@@ -238,6 +238,11 @@ impl Server {
             .unwrap();
     }
 
+    /// The server's public key, that of its own peer.
+    pub fn public_key(&self) -> &Key {
+        &self.public_key
+    }
+
     pub fn db(&self) -> Db {
         self.db.clone()
     }
@@ -245,6 +250,7 @@ impl Server {
     pub fn context(&self) -> Context {
         Context {
             db: self.db.clone(),
+            interface: self.interface,
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
             internal_address: self.internal_address,

@@ -368,6 +368,7 @@ pub async fn serve(
     };
     let coordinator = Coordinator::spawn(
         CoordinatorConfig {
+            network_name: interface,
             address: config.address,
             quic_port,
         },
@@ -898,6 +899,12 @@ mod tests {
         assert_eq!(status, 403);
         let problem: innernet_shared::problem::Problem = innernet_shared::cbor::from_slice(&body)?;
         assert!(problem.is(&innernet_shared::problem::CLIENT_KEY_REQUIRED));
+        // It may use the public routes.
+        let (status, body) = test::quic_get(addr, None, pinned, &header_key, "/server").await?;
+        assert_eq!(status, 200);
+        let description: innernet_shared::ServerDescription =
+            innernet_shared::cbor::from_slice(&body)?;
+        assert_eq!(description.public_key, header_key);
 
         // A client pinning another server key refuses the handshake, with a key or without.
         let wrong = KeyPair::generate().public;

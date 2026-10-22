@@ -1417,6 +1417,68 @@ pub struct ServerCapabilities {
     pub quic_port: Option<u16>,
 }
 
+/// The answer to `GET /server` of the TLS API, a public route: the server's public key, in
+/// base64, the name of the network, and its CIDR.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ServerDescription {
+    pub public_key: String,
+    pub network_name: String,
+    pub network_cidr: Prefix,
+}
+
+/// The answer to `GET /whoami` of the TLS API, a public route. For a connection authenticated with
+/// a client key, it names that key, and the name of the peer that has it; for an anonymous
+/// connection, the peer whose delegations hold the source address of the request, which is only
+/// information, since the connection proves nothing of the peer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Whoami {
+    /// The source address of the request, as text.
+    #[serde(with = "as_text")]
+    pub address: IpAddr,
+    /// Whether the connection authenticated with a client key.
+    pub authenticated: bool,
+    /// The public key, in base64, or `None` for an anonymous connection from an address that no
+    /// peer holds.
+    pub public_key: Option<String>,
+    /// The name of the peer with `public_key`, if there is one and it has a name.
+    pub name: Option<Hostname>,
+}
+
+/// The answer to `GET /capabilities` of the TLS API, a public route: the capabilities of the server
+/// that concern any client, and the version of the server. It leaves out
+/// `unspecified_ip_in_override_endpoint`, which concerns only a peer that sets its own endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PublicCapabilities {
+    pub quic_port: Option<u16>,
+    /// The version of innernet-server.
+    pub version: String,
+}
+
+/// A value that is serialized as its text, whatever the format, as the TLS API answers addresses
+/// even in CBOR, in which an address would otherwise be bytes.
+mod as_text {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use std::{fmt::Display, str::FromStr};
+
+    pub fn serialize<T: Display, S: Serializer>(
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: FromStr,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Timestring {
     timestring: String,

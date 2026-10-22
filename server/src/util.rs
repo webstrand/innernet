@@ -167,6 +167,17 @@ pub fn form_status_response<F: Serialize>(
         .body(Body::from(body))?)
 }
 
+/// A response of a public route of the TLS API, which needs no session, with the body `form`, in
+/// `representation`, as [`util::negotiate`](negotiate) chose it.
+pub fn represented_response<F: Serialize>(
+    representation: Representation,
+    form: F,
+) -> Result<Response<Body>, ServerError> {
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, representation.content_type())
+        .body(Body::from(representation.encode(&form)?))?)
+}
+
 pub fn status_response(status: StatusCode) -> Result<Response<Body>, ServerError> {
     Ok(Response::builder().status(status).body(Body::empty())?)
 }
