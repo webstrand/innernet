@@ -246,6 +246,27 @@ client adm enable-peer e2e --name y --yes || fail "enable-peer as adm"
 [ "$(x_peer)" = "y|0" ] || fail "adm didn't enable y: $(x_peer)"
 pass "adm enables a peer by key"
 
+step "a current admin client addresses CIDRs and associations by prefix over TLS"
+# The server keys CIDRs by prefix, and associations by the prefixes of their CIDRs.
+cidr_named() { db "SELECT hex(address) || '/' || prefix_len FROM cidrs WHERE name = '$1'"; }
+client adm add-cidr e2e --name lab --cidr 10.66.2.0/24 --parent e2e --yes || fail "add-cidr as adm"
+[ "$(cidr_named lab)" = "0A420200/24" ] || fail "adm didn't add lab: $(cidr_named lab)"
+pass "adm adds a CIDR"
+client adm rename-cidr e2e --name lab --new-name lab2 --yes || fail "rename-cidr as adm"
+[ "$(cidr_named lab2)" = "0A420200/24" ] || fail "adm didn't rename lab"
+pass "adm renames a CIDR by prefix"
+client adm add-association e2e peers lab2 --yes || fail "add-association as adm"
+[ "$(db "SELECT hex(address_1) || '/' || prefix_len_1 || ' ' || hex(address_2) || '/' || prefix_len_2 FROM associations")" = "0A420100/24 0A420200/24" ] ||
+    fail "adm didn't associate peers and lab2"
+client adm list-associations e2e || fail "list-associations as adm"
+grep -q "peers <=> lab2" "$work/adm.log" || fail "adm doesn't list the association"
+pass "adm associates two CIDRs by prefix, and lists the association"
+client adm delete-association e2e lab2 peers --yes || fail "delete-association as adm"
+[ "$(db "SELECT count(*) FROM associations")" = 0 ] || fail "adm didn't delete the association"
+client adm delete-cidr e2e --name lab2 --yes || fail "delete-cidr as adm"
+[ -z "$(cidr_named lab2)" ] || fail "adm didn't delete lab2"
+pass "adm deletes an association and a CIDR by prefix"
+
 step "delegations"
 a_key=$(invitation "$work/a/conf/e2e.conf" interface private-key | wg pubkey)
 # Prints the allowed IPs that a client's interface routes to a key.
@@ -397,10 +418,30 @@ if client c add-delegation e2o --name d2 --prefix 10.67.1.32/28 --yes; then
 fi
 grep -q "single address only" "$work/c.log" || fail "c's refusal doesn't explain itself"
 pass "c refuses to delegate a prefix through a server that predates TLS"
+# The server that predates TLS addresses CIDRs and associations only by ID.
+client c add-cidr e2o --name tmp --cidr 10.67.3.0/24 --parent e2o --yes ||
+    fail "add-cidr of tmp as c in plain HTTP"
+client c rename-cidr e2o --name tmp --new-name tmp2 --yes || fail "rename-cidr as c in plain HTTP"
+[ "$(osrv_db "SELECT ip, prefix FROM cidrs WHERE name = 'tmp2'")" = "10.67.3.0|24" ] ||
+    fail "c didn't add and rename tmp"
+client c delete-cidr e2o --name tmp2 --yes || fail "delete-cidr as c in plain HTTP"
+[ -z "$(osrv_db "SELECT id FROM cidrs WHERE name = 'tmp2'")" ] || fail "c didn't delete tmp2"
+pass "c adds, renames and deletes a CIDR by ID in plain HTTP"
+client c add-cidr e2o --name lab --cidr 10.67.2.0/24 --parent e2o --yes ||
+    fail "add-cidr as c in plain HTTP"
+client c add-association e2o peers lab --yes || fail "add-association as c in plain HTTP"
+client c list-associations e2o || fail "list-associations as c in plain HTTP"
+grep -q "peers <=> lab" "$work/c.log" || fail "c doesn't list the association"
+[ "$(osrv_db "SELECT count(*) FROM associations")" = 1 ] || fail "c didn't associate peers and lab"
+pass "c associates two CIDRs by ID in plain HTTP"
 
 step "the server is upgraded"
+cidr_names=$(osrv_db "SELECT name FROM cidrs ORDER BY name")
 stop_osrv
 serve_osrv "$E2E_BIN"
+[ "$(osrv_db "SELECT name FROM cidrs ORDER BY name")" = "$cidr_names" ] ||
+    fail "the upgraded server didn't keep every CIDR"
+pass "the upgraded server keeps every CIDR"
 client c fetch e2o || fail "fetch as c from the upgraded server"
 [ "$(client_latched c)" = 1 ] || fail "c didn't latch the upgraded server"
 pass "c fetches over TLS, and latched the server"
@@ -413,6 +454,13 @@ client c rename-peer e2o --name d2 --new-name d3 --yes || fail "rename-peer as c
 client c enable-peer e2o --name d3 --yes || fail "enable-peer as c over TLS"
 [ "$(d_peer)" = "d3|0" ] || fail "c didn't rename and enable d: $(d_peer)"
 pass "c renames and enables a peer by key over TLS"
+client c rename-cidr e2o --name lab --new-name lab2 --yes || fail "rename-cidr as c over TLS"
+client c delete-association e2o peers lab2 --yes || fail "delete-association as c over TLS"
+[ "$(osrv_db "SELECT count(*) FROM associations")" = 0 ] || fail "c didn't delete the association"
+client c delete-cidr e2o --name lab2 --yes || fail "delete-cidr as c over TLS"
+[ "$(osrv_db "SELECT count(*) FROM cidrs WHERE name LIKE 'lab%'")" = 0 ] ||
+    fail "c didn't rename and delete lab"
+pass "c renames and deletes a CIDR and an association by prefix over TLS"
 
 step "the server is downgraded"
 stop_osrv
