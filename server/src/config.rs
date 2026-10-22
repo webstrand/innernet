@@ -1,11 +1,11 @@
 //! The config of a server: its node, described as a client's interface is, the coordinator that
 //! runs beside it, and the DNS server of the node.
 
-use anyhow::Context as _;
+use anyhow::{bail, Context as _};
 use colored::*;
 use innernet_shared::{
     interface_config::{DnsInfo, InterfaceInfo},
-    Endpoint, Error, IoErrorContext,
+    Endpoint, Error, IoErrorContext, Prefix,
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,27 @@ impl ConfigFile {
     pub fn network(&self) -> IpNet {
         self.interface.address.trunc()
     }
+
+    /// Checks that the primary IP of the server's node lies within the allowed IPs that its node
+    /// announces, as the config states them, or within the delegation that it claims if the config
+    /// states no allowed IPs. Peers reach the coordinator's API at the primary IP through the
+    /// allowed IPs of the server's peer, so the API is unreachable at an address outside them.
+    pub fn check_primary_ip(&self) -> Result<(), Error> {
+        let address = self.address();
+        let (key, prefixes): (&str, &[Prefix]) =
+            match (&self.interface.allowed_ips, &self.interface.delegation) {
+                (Some(allowed), _) => ("allowed-ips", allowed),
+                (None, Some(delegation)) => ("delegation", delegation),
+                (None, None) => return Ok(()),
+            };
+        if !prefixes.iter().any(|prefix| prefix.contains_addr(&address)) {
+            bail!(
+                "the server's address {address} lies outside the {key} of its config, so peers \
+                 could not reach its API there"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +227,33 @@ mod tests {
         assert_eq!(
             ConfigFile::from_file(&path)?.interface.private_key,
             config.interface.private_key
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_primary_ip() -> Result<(), Error> {
+        let config = |extra: &str| -> Result<ConfigFile, Error> {
+            Ok(toml::from_str(&format!(
+                "[interface]\nnetwork-name = \"wg0\"\naddress = \"10.66.0.1/16\"\n\
+                 private-key = \"kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM=\"\n{extra}"
+            ))?)
+        };
+        assert!(config("")?.check_primary_ip().is_ok());
+        assert!(config("allowed-ips = [\"10.66.0.0/24\"]\n")?
+            .check_primary_ip()
+            .is_ok());
+        assert!(config("allowed-ips = [\"10.66.1.0/24\"]\n")?
+            .check_primary_ip()
+            .is_err());
+        assert!(config("delegation = [\"10.66.1.0/24\"]\n")?
+            .check_primary_ip()
+            .is_err());
+        // The allowed IPs decide when the config states both.
+        assert!(
+            config("delegation = [\"10.66.1.0/24\"]\nallowed-ips = [\"10.66.0.1/32\"]\n")?
+                .check_primary_ip()
+                .is_ok()
         );
         Ok(())
     }

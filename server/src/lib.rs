@@ -224,6 +224,7 @@ pub async fn serve(
             Err(e) => return Err(e),
         },
     };
+    config.check_primary_ip()?;
     log::debug!("opening database connection...");
     let store = open_database_connection(&interface, conf, &config)?;
     let public_key = check_database_matches_config(&store, &config)?;
