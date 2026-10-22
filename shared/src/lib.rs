@@ -182,17 +182,16 @@ mod tests {
             Some("peer-1.evilnet")
         );
 
-        // A suffix always follows the name, so the name may be a number.
+        // A name that a suffix follows may contain dots and end in a number.
         assert_eq!(hostname(None, "08").as_deref(), Some("08.wg0.wg"));
         assert_eq!(
-            hostname(Some("evilnet"), "08").as_deref(),
-            Some("08.evilnet")
+            hostname(Some("evilnet"), "a.08").as_deref(),
+            Some("a.08.evilnet")
         );
 
         // A name that isn't a valid hostname is omitted.
         assert_eq!(hostname(None, "peer\n10.0.0.1 example.com"), None);
         assert_eq!(hostname(None, "a b"), None);
-        assert_eq!(hostname(None, "a.b"), None);
         assert_eq!(hostname(None, "Peer"), None);
         assert_eq!(hostname(None, ""), None);
         assert_eq!(

@@ -810,19 +810,20 @@ mod tests {
         assert_eq!(config.dns, dns);
 
         // The selectors are read and written back as they are spelled.
-        let config = with("listen = \"127.0.0.55:53\"\nforward = [\"*\", \"!b\", \"c\"]").unwrap();
+        let config =
+            with("listen = \"127.0.0.55:53\"\nforward = [\"*\", \"!b\", \"c.d\"]").unwrap();
         let forward = &config.dns.as_ref().unwrap().forward;
         assert_eq!(
             forward.0,
             [
                 ForwardSelector::All,
                 ForwardSelector::Except("b".parse().unwrap()),
-                ForwardSelector::Peer("c".parse().unwrap()),
+                ForwardSelector::Peer("c.d".parse().unwrap()),
             ]
         );
         let written = toml::to_string(&config).unwrap();
         assert!(
-            written.contains(r#"forward = ["*", "!b", "c"]"#),
+            written.contains(r#"forward = ["*", "!b", "c.d"]"#),
             "{written}"
         );
 
