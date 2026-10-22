@@ -312,11 +312,20 @@ impl ServerCertVerifier for ServerKeyVerifier {
 }
 
 /// Accepts any well-formed WireGuard key; whether it belongs to a peer is up to the server,
-/// which reads it back with [`peer_public_key`].
+/// which reads it back with [`peer_public_key`]. A client that presents no key is accepted too,
+/// as an anonymous client, which the server lets use only its public routes.
+///
+/// The verifier requires raw public keys, so that a client that knows them presents its key as
+/// one. A client that offers no client certificate type, such as curl, is not asked for a key at
+/// all, which rustls, as innernet patches it, allows when client authentication is optional.
 #[derive(Debug)]
 struct PeerKeyVerifier;
 
 impl ClientCertVerifier for PeerKeyVerifier {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }
@@ -361,9 +370,9 @@ impl ClientCertVerifier for PeerKeyVerifier {
 }
 
 /// The server's TLS configuration: TLS 1.3 only, authenticating with the server's WireGuard
-/// private key, in its self-signed certificate, and requiring the client to authenticate with its
-/// own, as a raw public key, for HTTP/3 over QUIC. Sessions are never resumed and early data is
-/// refused, so every connection is authenticated afresh.
+/// private key, in its self-signed certificate, and accepting a client that authenticates with
+/// its own, as a raw public key, or with none, for HTTP/3 over QUIC. Sessions are never resumed
+/// and early data is refused, so every connection is authenticated afresh.
 pub fn server_config(private_key: &str) -> Result<Arc<ServerConfig>, Error> {
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -384,16 +393,33 @@ pub fn client_config(
     private_key: &str,
     server_public_key: &str,
 ) -> Result<Arc<ClientConfig>, Error> {
+    client_config_with(Some(private_key), server_public_key)
+}
+
+/// The TLS configuration of an anonymous client, which presents no key, as curl does, and
+/// accepts only the server's pinned public key. The server lets such a client use only its public
+/// routes.
+pub fn anonymous_client_config(server_public_key: &str) -> Result<Arc<ClientConfig>, Error> {
+    client_config_with(None, server_public_key)
+}
+
+fn client_config_with(
+    private_key: Option<&str>,
+    server_public_key: &str,
+) -> Result<Arc<ClientConfig>, Error> {
     let server_public_key = Key::from_base64(server_public_key)
         .map_err(|_| anyhow!("the server's public key is invalid"))?;
     let verifier = ServerKeyVerifier { server_public_key };
-    let mut config = ClientConfig::builder_with_provider(provider())
+    let builder = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-            XEdDsaKey::new(private_key)?.certified(),
-        )));
+        .with_custom_certificate_verifier(Arc::new(verifier));
+    let mut config = match private_key {
+        Some(private_key) => builder.with_client_cert_resolver(Arc::new(
+            AlwaysResolvesClientRawPublicKeys::new(XEdDsaKey::new(private_key)?.certified()),
+        )),
+        None => builder.with_no_client_auth(),
+    };
     config.resumption = Resumption::disabled();
     config.enable_sni = false;
     config.enable_early_data = false;
@@ -453,6 +479,25 @@ mod tests {
             .unwrap();
             assert_eq!(seen, Some(client.public));
         }
+    }
+
+    #[test]
+    fn test_anonymous_clients() {
+        // A client that presents no key, and offers no client certificate type, as curl does, is
+        // accepted without a key, and still authenticates the server.
+        let server = KeyPair::generate();
+        let seen = handshake(
+            anonymous_client_config(&server.public.to_base64()).unwrap(),
+            server_config(&private(&server)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seen, None);
+        let wrong = KeyPair::generate().public.to_base64();
+        assert!(handshake(
+            anonymous_client_config(&wrong).unwrap(),
+            server_config(&private(&server)).unwrap(),
+        )
+        .is_err());
     }
 
     #[test]

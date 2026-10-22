@@ -119,8 +119,17 @@ pub const DELEGATION_REFUSED: ProblemType = ProblemType {
     status: 422,
 };
 
+/// The route requires a client key, and the connection has none: the client connected without
+/// authenticating with its key, and must connect again with it. An anonymous connection is told
+/// the same for a path that the server has no route for, so that it can't probe for routes.
+pub const CLIENT_KEY_REQUIRED: ProblemType = ProblemType {
+    uri: "urn:uuid:305a37cb-49a7-43e6-ac4e-999d31323fff",
+    title: "Client key required",
+    status: 403,
+};
+
 /// Every type of problem of innernet's own.
-pub const PROBLEM_TYPES: [ProblemType; 9] = [
+pub const PROBLEM_TYPES: [ProblemType; 10] = [
     TLS_REQUIRED,
     PROMOTION_REQUIRES_TLS,
     PEER_CHANGED,
@@ -130,6 +139,7 @@ pub const PROBLEM_TYPES: [ProblemType; 9] = [
     NO_SUCH_CIDR,
     NO_SUCH_ASSOCIATION,
     DELEGATION_REFUSED,
+    CLIENT_KEY_REQUIRED,
 ];
 
 /// A problem detail. Members that a problem lacks are left out, and members that a recipient

@@ -62,6 +62,13 @@ pub enum ServerError {
     #[error("no association joins these CIDRs")]
     NoSuchAssociation,
 
+    /// A request of a connection of the TLS API without a client key, for a route that requires
+    /// one, or for a path that the server has no route for.
+    #[error(
+        "the route requires a client key; the client must connect again with its WireGuard key"
+    )]
+    ClientKeyRequired,
+
     /// Delegations that break the rules of delegations, with the explanation.
     #[error("{0}")]
     Delegation(String),
@@ -138,6 +145,7 @@ impl ServerError {
             NoSuchPeer => &problem::NO_SUCH_PEER,
             NoSuchCidr => &problem::NO_SUCH_CIDR,
             NoSuchAssociation => &problem::NO_SUCH_ASSOCIATION,
+            ClientKeyRequired => &problem::CLIENT_KEY_REQUIRED,
             Delegation(_) | DelegationTaken { .. } => &problem::DELEGATION_REFUSED,
             Unauthorized | NotFound | InvalidQuery | Gone | Database(_) | WireGuard | Io(_)
             | Json(_) | Cbor(_) | UnsupportedMediaType | NotAcceptable | EmptyBody | Http(_)
@@ -191,6 +199,7 @@ impl From<&ServerError> for StatusCode {
         use ServerError::*;
         match error {
             Unauthorized | TlsRequired => StatusCode::UNAUTHORIZED,
+            ClientKeyRequired => StatusCode::FORBIDDEN,
             PromotionRequiresTls | Delegation(_) | DelegationTaken { .. } => {
                 StatusCode::UNPROCESSABLE_ENTITY
             },
@@ -251,6 +260,7 @@ mod tests {
             ServerError::NoSuchPeer,
             ServerError::NoSuchCidr,
             ServerError::NoSuchAssociation,
+            ServerError::ClientKeyRequired,
             ServerError::Delegation("no".into()),
             ServerError::DelegationTaken {
                 reason: "taken".into(),

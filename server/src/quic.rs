@@ -4,7 +4,7 @@
 //! speaks hyper's types; the request and the response are translated at the edge, with their
 //! bodies read in full, since both are small.
 
-use crate::{util::MAX_BODY_LEN as MAX_REQUEST_BODY_LEN, Context};
+use crate::{util::MAX_BODY_LEN as MAX_REQUEST_BODY_LEN, ConnectionMode, Context};
 use anyhow::{anyhow, bail, Error};
 use bytes::{Buf, Bytes};
 use hyper::Body;
@@ -14,7 +14,6 @@ use quinn::{
     rustls::{self, pki_types::CertificateDer},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use wireguard_control::Key;
 
 /// How long a connection may stay silent before the server drops it, the handshake included.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,31 +56,39 @@ pub async fn serve(endpoint: quinn::Endpoint, context: Context) -> Result<(), Er
     bail!("the QUIC endpoint of the TLS API closed")
 }
 
-/// The X25519 key that the client of `connection` authenticated with.
-fn client_key(connection: &quinn::Connection) -> Option<Key> {
-    let certificates = connection
-        .peer_identity()?
+/// The mode of `connection`: authenticated with the X25519 key that the client presented, or
+/// anonymous, if the client presented none. The verifier of the handshake accepts no other key.
+fn connection_mode(connection: &quinn::Connection) -> Result<ConnectionMode, Error> {
+    let Some(identity) = connection.peer_identity() else {
+        return Ok(ConnectionMode::Anonymous);
+    };
+    let certificates = identity
         .downcast::<Vec<CertificateDer<'static>>>()
-        .ok()?;
-    tls::peer_public_key(Some(&certificates))
+        .map_err(|_| anyhow!("the client presented an unknown identity"))?;
+    if certificates.is_empty() {
+        return Ok(ConnectionMode::Anonymous);
+    }
+    let key = tls::peer_public_key(Some(&certificates))
+        .ok_or_else(|| anyhow!("the client presented no usable key"))?;
+    Ok(ConnectionMode::Authenticated(key))
 }
 
-/// Serves the requests of one connection, each in a task of its own.
+/// Serves the requests of one connection, each in a task of its own, in the mode that the
+/// handshake decided, once for the whole connection.
 async fn serve_connection(incoming: quinn::Incoming, context: Context) -> Result<(), Error> {
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
-    let client_key =
-        client_key(&connection).ok_or_else(|| anyhow!("the client presented no usable key"))?;
+    let mode = connection_mode(&connection)?;
     let mut h3 =
         h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection)).await?;
     loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
-                let (context, client_key) = (context.clone(), client_key.clone());
+                let (context, mode) = (context.clone(), mode.clone());
                 tokio::spawn(async move {
                     let served = async {
                         let (request, stream) = resolver.resolve_request().await?;
-                        serve_request(request, stream, context, remote_addr, client_key).await
+                        serve_request(request, stream, context, remote_addr, mode).await
                     };
                     if let Err(e) = served.await {
                         log::debug!("{remote_addr} (QUIC) - request failed: {e}");
@@ -101,7 +108,7 @@ async fn serve_request<S>(
     mut stream: h3::server::RequestStream<S, Bytes>,
     context: Context,
     remote_addr: SocketAddr,
-    client_key: Key,
+    mode: ConnectionMode,
 ) -> Result<(), Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -113,7 +120,7 @@ where
         request.method(),
         request.uri().path()
     );
-    let response = crate::hyper_service(request, context, remote_addr, Some(client_key)).await?;
+    let response = crate::hyper_service(request, context, remote_addr, mode).await?;
 
     let (parts, body) = response.into_parts();
     let body = hyper::body::to_bytes(body).await?;

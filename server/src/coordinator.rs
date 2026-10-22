@@ -229,7 +229,7 @@ async fn serve_legacy_connection(
     http.http1_header_read_timeout(HEADER_TIMEOUT);
     let service = service_fn(move |req: Request<Body>| {
         log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
-        hyper_service(req, context.clone(), remote_addr, None)
+        hyper_service(req, context.clone(), remote_addr, ConnectionMode::Legacy)
     });
     http.serve_connection(stream, service).await?;
     Ok(())
@@ -241,7 +241,7 @@ pub(crate) async fn hyper_service(
     req: Request<Body>,
     context: Context,
     remote_addr: SocketAddr,
-    client_key: Option<Key>,
+    mode: ConnectionMode,
 ) -> Result<Response<Body>, http::Error> {
     // Break the path into components.
     let components: VecDeque<_> = req
@@ -252,31 +252,105 @@ pub(crate) async fn hyper_service(
         .map(String::from)
         .collect();
 
-    // A client that connects over TLS is told of errors in problem details, in the debug view if
-    // it chose it, and one in plain HTTP as clients that predate TLS expect.
-    let over_tls = client_key.is_some();
+    // A client of the TLS API is told of errors in problem details, in the debug view if it chose
+    // it, and one in plain HTTP as clients that predate TLS expect.
     let debug_view = util::debug_view(&req);
-    routes(req, context, remote_addr, client_key, components)
-        .await
-        .or_else(|e| {
-            if over_tls {
-                e.problem_response(debug_view)
-            } else {
-                e.try_into()
-            }
-        })
+    match mode {
+        ConnectionMode::Legacy => legacy_routes(req, context, remote_addr, components)
+            .await
+            .or_else(|e| e.try_into()),
+        mode => tls_routes(req, context, remote_addr, mode, components)
+            .await
+            .or_else(|e| e.problem_response(debug_view)),
+    }
 }
 
-async fn routes(
+/// How the client of a connection authenticated, which the server decides once per connection,
+/// and which the router follows for each of its requests.
+#[derive(Clone, Debug)]
+pub(crate) enum ConnectionMode {
+    /// Plain HTTP, the legacy API of clients that predate TLS, which identifies a peer by its
+    /// source address.
+    Legacy,
+    /// The TLS API, with the key that the client authenticated with.
+    Authenticated(Key),
+    /// The TLS API, without a client key, which may use only the routes that allow anonymous
+    /// connections.
+    Anonymous,
+}
+
+/// The routes of the TLS API, each of which allows anonymous connections or requires a client
+/// key. A route names a resource, such as `/user`, under which the handler finds the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// `/user/...`, what every peer may do.
+    User,
+    /// `/admin/...`, what only admins may do.
+    Admin,
+}
+
+impl Route {
+    /// The route of a request for the path `components`, if the server has one.
+    fn of(components: &VecDeque<String>) -> Option<Self> {
+        match components.front().map(String::as_str) {
+            Some("user") => Some(Route::User),
+            Some("admin") => Some(Route::Admin),
+            _ => None,
+        }
+    }
+
+    /// Whether a connection without a client key may use the route.
+    fn allows_anonymous(self) -> bool {
+        match self {
+            Route::User | Route::Admin => false,
+        }
+    }
+}
+
+/// Serves a request of the TLS API, of a connection in `mode`. The checks follow one order: the
+/// route; then the gate, which refuses a route that requires a client key to a connection without
+/// one, and refuses an unknown path to such a connection the same way, so that it can't probe for
+/// routes; then the content type and `Accept`, which [`util::negotiate`] checks; then the handler.
+/// The API of TLS sessions is versioned by its media type, not by its paths.
+async fn tls_routes(
     req: Request<Body>,
     context: Context,
     remote_addr: SocketAddr,
-    client_key: Option<Key>,
+    mode: ConnectionMode,
     mut components: VecDeque<String>,
 ) -> Result<Response<Body>, ServerError> {
-    // Plain HTTP serves the API of clients that predate TLS, under "/v1/". The API of TLS sessions
-    // is versioned by its media type, not by its paths.
-    if client_key.is_none() && components.pop_front().as_deref() != Some("v1") {
+    let route = Route::of(&components);
+    let client_key = match mode {
+        ConnectionMode::Authenticated(key) => Some(key),
+        _ => None,
+    };
+    if client_key.is_none() && !route.is_some_and(Route::allows_anonymous) {
+        return Err(ServerError::ClientKeyRequired);
+    }
+    let route = route.ok_or(ServerError::NotFound)?;
+    let representation = util::negotiate(&req)?;
+    components.pop_front();
+    let client_key = client_key.ok_or(ServerError::ClientKeyRequired)?;
+    let mut session = get_session(&req, context, remote_addr.ip(), Some(&client_key), false)?;
+    session.representation = Some(representation);
+    match route {
+        Route::User => api::user::routes(req, components, session).await,
+        Route::Admin => api::admin::routes(req, components, session).await,
+    }
+}
+
+/// Serves a request of the legacy API, in plain HTTP, under the "/v1/" of v2.0.0. The legacy API
+/// has only the user routes: the admin API is served only over TLS, and an admin that predates TLS
+/// is an ordinary peer in plain HTTP until its client is upgraded.
+async fn legacy_routes(
+    req: Request<Body>,
+    context: Context,
+    remote_addr: SocketAddr,
+    mut components: VecDeque<String>,
+) -> Result<Response<Body>, ServerError> {
+    if components.pop_front().as_deref() != Some("v1")
+        || components.front().map(String::as_str) != Some("user")
+    {
         return Err(ServerError::NotFound);
     }
     // The capabilities are only information, which a peer that has connected over TLS asks for in
@@ -284,28 +358,9 @@ async fn routes(
     // internal address, so the answer can be trusted.
     let capabilities =
         req.method() == hyper::Method::GET && components.iter().eq(["user", "capabilities"].iter());
-    let component = components.pop_front();
-    // The admin API exists only over TLS: in plain HTTP its paths are not found, before the peer
-    // is identified. An admin that predates TLS is an ordinary peer in plain HTTP until its client
-    // is upgraded.
-    if component.as_deref() == Some("admin") && client_key.is_none() {
-        return Err(ServerError::NotFound);
-    }
-    let mut session = get_session(
-        &req,
-        context,
-        remote_addr.ip(),
-        client_key.as_ref(),
-        capabilities,
-    )?;
-    if session.over_tls {
-        session.representation = Some(util::negotiate(&req)?);
-    }
-    match component.as_deref() {
-        Some("user") => api::user::routes(req, components, session).await,
-        Some("admin") => api::admin::routes(req, components, session).await,
-        _ => Err(ServerError::NotFound),
-    }
+    let session = get_session(&req, context, remote_addr.ip(), None, capabilities)?;
+    components.pop_front();
+    api::user::routes(req, components, session).await
 }
 
 /// Identifies the peer making a request: by the key it authenticated with over TLS if it did,
@@ -313,7 +368,7 @@ async fn routes(
 /// anything on the peer's machine can send from. Peers that have once connected over TLS are
 /// refused the latter from then on, unless `information_only`, for a request that only reads
 /// information that the peer may have without TLS.
-fn get_session(
+pub(crate) fn get_session(
     req: &Request<Body>,
     context: Context,
     addr: IpAddr,

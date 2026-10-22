@@ -47,7 +47,7 @@ pub use error::ServerError;
 
 #[cfg(test)]
 pub(crate) use coordinator::Db;
-pub(crate) use coordinator::{hyper_service, Endpoints};
+pub(crate) use coordinator::{hyper_service, ConnectionMode, Endpoints};
 pub use coordinator::{Context, Session};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -871,11 +871,11 @@ mod tests {
         server.predate_tls_key(&peer_key.public.to_base64());
         let header_key = server_key(&server);
         let pinned = &server_tls_key.public;
+        let client = Some(&peer_key);
 
         // The peer's key is accepted by the handshake, but not from an IP other than its own,
         // and that doesn't latch it.
-        let (status, _) =
-            test::quic_get(addr, &peer_key, pinned, &header_key, "/user/state").await?;
+        let (status, _) = test::quic_get(addr, client, pinned, &header_key, "/user/state").await?;
         assert_eq!(status, 401);
         assert!(!DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?.requires_tls);
 
@@ -887,15 +887,78 @@ mod tests {
             &delegations,
         )?;
         let (status, body) =
-            test::quic_get(addr, &peer_key, pinned, &header_key, "/user/state").await?;
+            test::quic_get(addr, client, pinned, &header_key, "/user/state").await?;
         assert_eq!(status, 200);
         let _: innernet_shared::State = innernet_shared::cbor::from_slice(&body)?;
         assert!(DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?.requires_tls);
 
-        // A client pinning another server key refuses the handshake.
+        // A client without a key connects, as an anonymous client, which the route refuses for
+        // the lack of a key, though its address is that of the peer.
+        let (status, body) = test::quic_get(addr, None, pinned, &header_key, "/user/state").await?;
+        assert_eq!(status, 403);
+        let problem: innernet_shared::problem::Problem = innernet_shared::cbor::from_slice(&body)?;
+        assert!(problem.is(&innernet_shared::problem::CLIENT_KEY_REQUIRED));
+
+        // A client pinning another server key refuses the handshake, with a key or without.
         let wrong = KeyPair::generate().public;
-        let refused = test::quic_get(addr, &peer_key, &wrong, &header_key, "/user/state").await;
+        let refused = test::quic_get(addr, client, &wrong, &header_key, "/user/state").await;
         assert!(refused.is_err());
+        let refused = test::quic_get(addr, None, &wrong, &header_key, "/user/state").await;
+        assert!(refused.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_order_of_checks() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = test::DEVELOPER1_PEER_IP;
+        let unacceptable = |req: &mut Request<Body>| {
+            req.headers_mut().insert(
+                hyper::header::ACCEPT,
+                "application/vnd.innernet+cbor; version=2".parse().unwrap(),
+            );
+        };
+
+        // An anonymous connection is refused every route that requires a client key, and every
+        // path that the server has no route for, alike, before the content type and Accept are
+        // checked, so that it can't probe for routes.
+        for (method, path) in [
+            ("GET", "/user/state"),
+            ("GET", "/admin/peers"),
+            ("GET", "/nothing"),
+            ("GET", "/v1/user/state"),
+            ("PUT", "/user/candidates"),
+        ] {
+            for unacceptable_accept in [false, true] {
+                let mut req = server.body_request(method, path, "text/plain", vec![0]);
+                if unacceptable_accept {
+                    unacceptable(&mut req);
+                }
+                let res = server.anonymous_request(ip, req).await;
+                test::problem(res, &innernet_shared::problem::CLIENT_KEY_REQUIRED).await?;
+            }
+        }
+
+        // An authenticated connection is told that a path has no route before the content type
+        // and Accept are checked, and those before the handler checks the session.
+        let mut req = server.empty_request("GET", "/nothing");
+        unacceptable(&mut req);
+        let res = server.raw_request(ip, req).await;
+        test::blank_problem(res, StatusCode::NOT_FOUND).await?;
+        let mut req = server.empty_request("GET", "/user/state");
+        unacceptable(&mut req);
+        let res = server
+            .raw_request_as(ip, Some(KeyPair::generate().public), req)
+            .await;
+        test::blank_problem(res, StatusCode::NOT_ACCEPTABLE).await?;
+        let res = server
+            .raw_request_as(
+                ip,
+                Some(KeyPair::generate().public),
+                server.empty_request("GET", "/user/state"),
+            )
+            .await;
+        test::blank_problem(res, StatusCode::UNAUTHORIZED).await?;
         Ok(())
     }
 

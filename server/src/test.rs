@@ -2,7 +2,7 @@
 use crate::{
     db::{DatabaseCidr, DatabasePeer},
     initialize::{init_wizard, InitializeOpts},
-    Context, Db, Endpoints, ServerConfig,
+    ConnectionMode, Context, Db, Endpoints, ServerConfig,
 };
 use anyhow::anyhow;
 use bytes::Buf;
@@ -285,15 +285,41 @@ impl Server {
         client_key: Option<Key>,
         req: Request<Body>,
     ) -> Response<Body> {
+        let mode = match client_key {
+            Some(key) => ConnectionMode::Authenticated(key),
+            None => ConnectionMode::Legacy,
+        };
+        self.request_in_mode(ip_str, mode, req).await
+    }
+
+    /// Sends a request as a client connecting over QUIC without a client key would, from `ip_str`.
+    pub async fn anonymous_request(&self, ip_str: &str, req: Request<Body>) -> Response<Body> {
+        self.request_in_mode(ip_str, ConnectionMode::Anonymous, req)
+            .await
+    }
+
+    async fn request_in_mode(
+        &self,
+        ip_str: &str,
+        mode: ConnectionMode,
+        req: Request<Body>,
+    ) -> Response<Body> {
         let port = 54321u16;
         crate::hyper_service(
             req,
             self.context(),
             SocketAddr::new(ip_str.parse().unwrap(), port),
-            client_key,
+            mode,
         )
         .await
         .unwrap()
+    }
+
+    /// A request without a body, as [`Self::request`] sends it.
+    pub fn empty_request(&self, verb: &str, path: &str) -> Request<Body> {
+        self.base_request_builder(verb, path)
+            .body(Body::empty())
+            .unwrap()
     }
 
     fn base_request_builder(&self, verb: &str, path: &str) -> http::request::Builder {
@@ -382,16 +408,20 @@ pub fn serve_quic(server: &Server, server_key: &KeyPair) -> Result<SocketAddr, E
 }
 
 /// Sends a GET of `path` over QUIC to the TLS API at `addr`, as a client authenticated with
-/// `client`, which pins the server's key `pinned`, with `header_key` as the server's key in
-/// [`innernet_shared::INNERNET_PUBKEY_HEADER`]. Returns the status of the answer, and its body.
+/// `client`, or an anonymous one, which pins the server's key `pinned`, with `header_key` as the
+/// server's key in [`innernet_shared::INNERNET_PUBKEY_HEADER`]. Returns the status of the answer,
+/// and its body.
 pub async fn quic_get(
     addr: SocketAddr,
-    client: &KeyPair,
+    client: Option<&KeyPair>,
     pinned: &Key,
     header_key: &str,
     path: &str,
 ) -> Result<(u16, Vec<u8>), Error> {
-    let tls_config = tls::client_config(&client.private.to_base64(), &pinned.to_base64())?;
+    let tls_config = match client {
+        Some(client) => tls::client_config(&client.private.to_base64(), &pinned.to_base64())?,
+        None => tls::anonymous_client_config(&pinned.to_base64())?,
+    };
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?;
     let unspecified: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse()?
