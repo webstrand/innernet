@@ -13,7 +13,7 @@ use crate::{
     snapshot::Snapshot,
 };
 use innernet_shared::{
-    interface_config::DnsInfo,
+    interface_config::{DnsInfo, Forwarding},
     wg::{self, DeviceExt as _},
     Endpoint, Error, PeerChange, PeerContents,
 };
@@ -146,11 +146,13 @@ impl TunnelBackend for WireGuard {
     }
 }
 
-/// The names published by a DNS server, each under the hostname that the host suffix gives it, as
-/// [`Names::of`] makes them.
+/// The names published by a DNS server, each under the hostname that the host suffix gives it,
+/// forwarding to the nameservers of the peers that `forwarding` selects, as [`Names::of`] makes
+/// them.
 pub struct DnsServer {
     pub interface: InterfaceName,
     pub host_suffix: Option<String>,
+    pub forwarding: Forwarding,
     pub server: Server,
 }
 
@@ -159,6 +161,7 @@ impl NamePublisher for DnsServer {
         self.server.set_names(Names::of(
             &self.interface,
             self.host_suffix.as_deref(),
+            &self.forwarding,
             snapshot,
         ));
         Ok(())
@@ -201,15 +204,21 @@ impl DnsService {
                 running.server.stop().await;
             }
         }
-        let Some(DnsInfo { listen }) = dns else {
+        let Some(DnsInfo { listen, forward }) = dns else {
             return;
         };
         if let Some((_, running)) = &mut self.running {
+            running.forwarding = forward.clone();
             // Publishing to a running server never fails.
             let _ = running.publish(snapshot);
             return;
         }
-        let names = Names::of(&self.interface, self.host_suffix.as_deref(), snapshot);
+        let names = Names::of(
+            &self.interface,
+            self.host_suffix.as_deref(),
+            forward,
+            snapshot,
+        );
         match Server::spawn(*listen, names) {
             Ok(server) => {
                 log::info!(
@@ -219,6 +228,7 @@ impl DnsService {
                 let published = DnsServer {
                     interface: self.interface,
                     host_suffix: self.host_suffix.clone(),
+                    forwarding: forward.clone(),
                     server,
                 };
                 self.running = Some((*listen, published));
@@ -230,6 +240,13 @@ impl DnsService {
     /// The listen address of the table that started the running server, if one runs.
     pub fn listen(&self) -> Option<SocketAddr> {
         self.running.as_ref().map(|(listen, _)| *listen)
+    }
+
+    /// The peers to whose nameservers the running server forwards, if one runs.
+    pub fn forwarding(&self) -> Option<&Forwarding> {
+        self.running
+            .as_ref()
+            .map(|(_, running)| &running.forwarding)
     }
 
     pub async fn stop(&mut self) {

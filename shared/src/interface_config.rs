@@ -1,6 +1,6 @@
 use crate::{
-    chmod, ensure_dirs_exist, hosts_fallback, Endpoint, Error, IoErrorContext, PeerContents,
-    Prefix, WrappedIoError,
+    chmod, ensure_dirs_exist, hosts_fallback, Endpoint, Error, Hostname, IoErrorContext,
+    PeerContents, Prefix, WrappedIoError,
 };
 use anyhow::{anyhow, bail};
 use indoc::writedoc;
@@ -101,17 +101,115 @@ impl From<EndpointOverrides> for BTreeMap<String, Endpoint> {
     }
 }
 
-/// The `[dns]` table of the config: a DNS server that answers queries for the hostnames of the
-/// peers, with their addresses, and refuses queries for any other name. innernet doesn't
-/// configure the system resolver to use it.
+/// The `[dns]` table of the config of a client or of the server: a DNS server that answers queries
+/// for the hostnames of the peers. It answers for the hostname of a peer itself, with the peer's
+/// address, unless the peer offers a nameserver and `forward` selects it, in which case it answers
+/// for the hostname and the names under it from the peer's nameserver. It refuses queries for any
+/// other name. innernet doesn't configure the system resolver to use it.
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct DnsInfo {
     /// The address at which the server answers queries, over both UDP and TCP, such as
     /// `127.0.0.55:53`; `0.0.0.0` or `[::]` listens at every address. It should be a loopback
-    /// address, and its port one that only a privileged user may bind, since a local user who
-    /// binds it while the server doesn't answers for the names of peers.
+    /// address, since anyone who can reach it can query the nameservers of peers through it, and
+    /// its port should be one that only a privileged user may bind, since a local user who binds
+    /// it while the server doesn't answers for the names of peers.
     pub listen: SocketAddr,
+
+    /// The peers to whose nameservers the server forwards queries, none by default.
+    #[serde(default, skip_serializing_if = "Forwarding::is_none")]
+    pub forward: Forwarding,
+}
+
+/// The peers to whose nameservers a DNS server forwards queries, as a list of selectors: `"*"`
+/// selects every peer, a peer's name selects that peer, and a peer's name after `!` excludes that
+/// peer, whatever else selects it. A peer is forwarded to if a selector selects it and none
+/// excludes it, so a list of exclusions alone forwards to no peer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Forwarding(pub Vec<ForwardSelector>);
+
+impl Forwarding {
+    /// Whether the server forwards to no peer, since no selector selects one.
+    pub fn is_none(&self) -> bool {
+        !self
+            .0
+            .iter()
+            .any(|selector| !matches!(selector, ForwardSelector::Except(_)))
+    }
+
+    /// Whether the server forwards queries to the nameserver of the peer named `name`.
+    pub fn selects(&self, name: &str) -> bool {
+        let mut selected = false;
+        for selector in &self.0 {
+            match selector {
+                ForwardSelector::All => selected = true,
+                ForwardSelector::Peer(peer) => selected |= **peer == *name,
+                ForwardSelector::Except(peer) if **peer == *name => return false,
+                ForwardSelector::Except(_) => {},
+            }
+        }
+        selected
+    }
+
+    /// The names of peers that the selectors name, each once.
+    pub fn named(&self) -> impl Iterator<Item = &Hostname> {
+        let mut named: Vec<&Hostname> = self
+            .0
+            .iter()
+            .filter_map(|selector| match selector {
+                ForwardSelector::All => None,
+                ForwardSelector::Peer(peer) | ForwardSelector::Except(peer) => Some(peer),
+            })
+            .collect();
+        named.sort();
+        named.dedup();
+        named.into_iter()
+    }
+}
+
+/// A selector of [`Forwarding`]: `"*"`, a peer's name, or a peer's name after `!`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ForwardSelector {
+    All,
+    Peer(Hostname),
+    Except(Hostname),
+}
+
+impl TryFrom<String> for ForwardSelector {
+    type Error = String;
+
+    fn try_from(selector: String) -> Result<Self, Self::Error> {
+        if selector == "*" {
+            return Ok(Self::All);
+        }
+        let (except, name) = match selector.strip_prefix('!') {
+            Some(name) => (true, name),
+            None => (false, selector.as_str()),
+        };
+        let name = name.parse::<Hostname>().map_err(|_| {
+            format!(
+                "the forward selector {selector:?} is neither \"*\" nor a peer's name, with or \
+                 without \"!\""
+            )
+        })?;
+        Ok(if except {
+            Self::Except(name)
+        } else {
+            Self::Peer(name)
+        })
+    }
+}
+
+impl From<ForwardSelector> for String {
+    fn from(selector: ForwardSelector) -> Self {
+        match selector {
+            ForwardSelector::All => "*".to_string(),
+            ForwardSelector::Peer(name) => name.to_string(),
+            ForwardSelector::Except(name) => format!("!{name}"),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -686,6 +784,92 @@ mod tests {
                 "{zone}"
             );
         }
+    }
+
+    #[test]
+    fn test_dns() {
+        let config: InterfaceConfig = toml::from_str(INVITATION).unwrap();
+        assert_eq!(config.dns, None);
+        assert!(!toml::to_string(&config).unwrap().contains("[dns]"));
+
+        // A table without `forward` forwards to no peer, and is written back without it.
+        let with = |table: &str| {
+            toml::from_str::<InterfaceConfig>(
+                &INVITATION.replace("[server]", &format!("[dns]\n{table}\n\n[server]")),
+            )
+        };
+        let config = with("listen = \"127.0.0.55:53\"").unwrap();
+        let dns = Some(DnsInfo {
+            listen: "127.0.0.55:53".parse().unwrap(),
+            forward: Forwarding::default(),
+        });
+        assert_eq!(config.dns, dns);
+        let written = toml::to_string(&config).unwrap();
+        assert!(!written.contains("forward"), "{written}");
+        let config: InterfaceConfig = toml::from_str(&written).unwrap();
+        assert_eq!(config.dns, dns);
+
+        // The selectors are read and written back as they are spelled.
+        let config = with("listen = \"127.0.0.55:53\"\nforward = [\"*\", \"!b\", \"c\"]").unwrap();
+        let forward = &config.dns.as_ref().unwrap().forward;
+        assert_eq!(
+            forward.0,
+            [
+                ForwardSelector::All,
+                ForwardSelector::Except("b".parse().unwrap()),
+                ForwardSelector::Peer("c".parse().unwrap()),
+            ]
+        );
+        let written = toml::to_string(&config).unwrap();
+        assert!(
+            written.contains(r#"forward = ["*", "!b", "c"]"#),
+            "{written}"
+        );
+
+        // A selector that is neither "*" nor a peer's name, with or without "!", is refused.
+        for selector in ["", "!", "!*", "B", "**", "!!b"] {
+            assert!(
+                with(&format!(
+                    "listen = \"127.0.0.55:53\"\nforward = [{selector:?}]"
+                ))
+                .is_err(),
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_forwarding() {
+        let forwarding = |selectors: &[&str]| {
+            Forwarding(
+                selectors
+                    .iter()
+                    .map(|selector| selector.to_string().try_into().unwrap())
+                    .collect(),
+            )
+        };
+        let selected = |forwarding: &Forwarding| {
+            ["a", "b", "c"]
+                .into_iter()
+                .filter(|name| forwarding.selects(name))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&forwarding(&[])), [] as [&str; 0]);
+        assert_eq!(selected(&forwarding(&["*"])), ["a", "b", "c"]);
+        assert_eq!(selected(&forwarding(&["a", "c"])), ["a", "c"]);
+        // An exclusion wins over every selector, wherever it stands.
+        assert_eq!(selected(&forwarding(&["*", "!b"])), ["a", "c"]);
+        assert_eq!(selected(&forwarding(&["!b", "*", "b"])), ["a", "c"]);
+        // Exclusions alone select no peer.
+        assert_eq!(selected(&forwarding(&["!b"])), [] as [&str; 0]);
+        assert!(forwarding(&["!b"]).is_none());
+        assert!(!forwarding(&["a"]).is_none());
+
+        let named = forwarding(&["*", "b", "!a", "!b"]);
+        assert_eq!(
+            named.named().map(|name| &**name).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 
     #[test]

@@ -1575,7 +1575,7 @@ impl From<Timestring> for Duration {
 /// The name of a peer. Its hostname is this name, followed by the host suffix.
 ///
 /// A parsed or deserialized name must match [`Hostname::is_valid`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Hostname(String);
 

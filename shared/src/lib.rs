@@ -147,23 +147,24 @@ impl IpNetExt for IpNet {
     }
 }
 
-/// The zone under which the peers of `interface` are named: `host_suffix`, which the operator
-/// chooses, or `<interface>.wg` by default.
-pub fn host_zone(interface: &InterfaceName, host_suffix: Option<&str>) -> String {
+/// The zone of the names of the peers of `interface`: the host suffix that the operator chooses,
+/// or `<interface>.wg`.
+pub fn peer_zone(interface: &InterfaceName, host_suffix: Option<&str>) -> String {
     match host_suffix {
         Some(suffix) => suffix.to_string(),
         None => format!("{interface}.wg"),
     }
 }
 
-/// The hostname of the peer `name`, the name followed by the zone of [`host_zone`], or `None` if
-/// the name isn't a valid hostname.
+/// The hostname of the peer `name`, its name in the zone of [`peer_zone`], or `None` if the peer
+/// has none: a peer name that isn't a valid hostname, such as one with a newline or a space, names
+/// no host.
 pub fn peer_hostname(
     interface: &InterfaceName,
     host_suffix: Option<&str>,
     name: &str,
 ) -> Option<String> {
-    Hostname::is_valid(name).then(|| format!("{name}.{}", host_zone(interface, host_suffix)))
+    Hostname::is_valid(name).then(|| format!("{name}.{}", peer_zone(interface, host_suffix)))
 }
 
 #[cfg(test)]

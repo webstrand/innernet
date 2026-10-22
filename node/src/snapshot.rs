@@ -1,12 +1,15 @@
 //! The output of the node: what it configures, as a snapshot of what its store holds.
 //!
 //! A [`Snapshot`] is the desired state that the output adapters realize: the peers of the tunnel
-//! with what each is routed and where it is reached, the node's own addresses, and the peers whose
-//! names the node publishes. The node makes it of what it accepted alone, and never reads what the
-//! operating system holds back as truth.
+//! with what each is routed and where it is reached, the node's own addresses, and the names and
+//! zones that the node publishes. The node makes it of what it accepted alone, and never reads
+//! what the operating system holds back as truth.
 
-use innernet_shared::{announcement::Announcement, PeerContents, Prefix};
-use std::net::IpAddr;
+use innernet_shared::{
+    announcement::{Announcement, Nameserver},
+    PeerContents, Prefix,
+};
+use std::{collections::BTreeMap, net::IpAddr};
 
 /// How a node configures what it accepted.
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,11 +37,17 @@ pub struct Own<'a> {
 pub struct Snapshot {
     /// The peers as they take effect, each with the prefixes that the tunnel routes to it, its
     /// endpoint, the first that it announces, and its candidates, the others in their order. The
-    /// tunnel holds the enabled peers that are routed a prefix, whose names the node publishes.
+    /// tunnel holds the enabled peers that are routed a prefix.
     pub peers: Vec<PeerContents>,
     /// The addresses of the node's own interface: the address of its config first, then those of
     /// its further addresses that lie within the delegation that it claims.
     pub own_addresses: Vec<IpAddr>,
+    /// The address of each name that the node publishes: the primary IP of each enabled peer that
+    /// claims a name, one that offers a nameserver included.
+    pub names: BTreeMap<String, IpAddr>,
+    /// The nameserver that each enabled peer that claims a name offers for its name and the names
+    /// under it, by that name.
+    pub zones: BTreeMap<String, Nameserver>,
 }
 
 /// `record`, the node's record of a peer, as it takes effect with `announcement`, the last
@@ -107,6 +116,14 @@ pub fn snapshot<'a>(
         } else {
             peer
         };
+        if let Some(name) = peer.name.as_ref().filter(|_| !peer.is_disabled) {
+            if let Some(ip) = peer.hosts_fallback() {
+                snapshot.names.insert(name.to_string(), ip);
+            }
+            if let Some(nameserver) = &peer.nameserver {
+                snapshot.zones.insert(name.to_string(), nameserver.clone());
+            }
+        }
         snapshot.peers.push(peer);
     }
     if let Some(own) = own {
@@ -166,23 +183,52 @@ mod tests {
         let plain = record("recorded", "10.0.0.2");
         let plain_announced = announcement(Some("plain"), "10.0.0.0/30", "10.0.0.2");
         let silent = record("silent", "10.0.0.3");
+        let dns = record("dns", "10.0.0.4");
+        let dns_announced = Announcement {
+            nameserver: Some(Nameserver {
+                address: "10.0.0.4:53".parse().unwrap(),
+                zone: "example.com".into(),
+            }),
+            ..announcement(Some("dns"), "10.0.0.4/32", "10.0.0.4")
+        };
+        let disabled = PeerContents {
+            is_disabled: true,
+            ..record("disabled", "10.0.0.5")
+        };
+        let disabled_announced = announcement(Some("disabled"), "10.0.0.5/32", "10.0.0.5");
         let own = Own {
             public_key: &plain.public_key,
             address: "10.0.0.2".parse().unwrap(),
             extra: &["10.0.0.3".parse().unwrap(), "10.0.0.9".parse().unwrap()],
         };
-        let peers = [(&plain, Some(&plain_announced)), (&silent, None)];
+        let peers = [
+            (&plain, Some(&plain_announced)),
+            (&silent, None),
+            (&dns, Some(&dns_announced)),
+            (&disabled, Some(&disabled_announced)),
+        ];
         let snapshot = super::snapshot(&SnapshotConfig::default(), peers, Some(own));
 
         // Each peer takes effect as it announced: one without an accepted announcement is routed
         // nothing, and has no name.
         assert_eq!(snapshot.peers[0].name, plain_announced.claims.name);
-        assert_eq!(
-            snapshot.peers[0].hosts_fallback(),
-            Some("10.0.0.2".parse().unwrap())
-        );
         assert!(!snapshot.peers[1].is_routed());
         assert_eq!(snapshot.peers[1].name, None);
+
+        // The names are those that the enabled peers claim, at their primary IPs, that of a peer
+        // that offers a nameserver included, and the zones are those of the enabled peers.
+        assert_eq!(
+            snapshot.names,
+            [
+                ("dns".to_string(), "10.0.0.4".parse().unwrap()),
+                ("plain".to_string(), "10.0.0.2".parse().unwrap()),
+            ]
+            .into()
+        );
+        assert_eq!(
+            snapshot.zones,
+            [("dns".to_string(), dns_announced.nameserver.clone().unwrap())].into()
+        );
 
         // The node holds its address, and those of its further addresses that it claims.
         assert_eq!(

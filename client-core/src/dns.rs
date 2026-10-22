@@ -159,7 +159,17 @@ mod tests {
         update!(&mut servers, &[interface]);
         assert!(listening(&servers).is_empty());
         DataStore::open_or_create(&data_dir, &interface, &config).unwrap();
-        start!(&mut servers);
+        let started = start!(&mut servers);
+        assert!(servers.running["e2e"].forwarding().unwrap().is_none());
+
+        // A new forward key takes effect without moving it. The table ends the config, so the key
+        // appended to it lies within the table.
+        let path = InterfaceConfig::build_config_file_path(&config_dir, &interface).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap() + "forward = [\"*\"]\n";
+        std::fs::write(&path, toml).unwrap();
+        update!(&mut servers, &[interface]);
+        assert_eq!(listening(&servers), [started]);
+        assert!(servers.running["e2e"].forwarding().unwrap().selects("b"));
 
         // A new listen address moves it, and removing the table or the interface stops it.
         write_config(Some("127.0.0.1:0"));
