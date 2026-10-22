@@ -8,7 +8,7 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Hostname, PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerDelegations,
+    Hostname, PeerContents, PeerEndpoints, PeerUpdate, Tag, TaggedPeer, TaggedPeerDelegations,
     TaggedPeerEndpoints,
 };
 use rusqlite::Connection;
@@ -86,22 +86,19 @@ async fn peer_form_body(req: Request<Body>) -> Result<PeerContents, ServerError>
 /// and the value, and of nothing else, so that a tag depends only on the state that it was
 /// computed for. Clients treat tags as opaque. The hash is SHA-512, which XEdDSA uses already,
 /// cut to 128 bits: a tag only tells states apart, and needs no more resistance to collisions.
-pub(super) fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
+pub(super) fn tag<T: Serialize>(kind: &str, value: &T) -> Result<Tag, ServerError> {
     let mut hasher = Sha512::new();
     hasher.update(kind.as_bytes());
     hasher.update([0]);
     hasher.update(serde_json::to_vec(value)?);
     let hash = hasher.finalize();
-    Ok(hash[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(Tag::new(hash[..16].to_vec()))
 }
 
 /// The tag of a peer: that of everything an admin reads of the peer, its public key included, but
 /// its endpoint and candidates, which the peer reports on its own, and its delegations, which an
 /// admin changes apart from the rest of the peer.
-fn peer_tag(peer: &PeerContents) -> Result<String, ServerError> {
+fn peer_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
     let peer = PeerContents {
         delegations: vec![],
         endpoint: None,
@@ -120,12 +117,12 @@ fn peer_endpoints(peer: &PeerContents) -> PeerEndpoints {
 }
 
 /// The tag of a peer's endpoints: that of its public key, endpoint and candidates.
-fn endpoints_tag(peer: &PeerContents) -> Result<String, ServerError> {
+fn endpoints_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
     tag("endpoints", &(&peer.public_key, peer_endpoints(peer)))
 }
 
 /// The tag of a peer's delegations: that of its public key and delegations.
-fn delegations_tag(peer: &PeerContents) -> Result<String, ServerError> {
+fn delegations_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
     tag("delegations", &(&peer.public_key, &peer.delegations))
 }
 
@@ -136,11 +133,11 @@ fn delegations_tag(peer: &PeerContents) -> Result<String, ServerError> {
 fn get_unchanged(
     conn: &Connection,
     key: &Key,
-    tag: &str,
-    tag_of: impl Fn(&PeerContents) -> Result<String, ServerError>,
+    tag: &Tag,
+    tag_of: impl Fn(&PeerContents) -> Result<Tag, ServerError>,
 ) -> Result<DatabasePeer, ServerError> {
     match DatabasePeer::get_from_public_key(conn, key) {
-        Ok(peer) if tag_of(&peer)? == tag => Ok(peer),
+        Ok(peer) if tag_of(&peer)? == *tag => Ok(peer),
         Ok(_) => Err(ServerError::PeerChanged),
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(ServerError::NotFound),
         Err(e) => Err(e.into()),
@@ -594,7 +591,9 @@ mod tests {
         // A tag is a hash of the peer's state, and that state includes the key.
         let peer = test::developer_peer_contents("peer", "10.80.64.9")?;
         let tag = peer_tag(&peer)?;
-        assert_eq!(tag.len(), 32);
+        // In CBOR, a tag is a byte string of 16 bytes.
+        let encoded = innernet_shared::cbor::to_vec(&tag)?;
+        assert_eq!((encoded[0], encoded.len()), (0x50, 17));
         assert_eq!(peer_tag(&peer.clone())?, tag);
         let other_key = PeerContents {
             public_key: KeyPair::generate().public.to_base64(),
@@ -800,8 +799,17 @@ mod tests {
                 serde_json::from_reader::<_, TaggedPeerDelegations>(body.reader()).unwrap()
             }
         };
-        let put = |path: &str, delegations: &[&str], tag: &str| {
-            let body = serde_json::json!({ "delegations": delegations, "tag": tag });
+        // The delegations are sent as text, so that a misaligned prefix can be sent.
+        #[derive(Serialize)]
+        struct Delegations {
+            delegations: Vec<String>,
+            tag: Tag,
+        }
+        let put = |path: &str, delegations: &[&str], tag: &Tag| {
+            let body = Delegations {
+                delegations: delegations.iter().map(|d| d.to_string()).collect(),
+                tag: tag.clone(),
+            };
             let path = path.to_string();
             let server = &server;
             async move {

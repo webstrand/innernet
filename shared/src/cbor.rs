@@ -7,8 +7,8 @@
 //! peer encodes again to the bytes that the peer sent, as a signature over the encoding requires.
 //!
 //! Types serialize as they do in JSON, but for those that tell the two apart with
-//! [`serde::Serializer::is_human_readable`], which is false in CBOR. Public keys and prefixes are
-//! text in CBOR, as in JSON.
+//! [`serde::Serializer::is_human_readable`], which is false in CBOR: tags travel as byte strings
+//! rather than as hex. Public keys and prefixes are text in CBOR, as in JSON.
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::{self, Display, Formatter};
@@ -49,6 +49,31 @@ pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
 pub fn is_content_type(header: &str) -> bool {
     let essence = header.split(';').next().unwrap_or_default().trim();
     essence.eq_ignore_ascii_case(CONTENT_TYPE)
+}
+
+/// Bytes that deserialize from a byte string only.
+pub(crate) struct ByteBuf(pub Vec<u8>);
+
+impl<'de> serde::Deserialize<'de> for ByteBuf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ByteBuf;
+
+            fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
+                formatter.write_str("a byte string")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<ByteBuf, E> {
+                Ok(ByteBuf(bytes.to_vec()))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<ByteBuf, E> {
+                Ok(ByteBuf(bytes))
+            }
+        }
+        deserializer.deserialize_byte_buf(Visitor)
+    }
 }
 
 #[cfg(test)]

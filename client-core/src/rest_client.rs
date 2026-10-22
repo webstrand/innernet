@@ -863,6 +863,7 @@ impl RestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innernet_shared::Tag;
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{SocketAddr, TcpListener},
@@ -1053,11 +1054,16 @@ mod tests {
         json_response("200 OK", &serde_json::to_string(&peers).unwrap())
     }
 
+    /// The tag whose bytes are those of `text`, as a test server makes up tags.
+    fn test_tag(text: &str) -> Tag {
+        Tag::new(text.as_bytes().to_vec())
+    }
+
     /// The server's answer to a read of `peer` with the tag `tag`.
     fn tagged_response(peer: &PeerContents, tag: &str) -> String {
         let tagged = TaggedPeer {
             peer: peer.clone(),
-            tag: tag.into(),
+            tag: test_tag(tag),
         };
         json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
     }
@@ -1108,7 +1114,7 @@ mod tests {
             "{put}"
         );
         let body: PeerUpdate = serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(body, PeerUpdate::new("ab".into(), &renamed));
+        assert_eq!(body, PeerUpdate::new(test_tag("ab"), &renamed));
     }
 
     #[tokio::test]
@@ -1281,7 +1287,7 @@ mod tests {
         let tagged = |delegations: &[Prefix]| {
             let body = TaggedPeerDelegations {
                 delegations: delegations.to_vec(),
-                tag: "ab".into(),
+                tag: test_tag("ab"),
             };
             json_response("200 OK", &serde_json::to_string(&body).unwrap())
         };
@@ -1316,7 +1322,7 @@ mod tests {
             body,
             TaggedPeerDelegations {
                 delegations: wider.clone(),
-                tag: "ab".into()
+                tag: test_tag("ab")
             }
         );
 
@@ -1362,7 +1368,7 @@ mod tests {
                     name: "people".into(),
                     cidr: users.cidr
                 },
-                tag: "ab".into()
+                tag: test_tag("ab")
             }
         );
         let error = client.delete_cidr(&users).await.unwrap_err();
@@ -1392,7 +1398,7 @@ mod tests {
     fn tagged_cidr_response(cidr: &Cidr, tag: &str) -> String {
         let tagged = TaggedCidr {
             cidr: cidr.clone(),
-            tag: tag.into(),
+            tag: test_tag(tag),
         };
         json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
     }
@@ -1419,7 +1425,12 @@ mod tests {
         );
         let body: CidrDeletion =
             serde_json::from_str(delete.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(body, CidrDeletion { tag: "ab".into() });
+        assert_eq!(
+            body,
+            CidrDeletion {
+                tag: test_tag("ab")
+            }
+        );
     }
 
     #[tokio::test]

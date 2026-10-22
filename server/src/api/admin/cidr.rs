@@ -6,7 +6,7 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::{Cidr, CidrDeletion, Prefix, TaggedCidr};
+use innernet_shared::{Cidr, CidrDeletion, Prefix, Tag, TaggedCidr};
 use rusqlite::Connection;
 
 /// Serves `/admin/cidrs`, in which a path names a CIDR by its prefix, as
@@ -43,7 +43,7 @@ pub async fn routes(
 }
 
 /// The tag of a CIDR: that of its name and prefix, computed as the tags of peers are.
-fn cidr_tag(cidr: &Cidr) -> Result<String, ServerError> {
+fn cidr_tag(cidr: &Cidr) -> Result<Tag, ServerError> {
     super::peer::tag("cidr", cidr)
 }
 
@@ -52,10 +52,10 @@ fn cidr_tag(cidr: &Cidr) -> Result<String, ServerError> {
 fn get_unchanged(
     conn: &Connection,
     prefix: &Prefix,
-    tag: &str,
+    tag: &Tag,
 ) -> Result<DatabaseCidr, ServerError> {
     let cidr = DatabaseCidr::get(conn, prefix)?;
-    if cidr_tag(&cidr.contents())? != tag {
+    if cidr_tag(&cidr.contents())? != *tag {
         return Err(ServerError::CidrChanged);
     }
     Ok(cidr)
@@ -175,8 +175,8 @@ mod tests {
     }
 
     /// Deletes the CIDR `cidr` as the admin, with the tag `tag`.
-    async fn delete_tagged(server: &test::Server, cidr: &str, tag: &str) -> Result<StatusCode> {
-        let deletion = CidrDeletion { tag: tag.into() };
+    async fn delete_tagged(server: &test::Server, cidr: &str, tag: &Tag) -> Result<StatusCode> {
+        let deletion = CidrDeletion { tag: tag.clone() };
         let res = server
             .form_request(test::ADMIN_PEER_IP, "DELETE", &path(cidr)?, &deletion)
             .await;
@@ -328,10 +328,10 @@ mod tests {
             get_tagged(&server, test::DEVELOPER_CIDR).await?.tag,
             seen.tag
         );
-        let rename = |name: &str, prefix: &str, tag: &str| -> Result<TaggedCidr, Error> {
+        let rename = |name: &str, prefix: &str, tag: &Tag| -> Result<TaggedCidr, Error> {
             Ok(TaggedCidr {
                 cidr: cidr(name, prefix)?,
-                tag: tag.into(),
+                tag: tag.clone(),
             })
         };
         let renamed = rename("devs", test::DEVELOPER_CIDR, &seen.tag)?;
@@ -399,6 +399,9 @@ mod tests {
         // A tag is a hash of the CIDR's name and prefix, and of nothing else.
         let developer = cidr("developer", test::DEVELOPER_CIDR)?;
         let tag = cidr_tag(&developer)?;
+        // In CBOR, a tag is a byte string of 16 bytes.
+        let encoded = innernet_shared::cbor::to_vec(&tag)?;
+        assert_eq!((encoded[0], encoded.len()), (0x50, 17));
         assert_eq!(cidr_tag(&developer.clone())?, tag);
         assert_ne!(cidr_tag(&cidr("devs", test::DEVELOPER_CIDR)?)?, tag);
         assert_ne!(cidr_tag(&cidr("developer", test::EXPERIMENTAL_CIDR)?)?, tag);

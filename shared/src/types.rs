@@ -5,7 +5,7 @@ use clap::{
     Args,
 };
 use ipnet::{IpNet, PrefixLenError};
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     fmt::{self, Display, Formatter},
     io,
@@ -286,20 +286,67 @@ impl Display for Cidr {
     }
 }
 
+/// The tag of a resource of the API of TLS sessions, such as a peer or a CIDR, as the server
+/// computed it from the state of the resource. A client reads a tag with the resource, and sends
+/// it back unchanged with a change to the resource; the server refuses the change if the tag is
+/// no longer that of the resource. Tags are opaque: a client never looks into one, and the server
+/// may make them of any length.
+///
+/// A tag is a byte string in CBOR, and its bytes in hex in human-readable formats, such as JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tag(Vec<u8>);
+
+impl Tag {
+    /// The tag of the bytes `bytes`, which the server computes.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl Serialize for Tag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            let hex: String = self.0.iter().map(|byte| format!("{byte:02x}")).collect();
+            serializer.serialize_str(&hex)
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let hex = String::deserialize(deserializer)?;
+            let invalid = || de::Error::custom(format!("invalid tag {hex:?}"));
+            if hex.len() % 2 != 0 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(invalid());
+            }
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid()))
+                .collect::<Result<_, _>>()
+                .map(Self)
+        } else {
+            crate::cbor::ByteBuf::deserialize(deserializer).map(|bytes| Self(bytes.0))
+        }
+    }
+}
+
 /// A CIDR and its tag: the body of `GET` and `PUT /admin/cidrs/{prefix}` in TLS sessions. A `PUT`
 /// renames the CIDR: it carries the CIDR with its new name and the tag of the CIDR as the admin
 /// read it, and the server refuses it if the CIDR has changed since.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedCidr {
     pub cidr: Cidr,
-    pub tag: String,
+    pub tag: Tag,
 }
 
 /// The body of `DELETE /admin/cidrs/{prefix}` in TLS sessions. `tag` is that of the CIDR as the
 /// admin read it, and the server refuses the deletion if the CIDR has changed since.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CidrDeletion {
-    pub tag: String,
+    pub tag: Tag,
 }
 
 /// A CIDR as clients that predate TLS know it, without its ID: with its parent by ID.
@@ -854,7 +901,7 @@ impl Display for PeerContents {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeer {
     pub peer: PeerContents,
-    pub tag: String,
+    pub tag: Tag,
 }
 
 /// The changes that an admin may make to a peer: the body of `PUT /admin/peers/{key}` in TLS
@@ -862,7 +909,7 @@ pub struct TaggedPeer {
 /// name, and must be present, so that an update that leaves it out can't remove the name.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerUpdate {
-    pub tag: String,
+    pub tag: Tag,
     #[serde(deserialize_with = "Option::deserialize")]
     pub name: Option<Hostname>,
     pub is_admin: bool,
@@ -872,7 +919,7 @@ pub struct PeerUpdate {
 impl PeerUpdate {
     /// The changes that set the peer with the tag `tag` to the name, admin role and disabled
     /// state of `contents`.
-    pub fn new(tag: String, contents: &PeerContents) -> Self {
+    pub fn new(tag: Tag, contents: &PeerContents) -> Self {
         Self {
             tag,
             name: contents.name.clone(),
@@ -898,7 +945,7 @@ pub struct PeerEndpoints {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeerEndpoints {
     pub endpoints: PeerEndpoints,
-    pub tag: String,
+    pub tag: Tag,
 }
 
 /// A peer's delegations and their tag: the body of `GET` and `PUT /admin/peers/{key}/delegations`
@@ -908,7 +955,7 @@ pub struct TaggedPeerEndpoints {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeerDelegations {
     pub delegations: Vec<Prefix>,
-    pub tag: String,
+    pub tag: Tag,
 }
 
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
@@ -1672,6 +1719,69 @@ mod tests {
         assert_eq!(deserialize(PUBKEY.trim_end_matches('=')).unwrap(), PUBKEY);
         assert!(deserialize("abc").is_err());
         assert!(deserialize("").is_err());
+    }
+
+    #[test]
+    fn test_peers_in_cbor() {
+        // A peer's public key and its delegations are text in CBOR, as in JSON, and nothing else.
+        let key = Key([7; 32]);
+        let peer = PeerContents {
+            name: Some("peer".parse().unwrap()),
+            delegations: vec!["10.0.0.1/32".parse().unwrap()],
+            public_key: key.to_base64(),
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            persistent_keepalive_interval: Some(25),
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        };
+        let encoded = crate::cbor::to_vec(&peer).unwrap();
+        let value = cbor_core::Value::decode(&encoded).unwrap();
+        assert_eq!(value["public_key"].as_str().unwrap(), key.to_base64());
+        assert_eq!(value["delegations"][0].as_str().unwrap(), "10.0.0.1/32");
+        assert_eq!(value["endpoint"].as_str().unwrap(), "198.51.100.1:51820");
+        assert_eq!(
+            crate::cbor::from_slice::<PeerContents>(&encoded).unwrap(),
+            peer
+        );
+
+        // A key as a byte string, and a prefix as an array, are refused.
+        let mut binary_key = value.clone();
+        binary_key["public_key"] = cbor_core::Value::from(key.0.to_vec());
+        assert!(crate::cbor::from_slice::<PeerContents>(&binary_key.encode()).is_err());
+        let mut binary_prefix = value.clone();
+        binary_prefix["delegations"] = cbor_core::Value::from(vec![cbor_core::Value::from(vec![
+            cbor_core::Value::from(32),
+            cbor_core::Value::from(vec![10u8, 0, 0, 1]),
+        ])]);
+        assert!(crate::cbor::from_slice::<PeerContents>(&binary_prefix.encode()).is_err());
+    }
+
+    #[test]
+    fn test_tags() {
+        // A tag is a byte string in CBOR, and hex in JSON, of any length.
+        let tag = Tag::new(vec![0xab, 0x01]);
+        let encoded = crate::cbor::to_vec(&tag).unwrap();
+        assert_eq!(encoded, [0x42, 0xab, 0x01]);
+        assert_eq!(crate::cbor::from_slice::<Tag>(&encoded).unwrap(), tag);
+        assert_eq!(
+            crate::cbor::from_slice::<Tag>(&[0x40]).unwrap(),
+            Tag::new(vec![])
+        );
+        assert_eq!(serde_json::to_value(&tag).unwrap(), "ab01");
+        assert_eq!(serde_json::from_value::<Tag>("ab01".into()).unwrap(), tag);
+
+        // A tag in the other form, or that isn't hex, is refused.
+        let text = crate::cbor::to_vec("ab01").unwrap();
+        assert!(crate::cbor::from_slice::<Tag>(&text).is_err());
+        for invalid in ["ab0", "+a", "xy", "é0"] {
+            assert!(
+                serde_json::from_value::<Tag>(invalid.into()).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
