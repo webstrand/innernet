@@ -1,6 +1,7 @@
 pub use innernet_shared::peer::NewPeerInfo;
 
 use crate::{
+    data_store::DataStore,
     rest_client::{AdminApi, RestClient, RestError},
     Cidr, Invitation, PeerContents,
 };
@@ -9,7 +10,7 @@ use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo, FEATURE_TLS},
     CidrTree,
 };
-use std::path::Path;
+use std::{net::SocketAddr, path::Path};
 use thiserror::Error;
 use wireguard_control::{InterfaceName, KeyPair};
 
@@ -22,48 +23,60 @@ pub enum CreatePeerError {
     RestRequest(#[from] RestError),
 }
 
-/// Create a new innernet peer and an [`Invitation`] they can use to join the network, as
-/// the admin client of `interface` in `config_dir` and `data_dir`, as [`invite`] does.
+/// Create a new innernet peer and an [`Invitation`] they can use to join the network, as the
+/// admin client of `interface` in `config_dir` and `data_dir`, as [`invite`] does.
 pub async fn create_peer(
     config_dir: &Path,
     data_dir: &Path,
     interface: &InterfaceName,
     existing_cidrs: &[Cidr],
-    existing_peers: &[PeerContents],
     new_peer_info: NewPeerInfo,
 ) -> Result<(PeerContents, Invitation), CreatePeerError> {
     let interface_config = InterfaceConfig::from_interface(config_dir, interface)
         .map_err(CreatePeerError::InterfaceConfigAccess)?;
     let rest_client = RestClient::for_interface(&interface_config, data_dir, interface)?;
+    let server = coordinator_info(&interface_config, data_dir, interface)?;
     invite(
         &rest_client,
         interface,
-        &interface_config.server,
+        &server,
         existing_cidrs,
-        existing_peers,
         new_peer_info,
     )
     .await
+}
+
+/// The coordinator of `config`'s network, as an invitation names it: at the endpoint that its
+/// peer states in the data store in `data_dir`, as the coordinator is a peer like any other.
+pub fn coordinator_info(
+    config: &InterfaceConfig,
+    data_dir: &Path,
+    interface: &InterfaceName,
+) -> Result<ServerInfo, CreatePeerError> {
+    let mut server_info = config.server.clone();
+    let (_, endpoint) = DataStore::open(data_dir, interface, config)
+        .and_then(|store| store.coordinator(config))
+        .map_err(RestError::DataStore)?;
+    if let Some(endpoint) = endpoint {
+        server_info.external_endpoint = endpoint;
+    }
+    Ok(server_info)
 }
 
 /// Creates a new innernet peer through `rest_client`, an admin client of the coordinator of
 /// `interface`, which `server` names, and an [`Invitation`] that the peer can use to join the
 /// network.
 ///
-/// The invitation offers the peer's delegations within the network, without a source address. A
-/// server that predates TLS offers a single address, and the invitation is of the format of
-/// v2.0.0, which names it, so that clients that predate TLS can redeem it.
-///
-/// The coordinator is the peer with the key of `server`, which authenticated the server. The
-/// invitation names it at the endpoint of its peer in `existing_peers`, if it has one, and at the
-/// external endpoint of `server` otherwise. It states that the server speaks TLS, and the QUIC
-/// port at which it answered, only if the server answered this client over TLS.
+/// The invitation offers the peer's delegations within the network, without a source address. It
+/// names the coordinator at the primary IP at which the client reached its API, and states that
+/// the coordinator speaks TLS, and the QUIC port at which it answered, only if it answered over
+/// TLS. A server that predates TLS offers a single address, and the invitation is of the format
+/// of v2.0.0, which names it, so that clients that predate TLS can redeem it.
 pub async fn invite(
     rest_client: &RestClient<'_>,
     interface: &InterfaceName,
     server: &ServerInfo,
     existing_cidrs: &[Cidr],
-    existing_peers: &[PeerContents],
     new_peer_info: NewPeerInfo,
 ) -> Result<(PeerContents, Invitation), CreatePeerError> {
     let keypair = KeyPair::generate();
@@ -76,13 +89,8 @@ pub async fn invite(
     } else {
         (vec![], None)
     };
-    if let Some(endpoint) = existing_peers
-        .iter()
-        .find(|p| p.public_key == server_info.public_key)
-        .and_then(|p| p.endpoint.clone())
-    {
-        server_info.external_endpoint = endpoint;
-    }
+    server_info.internal_endpoint =
+        SocketAddr::new(rest_client.address(), server_info.internal_endpoint.port());
 
     let network = CidrTree::new(existing_cidrs).cidr.net();
     let invitation = match rest_client.admin_api().await? {

@@ -34,13 +34,16 @@ type Recorder<'a, T> = Box<dyn Fn(T) -> Result<(), anyhow::Error> + 'a>;
 /// A REST client that can be used to communicate with an innernet REST server.
 ///
 /// Requests are made to the TLS API, in HTTP/3 over QUIC at the server's internal address,
-/// authenticated with the interface's WireGuard key. The client needs the QUIC port of the API,
-/// which the invitation states, or the data store records; without one, the client asks the
-/// server for it in plain HTTP. A server that states no port, as servers that predate TLS do, is
-/// sent the requests in plain HTTP instead, unless the server is known to speak TLS. The server
-/// becomes known to speak TLS when it first answers over QUIC, and from then on the client refuses
-/// plain HTTP for its requests, and asks for the port only. When the server doesn't answer at the
-/// port, the client asks it for the port once more, since the operator may have moved it.
+/// authenticated with the interface's WireGuard key. The internal address is the primary IP that
+/// the coordinator's peer states in the data store, as every peer's is; the interface config's
+/// internal endpoint is read only while the data store doesn't record the coordinator, at
+/// installation. The client needs the QUIC port of the API, which the invitation states, or the
+/// data store records; without one, the client asks the server for it in plain HTTP. A server
+/// that states no port, as servers that predate TLS do, is sent the requests in plain HTTP
+/// instead, unless the server is known to speak TLS. The server becomes known to speak TLS when
+/// it first answers over QUIC, and from then on the client refuses plain HTTP for its requests,
+/// and asks for the port only. When the server doesn't answer at the port, the client asks it
+/// for the port once more, since the operator may have moved it.
 ///
 /// We recommend to use the high level API (like [`Self::create_peer()`]) when possible and fall
 /// back on the low level [`Self::http()`] and [`Self::http_form()`] otherwise.
@@ -107,17 +110,29 @@ impl<'a> RestClient<'a> {
     /// Create a [`Self`] to communicate with the innernet server of `interface`, whose data store
     /// records whether the server is known to speak TLS, and the QUIC port of its TLS API, if the
     /// client has learned it from the server. The data store records that the server speaks TLS
-    /// when the server first answers over QUIC, and the port when the server states one.
+    /// when the server first answers over QUIC, and the port when the server states one. The
+    /// client reaches the server at the primary IP of the coordinator's peer in the data store,
+    /// or, while the data store doesn't record the coordinator, at the internal endpoint of the
+    /// interface config.
     pub fn for_interface(
         config: &'a InterfaceConfig,
         data_dir: &'a Path,
         interface: &'a InterfaceName,
     ) -> Result<Self, RestError> {
         let server_key = &config.server.public_key;
-        let (speaks_tls, quic_port) = DataStore::open(data_dir, interface, config)
-            .and_then(|store| Ok((store.speaks_tls(server_key)?, store.quic_port(server_key)?)))
+        let (speaks_tls, quic_port, address) = DataStore::open(data_dir, interface, config)
+            .and_then(|store| {
+                Ok((
+                    store.speaks_tls(server_key)?,
+                    store.quic_port(server_key)?,
+                    store.coordinator(config)?.0,
+                ))
+            })
             .map_err(RestError::DataStore)?;
-        let client = Self::new(config, speaks_tls)?.on_interface(interface);
+        let client = Self {
+            address,
+            ..Self::new(config, speaks_tls)?.on_interface(interface)
+        };
         client.quic_port.set(quic_port.or(config.server.quic_port));
         // A data store that the client first made without an invitation records the coordinator
         // only once the server reports it, after which `fetch` records what the client learned.

@@ -6,7 +6,7 @@ use crate::{
     rest_client::{RestClient, RestError},
     HostsOpts, NatOpts, NetworkOpts, WrappedIoError,
 };
-use anyhow::{bail, Context as _, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_node::{
     events::EventSource,
@@ -15,7 +15,7 @@ use innernet_node::{
     snapshot::{Own, Snapshot, SnapshotConfig},
 };
 use innernet_shared::{
-    announcement::SignedAnnouncement,
+    announcement::{Announcement, SignedAnnouncement},
     interface_config::{ResolvedInvitation, FEATURE_TLS},
     wg, Endpoint, IoErrorContext, PeerChange, PeerContents, Prefix, RedeemContents,
     ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
@@ -304,6 +304,7 @@ pub async fn round(
     hosts_opts.warn_of_hosts_file_options();
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let interface_up = interface_is_up(network_opts.backend, interface);
+    let store = DataStore::open_or_create(data_dir, interface, &config)?;
 
     if !interface_up {
         if !bring_up_interface {
@@ -317,21 +318,22 @@ pub async fn round(
             "bringing up interface {}.",
             interface.as_str_lossy().yellow()
         );
-        let resolved_endpoint = config
-            .server
-            .external_endpoint
-            .resolve()
-            .context(config.server.external_endpoint.to_string())?;
+        // The coordinator is a peer like any other: the interface reaches it where its peer in
+        // the data store states, and the config serves only before the data store records it.
+        let (address, endpoint) = store.coordinator(&config)?;
+        let endpoint = endpoint.ok_or_else(|| {
+            anyhow!(
+                "the coordinator {} states no endpoint to reach it at",
+                config.server.public_key
+            )
+        })?;
+        let resolved_endpoint = endpoint.resolve().context(endpoint.to_string())?;
         wg::up(
             interface,
             &config.interface.private_key,
             config.interface.address,
             config.interface.listen_port,
-            Some((
-                &config.server.public_key,
-                config.server.internal_endpoint.ip(),
-                resolved_endpoint,
-            )),
+            Some((&config.server.public_key, address, resolved_endpoint)),
             network_opts,
         )
         .context(interface.to_string())?;
@@ -341,7 +343,6 @@ pub async fn round(
         "fetching state for {} from server...",
         interface.as_str_lossy().yellow()
     );
-    let store = DataStore::open_or_create(data_dir, interface, &config)?;
     let peers = store.peers()?;
     config.refuse_ip_keyed_endpoint_overrides(&peers)?;
     for peer in &peers {
@@ -499,6 +500,13 @@ impl Link for RemoteLink<'_> {
 
     fn observed_endpoint(&self) -> Option<Endpoint> {
         self.state.as_ref()?.observed_endpoint.clone()
+    }
+
+    /// The server relays this client's own announcement back in the state.
+    fn current_announcement(&self) -> Option<Announcement> {
+        let own = self.assignment().ok()??;
+        let key = wireguard_control::Key::from_base64(&own.public_key).ok()?;
+        own.announcement.as_ref()?.open(&key).ok()
     }
 
     async fn announce(

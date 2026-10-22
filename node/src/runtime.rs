@@ -20,10 +20,10 @@ use crate::{
 };
 use anyhow::{Context as _, Error};
 use innernet_shared::{
-    announcement::{self, SignedAnnouncement},
+    announcement::{self, Announcement, SignedAnnouncement},
     get_local_addrs,
     interface_config::InterfaceInfo,
-    xeddsa, Endpoint, NatOpts, PeerContents, Prefix,
+    Endpoint, NatOpts, PeerContents, Prefix,
 };
 use std::{future::pending, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::Notify, time::Instant};
@@ -70,6 +70,9 @@ pub trait Link {
 
     /// The endpoint at which the coordinator observes the node, if any.
     fn observed_endpoint(&self) -> Option<Endpoint>;
+
+    /// The node's own last announcement, as the coordinator holds it.
+    fn current_announcement(&self) -> Option<Announcement>;
 
     /// Hands `signed`, the node's own announcement, to the coordinator, which checks the claims
     /// of `claim_types`, and records it in the node's store once the coordinator accepted it.
@@ -145,8 +148,8 @@ impl Node {
 
     /// Announces the node through `link`, as [`own::own_announcement`] makes the announcement of
     /// what the coordinator assigns it, with the endpoints at the other addresses of the host as
-    /// its candidates. No announcement is made to a coordinator that accepts none, or whose claim
-    /// types the node can't tell.
+    /// its candidates. An announcement that would change nothing but its timestamp isn't made,
+    /// nor one to a coordinator that accepts none, or whose claim types the node can't tell.
     pub async fn announce(&self, link: &mut impl Link) -> Result<(), Error> {
         let Some(claim_types) = link.claim_types().filter(|types| !types.is_empty()) else {
             return Ok(());
@@ -165,8 +168,11 @@ impl Node {
             last,
             announcement::timestamp_now(),
         );
-        let private_key = xeddsa::PrivateKey::from_base64(&self.info.private_key)?;
-        let signed = announcement.sign(&private_key)?;
+        if own::is_unchanged(&announcement, link.current_announcement().as_ref()) {
+            log::debug!("this node's announcement is unchanged, so it isn't made again.");
+            return Ok(());
+        }
+        let signed = own::sign(&announcement, &self.info.private_key, last)?;
         log::info!(
             "announcing {} and {} endpoint{}.",
             if announcement.claims.delegation.is_empty() {

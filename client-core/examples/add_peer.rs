@@ -25,7 +25,6 @@ async fn main() -> Result<(), Error> {
     let interface_config = InterfaceConfig::from_interface(config_dir, &interface)?;
     let rest_client = RestClient::for_interface(&interface_config, data_dir, &interface)?;
     let cidrs = rest_client.get_cidrs().await?;
-    let peers = rest_client.get_peers().await?;
 
     let new_peer_info = NewPeerInfo {
         name: "joe".parse().unwrap(),
@@ -35,15 +34,8 @@ async fn main() -> Result<(), Error> {
     };
 
     let target_path = "invitation.toml";
-    let (peer, invitation) = create_peer(
-        config_dir,
-        data_dir,
-        &interface,
-        &cidrs,
-        &peers,
-        new_peer_info,
-    )
-    .await?;
+    let (peer, invitation) =
+        create_peer(config_dir, data_dir, &interface, &cidrs, new_peer_info).await?;
     invitation.save_new(target_path)?;
     prompts::print_invitation_info(&peer, target_path);
 

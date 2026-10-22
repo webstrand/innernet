@@ -1,14 +1,53 @@
-//! The node's own announcement, as the config of its interface selects it.
+//! The node's own announcement, which every node signs alike, whatever its role.
 
 use innernet_shared::{
-    announcement::{self, Announcement, Claims},
+    announcement::{self, Announcement, AnnouncementError, Claims, SignedAnnouncement},
     interface_config::InterfaceInfo,
-    Endpoint, PeerContents, Prefix,
+    xeddsa, Endpoint, Error, PeerContents, Prefix,
 };
 use std::{
     collections::BTreeSet,
     sync::{Mutex, PoisonError},
 };
+
+/// The timestamp of the node's next announcement, at the time `now`: `now`, or, if the clock went
+/// back, one past `last`, the timestamp of the node's last announcement, so that every node takes
+/// the next announcement for newer.
+pub fn next_timestamp(last: Option<u64>, now: u64) -> u64 {
+    last.map_or(now, |last| now.max(last.saturating_add(1)))
+}
+
+/// Whether `next`, the node's next announcement, would change nothing but the timestamp of
+/// `current`, the last signed announcement of the node that the coordinator holds, if any. Such an
+/// announcement isn't made: every node already holds what it claims and states.
+pub fn is_unchanged(next: &Announcement, current: Option<&Announcement>) -> bool {
+    current.is_some_and(|current| {
+        *current
+            == Announcement {
+                timestamp: current.timestamp,
+                ..next.clone()
+            }
+    })
+}
+
+/// Signs `announcement`, the node's own, with its private key `private_key` in base64. Its
+/// timestamp must be newer than `last`, that of the node's last announcement, as
+/// [`next_timestamp`] makes it, or every node would refuse it as stale.
+pub fn sign(
+    announcement: &Announcement,
+    private_key: &str,
+    last: Option<u64>,
+) -> Result<SignedAnnouncement, Error> {
+    if let Some(last) = last.filter(|last| announcement.timestamp <= *last) {
+        return Err(AnnouncementError::Stale {
+            timestamp: announcement.timestamp,
+            last,
+        }
+        .into());
+    }
+    let private_key = xeddsa::PrivateKey::from_base64(private_key)?;
+    Ok(announcement.sign(&private_key)?)
+}
 
 /// What the node announces, as the config of its interface, `interface`, selects it from `own`,
 /// its record as the coordinator assigns it, with the ranges that the server assigns it as its
@@ -122,7 +161,7 @@ pub fn own_announcement(
     };
     claims.retain_types(claim_types);
     Announcement {
-        timestamp: last.map_or(now, |last| now.max(last.saturating_add(1))),
+        timestamp: next_timestamp(last, now),
         claims,
         allowed_ips,
         primary_ip: Some(primary_ip),
@@ -145,6 +184,48 @@ pub fn warn_once(message: String) {
 mod tests {
     use super::*;
     use wireguard_control::KeyPair;
+
+    #[test]
+    fn test_next_timestamp() {
+        assert_eq!(next_timestamp(None, 7), 7);
+        assert_eq!(next_timestamp(Some(5), 7), 7);
+        // A clock that went back still yields an announcement newer than the last.
+        assert_eq!(next_timestamp(Some(9), 7), 10);
+        assert_eq!(next_timestamp(Some(u64::MAX), 7), u64::MAX);
+    }
+
+    #[test]
+    fn test_is_unchanged() {
+        let current = Announcement {
+            timestamp: 5,
+            ..Default::default()
+        };
+        let next = Announcement {
+            timestamp: 7,
+            ..Default::default()
+        };
+        assert!(is_unchanged(&next, Some(&current)));
+        // Nothing to compare with: the coordinator holds no signed announcement of the node.
+        assert!(!is_unchanged(&next, None));
+        let moved = Announcement {
+            primary_ip: Some("10.0.0.2".parse().unwrap()),
+            ..next
+        };
+        assert!(!is_unchanged(&moved, Some(&current)));
+    }
+
+    #[test]
+    fn test_sign() {
+        let keypair = KeyPair::generate();
+        let private_key = keypair.private.to_base64();
+        let announcement = Announcement {
+            timestamp: 7,
+            ..Default::default()
+        };
+        let signed = sign(&announcement, &private_key, Some(6)).unwrap();
+        assert_eq!(signed.open(&keypair.public).unwrap(), announcement);
+        assert!(sign(&announcement, &private_key, Some(7)).is_err());
+    }
 
     fn config(interface: serde_json::Value) -> InterfaceInfo {
         let keypair = KeyPair::generate();

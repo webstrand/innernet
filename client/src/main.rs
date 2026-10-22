@@ -8,6 +8,7 @@ use innernet_client_core::{
     admin,
     data_store::DataStore,
     interface::{fetch, redeem_invite, round, NodeState},
+    peer::coordinator_info,
     rest_client::{RestClient, RestError},
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
@@ -1240,7 +1241,8 @@ async fn run(opts: &Opts) -> Result<(), Error> {
             sub_opts,
         } => {
             admin_client!(interface, config, rest_client);
-            admin::add_peer(&rest_client, &interface, &config.server, sub_opts).await?
+            let server = coordinator_info(&config, &opts.data_dir, &interface)?;
+            admin::add_peer(&rest_client, &interface, &server, sub_opts).await?
         },
         Command::RenamePeer {
             interface,

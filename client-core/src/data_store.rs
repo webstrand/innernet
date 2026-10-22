@@ -10,7 +10,7 @@ use innernet_shared::{
     announcement::{self, Announcement, SignedAnnouncement},
     ensure_dirs_exist,
     interface_config::InterfaceConfig,
-    Cidr, IoErrorContext, LegacyCidr, LegacyPeer, PeerContents, Prefix, State,
+    Cidr, Endpoint, IoErrorContext, LegacyCidr, LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
 use rusqlite::{params, Connection, OptionalExtension as _};
@@ -392,7 +392,8 @@ impl DataStore {
     }
 
     /// The peer with `public_key` as it takes effect, as [`Self::effective_peers`] makes it, or
-    /// `None` if the data store doesn't record it.
+    /// `None` if the data store doesn't record it. The client reaches the coordinator's API at the
+    /// primary IP that the coordinator's peer states, and its tunnel at its endpoint.
     pub fn effective_peer(&self, public_key: &str) -> Result<Option<PeerContents>, Error> {
         let Some(peer) = node_store::load_peer(&self.store, &key_to_bytes(public_key)?)? else {
             return Ok(None);
@@ -415,6 +416,31 @@ impl DataStore {
         own: Option<Own>,
     ) -> Result<Snapshot, Error> {
         Ok(snapshot::of_store(&self.store, config, own)?)
+    }
+
+    /// The coordinator of `config`'s network as the client reaches it: the primary IP that its
+    /// peer states, at which its API runs, and the endpoint that its peer states, if any. The
+    /// coordinator is a peer like any other, so the interface config's internal and external
+    /// endpoints serve only while the data store doesn't record the coordinator, at installation;
+    /// once it does, they are never read.
+    pub fn coordinator(
+        &self,
+        config: &InterfaceConfig,
+    ) -> Result<(IpAddr, Option<Endpoint>), Error> {
+        // Public keys are compared in their canonical encoding, as a state's are deserialized.
+        let server_key = Key::from_base64(&config.server.public_key)?.to_base64();
+        match self.effective_peer(&server_key)? {
+            Some(coordinator) => {
+                let address = coordinator.primary_ip.ok_or_else(|| {
+                    anyhow!("the coordinator {server_key} states no primary IP to reach it at")
+                })?;
+                Ok((address, coordinator.endpoint))
+            },
+            None => Ok((
+                config.server.internal_endpoint.ip(),
+                Some(config.server.external_endpoint.clone()),
+            )),
+        }
     }
 
     /// The prefixes pinned to the keys of the peers, each with its peer.
@@ -2135,6 +2161,52 @@ mod tests {
         );
         let reopened = open(dir.path(), false).unwrap();
         assert_eq!(claimed(&reopened, &mover).0, prefixes(&["10.0.3.0/24"]));
+    }
+
+    #[test]
+    fn test_coordinator_moves_as_any_peer() {
+        // The coordinator is checked as every other peer is: a signed announcement that moves its
+        // primary IP and its endpoint takes effect, and the client reaches it there.
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator = wireguard_control::KeyPair::generate();
+        let mut store = open(dir.path(), true).unwrap();
+        let sign = signer(&coordinator);
+        let announcement = |timestamp, delegation: &[&str], endpoint: &str| Announcement {
+            timestamp,
+            claims: Claims {
+                delegation: prefixes(delegation),
+                name: Some("innernet-server".parse().unwrap()),
+            },
+            allowed_ips: prefixes(delegation),
+            primary_ip: Some(prefixes(delegation)[0].first()),
+            endpoints: vec![endpoint.parse().unwrap()],
+        };
+        let state = |announcement: &Announcement| {
+            vec![PeerContents {
+                name: Some("innernet-server".parse().unwrap()),
+                delegations: vec![],
+                public_key: coordinator.public.to_base64(),
+                announcement: Some(sign(announcement)),
+                ..BASE_PEERS[0].clone()
+            }]
+        };
+        let now = announcement::timestamp_now();
+
+        let first = announcement(now, &["10.0.0.1/32"], "203.0.113.1:51820");
+        assert!(store.relay_peers(&state(&first)).is_empty());
+        let moved = announcement(now + 1, &["10.0.0.9/32"], "198.51.100.7:51820");
+        assert!(store.relay_peers(&state(&moved)).is_empty());
+
+        let effective = store
+            .effective_peer(&coordinator.public.to_base64())
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.primary_ip, Some("10.0.0.9".parse().unwrap()));
+        assert_eq!(effective.delegations, prefixes(&["10.0.0.9/32"]));
+        assert_eq!(
+            effective.endpoint,
+            Some("198.51.100.7:51820".parse().unwrap())
+        );
     }
 
     #[test]

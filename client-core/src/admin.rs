@@ -101,15 +101,8 @@ pub async fn add_peer(
         prompts::gather_new_peer_info(&peers, &cidr_tree, &sub_opts)?
     {
         log::info!("Creating peer...");
-        let (peer, invitation) = invite(
-            rest_client,
-            interface,
-            server,
-            &cidrs,
-            &peers,
-            new_peer_info,
-        )
-        .await?;
+        let (peer, invitation) =
+            invite(rest_client, interface, server, &cidrs, new_peer_info).await?;
 
         invitation.save_new(&target_path)?;
         prompts::print_invitation_info(&peer, &target_path);

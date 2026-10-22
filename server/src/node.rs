@@ -6,12 +6,13 @@ use crate::{
 };
 use anyhow::Error;
 use innernet_node::{
+    accept,
     runtime::Link,
     snapshot::{self, Own, Snapshot, SnapshotConfig},
     store,
 };
 use innernet_shared::{
-    announcement::{self, SignedAnnouncement},
+    announcement::{self, Announcement, SignedAnnouncement},
     Endpoint, PeerContents,
 };
 use wireguard_control::Key;
@@ -54,15 +55,23 @@ impl Link for LocalLink {
         Ok(Some(self.coordinator()?.inner))
     }
 
-    /// None, so that the node makes no announcement: the coordinator relays its own peer as the
-    /// unsigned announcement that it makes of what it records, as of any peer that has never
-    /// announced.
     fn claim_types(&self) -> Option<Vec<String>> {
-        Some(vec![])
+        Some(accept::all_claim_types())
     }
 
+    /// Nothing observes the server's node, so its observed endpoint is the endpoint recorded at
+    /// initialization until the node first announces, and the preferred endpoint that it last
+    /// announced after.
     fn observed_endpoint(&self) -> Option<Endpoint> {
-        None
+        let me = self.coordinator().ok()?;
+        match me.signed_announcement() {
+            Some(announced) => announced.endpoints.first().cloned(),
+            None => me.endpoint.clone(),
+        }
+    }
+
+    fn current_announcement(&self) -> Option<Announcement> {
+        self.coordinator().ok()?.signed_announcement().cloned()
     }
 
     async fn announce(&mut self, signed: &SignedAnnouncement, _: &[String]) -> Result<(), Error> {
