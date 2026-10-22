@@ -2,7 +2,7 @@ use crate::{
     db::{self, DatabaseCidr, DatabasePeer},
     ConfigFile, Interface, Path, ServerConfig,
 };
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, bail, Error};
 use clap::Parser;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Input};
@@ -14,7 +14,8 @@ use innernet_shared::{
 };
 use ipnet::IpNet;
 use std::{
-    net::{IpAddr, SocketAddr},
+    io::IsTerminal,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::fs::OpenOptionsExt,
 };
 use wireguard_control::KeyPair;
@@ -56,6 +57,11 @@ pub struct InitializeOpts {
     /// Port to listen on (for the WireGuard interface)
     #[clap(long)]
     pub listen_port: Option<u16>,
+
+    /// UDP port of the TLS API, over QUIC at the server's internal address (default: a free port,
+    /// which an interactive run offers to change)
+    #[clap(long)]
+    pub quic_port: Option<u16>,
 }
 
 struct DbInitData {
@@ -162,6 +168,35 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
 
     log::info!("listen port: {}", listen_port);
 
+    // The kernel's WireGuard holds the listen port on every address, so the TLS API, which runs
+    // over QUIC at the server's internal address, needs a UDP port of its own. A free port is
+    // suggested, and taken as it is when no operator is at a terminal to change it, so that
+    // scripts that predate the QUIC port keep working.
+    let quic_port: u16 = match opts.quic_port {
+        Some(quic_port) => quic_port,
+        None => {
+            let unspecified = match root_cidr {
+                IpNet::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpNet::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            };
+            let suggested = crate::free_udp_port(unspecified, listen_port)?;
+            if std::io::stdin().is_terminal() {
+                Input::with_theme(&theme)
+                    .with_prompt("QUIC port (UDP, for the TLS API)")
+                    .default(suggested)
+                    .interact()
+                    .map_err(|_| anyhow!("failed to get QUIC port."))?
+            } else {
+                suggested
+            }
+        },
+    };
+    if quic_port == listen_port {
+        bail!("the QUIC port must differ from the listen port, which WireGuard holds.");
+    }
+
+    log::info!("QUIC port: {}", quic_port);
+
     let endpoint: Endpoint = if let Some(endpoint) = opts.external_endpoint {
         endpoint
     } else if opts.auto_external_endpoint {
@@ -185,6 +220,7 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
         listen_port,
         address: our_ip,
         network_cidr_prefix: root_cidr.prefix_len(),
+        quic_port: Some(quic_port),
         dns: None,
     };
     config.write_to_path(config_path)?;

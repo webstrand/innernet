@@ -438,6 +438,26 @@ pass "c associates two CIDRs by ID in plain HTTP"
 step "the server is upgraded"
 cidr_names=$(osrv_db "SELECT name FROM cidrs ORDER BY name")
 stop_osrv
+# Nothing writes the config: the upgraded server refuses the config of innernet-server 2.0.0,
+# which states no QUIC port, and suggests a free one. The operator adds a UDP port that it finds
+# free itself. innernet-server 2.0.0 ignores the key.
+if ns osrv "$E2E_BIN/innernet-server" -c "$work/osrv/conf" -d "$work/osrv/data" serve e2o \
+    --no-write-hosts >"$work/osrv.refusal.log" 2>&1; then
+    fail "the upgraded server started without a QUIC port"
+fi
+grep -q "states no quic-port" "$work/osrv.refusal.log" ||
+    fail "the upgraded server doesn't explain its refusal: $(cat "$work/osrv.refusal.log")"
+chosen_port=$(ns osrv python3 -I -c '
+import socket
+while True:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        udp.bind(("", 0))
+        port = udp.getsockname()[1]
+    if port != 51820:
+        print(port)
+        break')
+echo "quic-port = $chosen_port" >>"$work/osrv/conf/e2o.conf"
+pass "the upgraded server refuses a config without a QUIC port, and the operator adds one"
 serve_osrv "$E2E_BIN"
 [ "$(osrv_db "SELECT name FROM cidrs ORDER BY name")" = "$cidr_names" ] ||
     fail "the upgraded server didn't keep every CIDR"

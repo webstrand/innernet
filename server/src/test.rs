@@ -148,6 +148,7 @@ impl Server {
             network_cidr: Some(ROOT_CIDR.parse()?),
             external_endpoint: Some("155.155.155.155:54321".parse().unwrap()),
             listen_port: Some(54321),
+            quic_port: Some(54322),
             auto_external_endpoint: false,
         };
         init_wizard(&conf, opts).map_err(|_| anyhow!("init_wizard failed"))?;

@@ -24,7 +24,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::prelude::*,
-    net::{IpAddr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -64,6 +64,12 @@ pub struct ConfigFile {
 
     /// The CIDR prefix of the WireGuard network
     pub network_cidr_prefix: u8,
+
+    /// The UDP port of the TLS API, which runs over QUIC at the server's internal address. The
+    /// kernel's WireGuard holds `listen_port` on every address, so the API needs a port of its
+    /// own. The server refuses to start without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
 
     /// The DNS server that the server runs, as every node runs it, at the address of the
     /// table, or `None` if the server runs none.
@@ -272,7 +278,9 @@ pub async fn serve(
     hosts_opts: HostsOpts,
 ) -> Result<(), Error> {
     hosts_opts.warn_of_hosts_file_options();
-    let config = ConfigFile::from_file(conf.config_path(&interface))?;
+    let config_path = conf.config_path(&interface);
+    let config = ConfigFile::from_file(&config_path)?;
+    let quic_port = quic_port(&config, &config_path)?;
     log::debug!("opening database connection...");
     let store = open_database_connection(&interface, conf)?;
     let public_key = check_database_matches_config(&store, &config)?;
@@ -325,6 +333,7 @@ pub async fn serve(
         Ok(round)
     });
 
+    log::info!("the TLS API's QUIC port is {quic_port}.");
     log::info!("innernet-server {} starting.", VERSION);
     let coordinator = Coordinator::spawn(
         CoordinatorConfig {
@@ -364,6 +373,37 @@ fn follow_endpoints(mut events: TunnelEvents) -> Endpoints {
         }
     });
     endpoints
+}
+
+/// The QUIC port of `config`, the config at `path`. Nothing writes the config, so a config that
+/// states none, such as one of v2.0.0, is refused with a free UDP port for the operator to add.
+fn quic_port(config: &ConfigFile, path: &Path) -> Result<u16, Error> {
+    if let Some(port) = config.quic_port {
+        return Ok(port);
+    }
+    let unspecified = match config.address {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    bail!(
+        "{} states no quic-port; nothing writes the config, so the operator must add one, such \
+         as this free UDP port:\n\nquic-port = {}\n",
+        path.display(),
+        free_udp_port(unspecified, config.listen_port)?
+    )
+}
+
+/// A UDP port that is free at `address`, other than `listen_port`, the port of WireGuard, which
+/// the kernel holds on every address.
+pub(crate) fn free_udp_port(address: IpAddr, listen_port: u16) -> Result<u16, Error> {
+    loop {
+        let port = std::net::UdpSocket::bind((address, 0))?
+            .local_addr()?
+            .port();
+        if port != listen_port {
+            return Ok(port);
+        }
+    }
 }
 
 /// Checks, before the server starts anything, that the database holds the server's own peer, the
@@ -447,9 +487,10 @@ mod tests {
         let server = test::Server::new()?;
 
         assert!(Path::new(&server.wg_conf_path()).exists());
+        let config = ConfigFile::from_file(server.wg_conf_path())?;
+        assert_eq!(config.quic_port, Some(54322));
 
         // The server's own peer has the key of the config.
-        let config = ConfigFile::from_file(server.wg_conf_path())?;
         let key = Key::from_base64(&config.private_key)?.get_public();
         let own = DatabasePeer::own(&server.db().lock(), &key)?;
         assert_eq!(own.name.as_deref(), Some("innernet-server"));
@@ -465,6 +506,26 @@ mod tests {
         };
         assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_without_quic_port_is_refused() -> Result<(), Error> {
+        // A config without the QUIC port gets a free one suggested, and nothing writes it.
+        let server = test::Server::new()?;
+        let path = server.wg_conf_path();
+        let mut config = ConfigFile::from_file(&path)?;
+        assert_eq!(quic_port(&config, &path)?, 54322);
+        config.quic_port = None;
+        let error = quic_port(&config, &path).unwrap_err().to_string();
+        assert!(error.contains("states no quic-port"), "{error}");
+        let suggested: u16 = error
+            .rsplit("quic-port = ")
+            .next()
+            .and_then(|port| port.trim().parse().ok())
+            .expect("a suggested port");
+        assert_ne!(suggested, config.listen_port);
+        assert_eq!(ConfigFile::from_file(&path)?.quic_port, Some(54322));
         Ok(())
     }
 
