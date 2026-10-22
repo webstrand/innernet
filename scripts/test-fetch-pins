@@ -79,7 +79,7 @@ mkdir -p "$work/coordination-server" "$work/alice" "$work/bob"
 coordination_server new --network-name e2e --network-cidr 10.66.0.0/16 \
     --external-endpoint 1.1.1.1:51820 --listen-port 51820 >/dev/null
 # The admin commands of innernet-server go through the running server's coordinator.
-coordination_server serve e2e --no-write-hosts >"$work/coordination-server.log" 2>&1 &
+coordination_server serve e2e >"$work/coordination-server.log" 2>&1 &
 await_coordinator coordination-server "$work/coordination-server/conf/e2e.conf"
 coordination_server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
 for peer in alice bob; do
@@ -88,10 +88,10 @@ for peer in alice bob; do
 done
 for peer in alice bob; do
     client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 \
-        --delete-invite --no-write-hosts >/dev/null 2>&1
+        --delete-invite >/dev/null 2>&1
 done
 for peer in alice bob; do
-    client "$peer" fetch e2e --no-write-hosts >/dev/null 2>&1
+    client "$peer" fetch e2e >/dev/null 2>&1
 done
 
 # Prints a field of a client's config.
@@ -153,7 +153,7 @@ db "UPDATE peers SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex'
     INSERT INTO endpoints (public_key, kind, position, address, port)
     VALUES (x'$mallory_hex', 0, 0, x'06060606', 51820);"
 fetch_status=0
-client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
+client alice fetch e2e 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
 echo "    (fetch exited with status $fetch_status)"
 
 cat <<EOF
@@ -170,7 +170,7 @@ db "DELETE FROM delegations WHERE public_key = x'$mallory_hex';
     INSERT INTO delegations (address, prefix_len, last, public_key)
     VALUES (x'$first', 31, x'$last', x'$mallory_hex');"
 fetch_status=0
-client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
+client alice fetch e2e 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
 echo "    (fetch exited with status $fetch_status)"
 # Sends traffic to bob's IP, which goes to whichever key alice's interface routes it to.
 ns alice ping -c2 -W2 "$bob_ip" >/dev/null 2>&1 || true
