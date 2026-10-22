@@ -247,6 +247,7 @@ impl Server {
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
             internal_address: self.internal_address,
+            quic_port: 54322,
             changed: Default::default(),
             invitations: Default::default(),
         }

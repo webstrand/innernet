@@ -1410,6 +1410,11 @@ impl From<LegacyState> for State {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
+
+    /// The UDP port of the TLS API, which runs over QUIC at the server's internal address. A
+    /// server that predates TLS states none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

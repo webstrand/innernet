@@ -27,6 +27,8 @@ use wireguard_control::Key;
 pub struct CoordinatorConfig {
     /// The address at which the coordinator serves its API: the primary IP of its node.
     pub address: IpAddr,
+    /// The UDP port of the TLS API, at `address`.
+    pub quic_port: u16,
 }
 
 /// The sockets at which the coordinator serves its API, which the host binds.
@@ -64,6 +66,7 @@ impl Coordinator {
             endpoints: hooks.endpoints,
             public_key,
             internal_address: config.address,
+            quic_port: config.quic_port,
             changed: hooks.changed.clone(),
             invitations: Arc::default(),
         };
@@ -136,6 +139,8 @@ pub struct Context {
     pub public_key: Key,
     /// The address that the server serves its API on, within the delegations of its own peer.
     pub internal_address: IpAddr,
+    /// The UDP port of the TLS API, at `internal_address`.
+    pub quic_port: u16,
     /// Tells the coordinator's node that the coordinator changed what the node holds.
     pub changed: StoreChanged,
     /// Tells the sweeper of invitations that one was created or redeemed, so that it sleeps until
@@ -275,6 +280,11 @@ async fn routes(
     if client_key.is_none() && components.pop_front().as_deref() != Some("v1") {
         return Err(ServerError::NotFound);
     }
+    // The capabilities are only information, which a peer that has connected over TLS asks for in
+    // plain HTTP to learn the QUIC port of the TLS API. WireGuard authenticates the server's
+    // internal address, so the answer can be trusted.
+    let capabilities =
+        req.method() == hyper::Method::GET && components.iter().eq(["user", "capabilities"].iter());
     let component = components.pop_front();
     // The admin API exists only over TLS: in plain HTTP its paths are not found, before the peer
     // is identified. An admin that predates TLS is an ordinary peer in plain HTTP until its client
@@ -282,7 +292,13 @@ async fn routes(
     if component.as_deref() == Some("admin") && client_key.is_none() {
         return Err(ServerError::NotFound);
     }
-    let mut session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
+    let mut session = get_session(
+        &req,
+        context,
+        remote_addr.ip(),
+        client_key.as_ref(),
+        capabilities,
+    )?;
     if session.over_tls {
         session.representation = Some(util::negotiate(&req)?);
     }
@@ -296,12 +312,14 @@ async fn routes(
 /// Identifies the peer making a request: by the key it authenticated with over TLS if it did,
 /// otherwise by its source IP, which must lie within one of the peer's delegations, and which
 /// anything on the peer's machine can send from. Peers that have once connected over TLS are
-/// refused the latter from then on.
+/// refused the latter from then on, unless `information_only`, for a request that only reads
+/// information that the peer may have without TLS.
 fn get_session(
     req: &Request<Body>,
     context: Context,
     addr: IpAddr,
     client_key: Option<&Key>,
+    information_only: bool,
 ) -> Result<Session, ServerError> {
     let pubkey = req
         .headers()
@@ -331,7 +349,7 @@ fn get_session(
             log::warn!("refusing {} connecting from {addr}.", *peer);
             return Err(ServerError::Unauthorized);
         }
-        if client_key.is_none() && peer.requires_tls {
+        if client_key.is_none() && peer.requires_tls && !information_only {
             log::warn!("refusing {} connecting without TLS.", *peer);
             return Err(ServerError::TlsRequired);
         }

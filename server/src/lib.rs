@@ -197,6 +197,7 @@ impl AdminClient {
             external_endpoint: internal_endpoint.into(),
             internal_endpoint,
             features: vec![FEATURE_TLS.to_string()],
+            quic_port: config.quic_port,
         };
         let own = InterfaceInfo {
             network_name: interface.to_string(),
@@ -338,6 +339,7 @@ pub async fn serve(
     let coordinator = Coordinator::spawn(
         CoordinatorConfig {
             address: config.address,
+            quic_port,
         },
         &config.private_key,
         db,

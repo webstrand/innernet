@@ -98,9 +98,13 @@ mod handlers {
         }
     }
 
+    /// What the server supports, and the QUIC port of its TLS API, which a client upgraded from
+    /// v2.0.0 asks for in plain HTTP, even once the server requires TLS of it, and which clients
+    /// that predate TLS ignore.
     pub async fn capabilities(session: Session) -> Result<Response<Body>, ServerError> {
         let capabilities = ServerCapabilities {
             unspecified_ip_in_override_endpoint: true,
+            quic_port: Some(session.context.quic_port),
         };
 
         form_response(&session, capabilities)
@@ -390,6 +394,44 @@ mod tests {
         let res = delete(&media_type::accept(), None).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert!(DatabaseAssociation::list(&server.db.lock())?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_capabilities_state_the_quic_port() -> Result<(), Error> {
+        let server = test::Server::new()?;
+
+        // A peer that is required to connect over TLS may still ask for the capabilities in plain
+        // HTTP, which state the QUIC port of the TLS API, but nothing else.
+        let ip = test::DEVELOPER1_PEER_IP;
+        let res = server
+            .plain_request(ip, "GET", "/v1/user/capabilities")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let capabilities: serde_json::Value = test::json_body(res).await?;
+        assert_eq!(capabilities["quic_port"], 54322);
+        assert_eq!(capabilities["unspecified_ip_in_override_endpoint"], true);
+        let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = server
+            .plain_request(ip, "PUT", "/v1/user/capabilities")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // An unknown address learns nothing.
+        let res = server
+            .plain_request(
+                test::EXPERIMENT_SUBCIDR_PEER_IP,
+                "GET",
+                "/v1/user/capabilities",
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Over TLS, the capabilities state it too.
+        let res = server.request(ip, "GET", "/user/capabilities").await;
+        let capabilities: ServerCapabilities = test::cbor_body(res).await?;
+        assert_eq!(capabilities.quic_port, Some(54322));
         Ok(())
     }
 

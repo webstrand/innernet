@@ -158,6 +158,12 @@ pub struct ServerInfo {
     /// reads it only when it redeems the invitation, and ignores features that it doesn't know.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+
+    /// The UDP port of the server's TLS API, which runs over QUIC at the address of
+    /// `internal_endpoint`, as the invitation states it. An invitation from a server that predates
+    /// the port lacks it, and a client then asks the server for it in plain HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
 }
 
 /// The feature of a server that speaks TLS. A client that redeems an invitation stating it never
@@ -174,6 +180,7 @@ impl ServerInfo {
             internal_endpoint,
             public_key: server_peer.public_key.clone(),
             features: vec![],
+            quic_port: None,
         }
     }
 
@@ -563,6 +570,22 @@ mod tests {
         assert!(config.server.has_feature(FEATURE_TLS));
         let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(config.server.features, ["tls", "from-the-future"]);
+    }
+
+    #[test]
+    fn test_quic_port() {
+        // An invitation from a server that predates the QUIC port lacks it, and is written back
+        // without it.
+        let config: InterfaceConfig = toml::from_str(INVITATION).unwrap();
+        assert_eq!(config.server.quic_port, None);
+        assert!(!toml::to_string(&config).unwrap().contains("quic-port"));
+
+        // A new invitation states it in its [server] table.
+        let invitation = INVITATION.replace("[server]", "[server]\nquic-port = 41641");
+        let config: InterfaceConfig = toml::from_str(&invitation).unwrap();
+        assert_eq!(config.server.quic_port, Some(41641));
+        let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.server.quic_port, Some(41641));
     }
 
     /// An invitation offering delegations.
