@@ -698,7 +698,6 @@ mod tests {
         PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec![Prefix::host(ip.parse().unwrap())],
-            cidr_id: 1,
             public_key: public_key.to_owned(),
             endpoint: None,
             persistent_keepalive_interval: None,

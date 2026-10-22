@@ -35,6 +35,12 @@ pub enum ServerError {
     )]
     PeerChanged,
 
+    #[error(
+        "the CIDR has changed since it was read, so the change was not made; the admin client \
+         must read the CIDR again before it changes the CIDR"
+    )]
+    CidrChanged,
+
     /// Delegations that break the rules of delegations, with the explanation.
     #[error("{0}")]
     Delegation(String),
@@ -66,7 +72,7 @@ impl From<&ServerError> for StatusCode {
             PromotionRequiresTls | Delegation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
-            PeerChanged => StatusCode::CONFLICT,
+            PeerChanged | CidrChanged => StatusCode::CONFLICT,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
             // Special-case the constraint violation situation.
             Database(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..))
@@ -91,6 +97,7 @@ impl TryFrom<ServerError> for Response<Body> {
             ServerError::TlsRequired
             | ServerError::PromotionRequiresTls
             | ServerError::PeerChanged
+            | ServerError::CidrChanged
             | ServerError::Delegation(_) => e.to_string().into(),
             _ => Body::empty(),
         };

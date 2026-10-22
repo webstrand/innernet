@@ -4,9 +4,8 @@ use wireguard_control::KeyPair;
 
 pub struct NewPeerInfo {
     pub name: Hostname,
-    /// The delegations that the server offers the new peer.
+    /// The delegations that the server offers the new peer, which give it its CIDR.
     pub delegations: Vec<Prefix>,
-    pub cidr_id: i64,
     pub is_admin: bool,
     pub invite_expires: Timestring,
 }
@@ -16,7 +15,6 @@ impl NewPeerInfo {
         PeerContents {
             name: Some(self.name),
             delegations: self.delegations,
-            cidr_id: self.cidr_id,
             public_key: keypair.public.to_base64(),
             endpoint: None,
             is_admin: self.is_admin,

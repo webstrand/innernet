@@ -92,6 +92,28 @@ impl Prefix {
         self.contains(other) || other.contains(self)
     }
 
+    /// The prefix as a segment of a path of the API, by which the API of TLS sessions names a
+    /// CIDR: its first address and its length, separated by an underscore, as in `10.42.0.0_16`
+    /// or `fd00::_64`.
+    ///
+    /// A slash would split the segment in two, and its percent-encoding is decoded, or refused,
+    /// by some HTTP stacks and proxies before the server sees it. A hyphen would read as a range
+    /// of addresses. Neither the text of an IPv4 nor that of an IPv6 address holds an underscore,
+    /// so the segment splits without ambiguity, and none of its characters needs encoding: the
+    /// underscore is unreserved, and the colons of an IPv6 address are allowed in a path segment.
+    pub fn api_path_segment(&self) -> String {
+        format!("{}_{}", self.first(), self.prefix_len())
+    }
+
+    /// The prefix that `segment` names, as [`Self::api_path_segment`] writes it, or `None` for
+    /// any other segment, a misaligned prefix or a noncanonical address included, so that a
+    /// prefix has one path.
+    pub fn from_api_path_segment(segment: &str) -> Option<Self> {
+        let (address, prefix_len) = segment.rsplit_once('_')?;
+        let prefix: Self = format!("{address}/{prefix_len}").parse().ok()?;
+        (prefix.api_path_segment() == segment).then_some(prefix)
+    }
+
     /// The prefix as a WireGuard allowed IP, which routes the prefix to a peer.
     pub fn allowed_ip(&self) -> AllowedIp {
         AllowedIp {
@@ -353,6 +375,38 @@ mod tests {
             hosts_fallback(&[prefix("fd00::1:0/112"), prefix("fd00::2/128")]),
             Some("fd00::2".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn test_api_path_segment() {
+        for (text, segment) in [
+            ("10.42.0.0/16", "10.42.0.0_16"),
+            ("10.42.0.7/32", "10.42.0.7_32"),
+            ("fd00::/64", "fd00::_64"),
+            ("::/0", "::_0"),
+        ] {
+            let prefix = prefix(text);
+            assert_eq!(prefix.api_path_segment(), segment);
+            assert_eq!(Prefix::from_api_path_segment(segment), Some(prefix));
+        }
+        // A misaligned prefix, a noncanonical address, a hyphen, a slash and anything else are
+        // not found.
+        for segment in [
+            "10.42.0.1_16",
+            "fd00:0::_64",
+            "FD00::_64",
+            "10.42.0.0_016",
+            "10.42.0.0-16",
+            "fd00::-64",
+            "10.42.0.0/16",
+            "10.42.0.0%2F16",
+            "10.42.0.0",
+            "10.42.0.0_33",
+            "1",
+            "",
+        ] {
+            assert_eq!(Prefix::from_api_path_segment(segment), None, "{segment}");
+        }
     }
 
     #[test]

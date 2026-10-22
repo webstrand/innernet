@@ -6,7 +6,7 @@
 //! [`key_to_bytes`] makes of their base64 text, and the readers key their results by the canonical
 //! base64 text, as a state's public keys are deserialized.
 
-use innernet_shared::{Endpoint, Hostname, PeerContents, Prefix};
+use innernet_shared::{Cidr, Endpoint, Hostname, PeerContents, Prefix};
 use ipnet::IpNet;
 use rusqlite::{params, types::Type, Connection, OptionalExtension as _, Row};
 use std::{
@@ -382,7 +382,6 @@ fn load_peers_where(
                 .get::<_, Option<String>>(1)?
                 .and_then(|name| Hostname::try_from(name).ok()),
             delegations: delegations.remove(&public_key).unwrap_or_default(),
-            cidr_id: 0,
             public_key,
             endpoint: endpoints.endpoint,
             persistent_keepalive_interval: row.get(5)?,
@@ -405,62 +404,18 @@ fn load_peers_where(
     Ok(peers)
 }
 
-/// A CIDR as the node records it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredCidr {
-    pub prefix: Prefix,
-    pub name: String,
-    /// Whether every peer sees the peers of the CIDR.
-    pub infra: bool,
-}
-
 /// The CIDRs that the node records, ordered by prefix.
-pub fn load_cidrs(conn: &Connection) -> Result<Vec<StoredCidr>, rusqlite::Error> {
+pub fn load_cidrs(conn: &Connection) -> Result<Vec<Cidr>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(
-        "SELECT address, prefix_len, name, infra FROM cidrs
-         ORDER BY length(address), address, prefix_len",
+        "SELECT address, prefix_len, name FROM cidrs ORDER BY length(address), address, prefix_len",
     )?;
     let mut rows = stmt.query([])?;
     let mut cidrs = vec![];
     while let Some(row) = rows.next()? {
-        cidrs.push(StoredCidr {
-            prefix: prefix_from_row(row.get(0)?, row.get(1)?)?,
+        cidrs.push(Cidr {
             name: row.get(2)?,
-            infra: row.get(3)?,
+            cidr: prefix_from_row(row.get(0)?, row.get(1)?)?,
         });
     }
     Ok(cidrs)
-}
-
-/// Replaces the CIDRs that the node records with `cidrs`. Of two CIDRs with the same prefix or
-/// the same name, the first is kept.
-pub fn replace_cidrs(conn: &Connection, cidrs: &[StoredCidr]) -> Result<(), rusqlite::Error> {
-    conn.execute("DELETE FROM cidrs", [])?;
-    for cidr in cidrs {
-        conn.execute(
-            "INSERT INTO cidrs (address, prefix_len, name, infra) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT DO NOTHING",
-            params![
-                ip_to_bytes(cidr.prefix.first()),
-                cidr.prefix.prefix_len(),
-                cidr.name,
-                cidr.infra
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-/// Records `cidr`. The database refuses a prefix or a name that another CIDR has.
-pub fn insert_cidr(conn: &Connection, cidr: &StoredCidr) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "INSERT INTO cidrs (address, prefix_len, name, infra) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            ip_to_bytes(cidr.prefix.first()),
-            cidr.prefix.prefix_len(),
-            cidr.name,
-            cidr.infra
-        ],
-    )?;
-    Ok(())
 }

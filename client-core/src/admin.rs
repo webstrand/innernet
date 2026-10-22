@@ -11,8 +11,8 @@ use colored::*;
 use indoc::eprintdoc;
 use innernet_shared::{
     interface_config::ServerInfo, prompts, AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts,
-    Association, AssociationContents, Cidr, CidrTree, DelegationOpts, DeleteCidrOpts,
-    EnableDisablePeerOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
+    Association, Cidr, CidrTree, DelegationOpts, DeleteCidrOpts, EnableDisablePeerOpts,
+    PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
 };
 use wireguard_control::InterfaceName;
 
@@ -52,15 +52,11 @@ pub async fn rename_cidr(
     if let Some((cidr_request, old_name)) = prompts::rename_cidr(&cidrs, &sub_opts)? {
         log::info!("Renaming CIDR...");
 
-        let id = cidrs
-            .iter()
-            .find(|c| c.name == old_name)
-            .ok_or_else(|| anyhow!("CIDR not found."))?
-            .id;
-
-        rest_client
-            .http_form::<_, ()>("PUT", &format!("/admin/cidrs/{id}"), cidr_request)
-            .await?;
+        let listed = Cidr {
+            name: old_name,
+            ..cidr_request.clone()
+        };
+        rest_client.rename_cidr(&listed, &cidr_request.name).await?;
         log::info!("CIDR renamed.");
     } else {
         log::info!("Exited without renaming CIDR.");
@@ -77,12 +73,10 @@ pub async fn delete_cidr(
     let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
     let peers = rest_client.get_peers().await?;
 
-    let cidr_id = prompts::delete_cidr(&cidrs, &peers, &sub_opts)?;
+    let cidr = prompts::delete_cidr(&cidrs, &peers, &sub_opts)?;
 
     println!("Deleting CIDR...");
-    rest_client
-        .http::<()>("DELETE", &format!("/admin/cidrs/{cidr_id}"))
-        .await?;
+    rest_client.delete_cidr(&cidr).await?;
 
     println!("CIDR deleted.");
 
@@ -246,14 +240,10 @@ pub async fn add_association(
     };
 
     rest_client
-        .http_form::<_, ()>(
-            "POST",
-            "/admin/associations",
-            AssociationContents {
-                cidr_id_1: association.0.id,
-                cidr_id_2: association.1.id,
-            },
-        )
+        .create_association(&Association {
+            cidr_1: association.0.cidr,
+            cidr_2: association.1.cidr,
+        })
         .await?;
 
     Ok(())
@@ -266,14 +256,12 @@ pub async fn delete_association(
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
     log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
+    let associations: Vec<Association> = rest_client.get_associations().await?;
 
     if let Some(association) =
         prompts::delete_association(&associations[..], &cidrs[..], &sub_opts)?
     {
-        rest_client
-            .http::<()>("DELETE", &format!("/admin/associations/{}", association.id))
-            .await?;
+        rest_client.delete_association(association).await?;
     } else {
         log::info!("exiting without adding association.");
     }
@@ -285,24 +273,20 @@ pub async fn list_associations(rest_client: &RestClient<'_>) -> Result<(), Error
     log::info!("Fetching CIDRs");
     let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
     log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
+    let associations: Vec<Association> = rest_client.get_associations().await?;
 
+    // An association is named by its CIDRs, each by its name, or by its prefix if it has none.
+    let name = |prefix: &Prefix| {
+        cidrs
+            .iter()
+            .find(|c| c.cidr == *prefix)
+            .map_or_else(|| prefix.to_string(), |c| c.name.clone())
+    };
     for association in associations {
         println!(
-            "{}: {} <=> {}",
-            association.id,
-            cidrs
-                .iter()
-                .find(|c| c.id == association.cidr_id_1)
-                .unwrap()
-                .name
-                .yellow(),
-            cidrs
-                .iter()
-                .find(|c| c.id == association.cidr_id_2)
-                .unwrap()
-                .name
-                .yellow()
+            "{} <=> {}",
+            name(&association.cidr_1).yellow(),
+            name(&association.cidr_2).yellow()
         );
     }
 

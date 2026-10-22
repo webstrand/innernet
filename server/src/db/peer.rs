@@ -1,4 +1,4 @@
-use super::DatabaseCidr;
+use super::{DatabaseAssociation, DatabaseCidr};
 use crate::ServerError;
 use innernet_node::{
     accept::Refusal,
@@ -6,7 +6,7 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    check_delegations, cidr_of_delegations, xeddsa, Cidr, Endpoint, LegacyPeer, LegacyPeerContents,
+    check_delegations, cidr_of_delegations, xeddsa, Endpoint, LegacyPeer, LegacyPeerContents,
     PeerContents, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use rusqlite::{params, Connection};
@@ -18,8 +18,7 @@ use std::{
 };
 use wireguard_control::Key;
 
-/// A peer of the coordinator's database, with the ID of its CIDR, the smallest CIDR that holds its
-/// IP.
+/// A peer of the coordinator's database.
 #[derive(Debug)]
 pub struct DatabasePeer {
     pub inner: PeerContents,
@@ -46,12 +45,16 @@ impl DerefMut for DatabasePeer {
 
 impl DatabasePeer {
     /// The peer as the API of plain-HTTP sessions transfers it, with the ID `id`, which
-    /// [`Self::plain_http_ids`] gives it, or `None` if clients that predate TLS can't represent
-    /// it, as [`LegacyPeerContents::from_peer`] tells.
-    pub fn legacy(&self, id: i64) -> Option<LegacyPeer> {
+    /// [`Self::plain_http_ids`] gives it, and the ID of its CIDR, the CIDR of its delegations,
+    /// among `cidrs`, every CIDR, as [`DatabaseCidr::id_of`] numbers them, or `None` if clients
+    /// that predate TLS can't represent it, as [`LegacyPeerContents::from_peer`] tells: a peer
+    /// without a name or without a hosts fallback address, which has no CIDR either.
+    pub fn legacy(&self, id: i64, cidrs: &[DatabaseCidr]) -> Option<LegacyPeer> {
+        let cidr = cidr_of_delegations(&self.delegations, &DatabaseCidr::prefixes(cidrs))?;
+        let cidr_id = DatabaseCidr::id_of(&cidr, cidrs)?;
         Some(LegacyPeer {
             id,
-            contents: LegacyPeerContents::from_peer(&self.inner)?,
+            contents: LegacyPeerContents::from_peer(&self.inner, cidr_id)?,
         })
     }
 
@@ -70,9 +73,8 @@ impl DatabasePeer {
 
     /// Creates the peer `contents`, offering it its delegations, of which it must have at least
     /// one. The delegations must follow the rules of [`check_delegations`], which give the peer
-    /// its CIDR, the CIDR that the peer names, and the server's node must accept the peer: a name,
-    /// if it has one, that no other peer has, and delegations that overlap no prefix pinned to
-    /// another key.
+    /// its CIDR, and the server's node must accept the peer: a name, if it has one, that no other
+    /// peer has, and delegations that overlap no prefix pinned to another key.
     pub fn create(store: &Store, mut contents: PeerContents) -> Result<Self, ServerError> {
         contents.delegations.sort();
         log::info!("creating peer {:?}", contents);
@@ -82,18 +84,12 @@ impl DatabasePeer {
             return Err(ServerError::InvalidQuery);
         }
 
-        let cidr = DatabaseCidr::get(store, contents.cidr_id)?;
         if contents.delegations.is_empty() {
             return Err(ServerError::Delegation(
                 "a new peer must be offered at least one delegation".into(),
             ));
         }
-        if check_new_delegations(store, &contents.delegations, None)? != Some(cidr.prefix()) {
-            return Err(ServerError::Delegation(format!(
-                "the delegations of a new peer must lie in its CIDR {}",
-                cidr.cidr
-            )));
-        }
+        check_new_delegations(store, &contents.delegations, None)?;
 
         let key = key_to_bytes(&contents.public_key).map_err(|_| ServerError::InvalidQuery)?;
         let tx = store.unchecked_transaction()?;
@@ -178,7 +174,7 @@ impl DatabasePeer {
             )));
         }
         let new_cidr = check_new_delegations(store, &delegations, Some(&key))?;
-        let cidrs = prefixes(&DatabaseCidr::list(store)?);
+        let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(store)?);
         match (cidr_of_delegations(&self.delegations, &cidrs), new_cidr) {
             (Some(old), Some(new)) if old != new => {
                 return Err(ServerError::Delegation(format!(
@@ -346,36 +342,27 @@ impl DatabasePeer {
             .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
-    /// The enabled, redeemed peers that the peer sees: those within its own CIDR, within an infra
-    /// CIDR, or within a CIDR associated with a CIDR that holds the peer's CIDR, its own or one of
-    /// its ancestors.
+    /// The enabled, redeemed peers that the peer sees: those whose CIDR lies within the peer's own
+    /// CIDR, within an infra CIDR, which every peer sees, or within a CIDR associated with a CIDR
+    /// that holds the peer's CIDR, its own or one of its ancestors. A peer's CIDR is that of its
+    /// delegations, so a peer without a delegation is seen by none, and sees only the peers of
+    /// the infra CIDRs.
     pub fn get_all_allowed_peers(&self, conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let cidrs = DatabaseCidr::list(conn)?;
-        let associations = super::DatabaseAssociation::list(conn)?;
-        let own = cidrs.iter().find(|cidr| cidr.id == self.cidr_id);
+        let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(conn)?);
+        let associations = DatabaseAssociation::list(conn)?;
+        let cidr_of = |peer: &Self| cidr_of_delegations(&peer.delegations, &cidrs);
 
-        let mut visible: Vec<ipnet::IpNet> = cidrs
-            .iter()
-            .filter(|cidr| DatabaseCidr::is_infra(conn, cidr.id).unwrap_or(false))
-            .map(|cidr| cidr.cidr)
-            .collect();
-        if let Some(own) = own {
-            visible.push(own.cidr);
-            let holds_own = |id: i64| {
-                cidrs
-                    .iter()
-                    .any(|cidr| cidr.id == id && cidr.cidr.contains(&own.cidr))
-            };
+        // The CIDRs whose peers, and those of their descendants, the peer sees.
+        let mut visible = DatabaseCidr::infra(conn)?;
+        if let Some(own) = cidr_of(self) {
+            visible.push(own);
+            let holds_own = |cidr: &Prefix| cidr.contains(&own);
             for association in &associations {
-                let other = if holds_own(association.cidr_id_1) {
-                    Some(association.cidr_id_2)
-                } else if holds_own(association.cidr_id_2) {
-                    Some(association.cidr_id_1)
-                } else {
-                    None
-                };
-                if let Some(cidr) = other.and_then(|id| cidrs.iter().find(|cidr| cidr.id == id)) {
-                    visible.push(cidr.cidr);
+                if holds_own(&association.cidr_1) {
+                    visible.push(association.cidr_2);
+                }
+                if holds_own(&association.cidr_2) {
+                    visible.push(association.cidr_1);
                 }
             }
         }
@@ -383,23 +370,17 @@ impl DatabasePeer {
         Ok(Self::list_enabled(conn)?
             .into_iter()
             .filter(|peer| {
-                cidr_of_delegations(&peer.delegations, &prefixes(&cidrs))
-                    .is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr.net())))
+                cidr_of(peer).is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr)))
             })
             .collect())
     }
 
     /// Every peer, ordered by hosts fallback address, those without one last.
     pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
-        let cidrs = DatabaseCidr::list(conn)?;
         let latched = Self::latched(conn)?;
         Ok(store::load_peers(conn)?
             .into_iter()
             .map(|mut contents| {
-                contents.cidr_id = cidr_of_delegations(&contents.delegations, &prefixes(&cidrs))
-                    .and_then(|prefix| cidrs.iter().find(|cidr| cidr.prefix() == prefix))
-                    .map(|cidr| cidr.id)
-                    .unwrap_or(0);
                 contents.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
                 Self {
                     requires_tls: latched.contains(&contents.public_key),
@@ -458,11 +439,6 @@ fn refused(refusal: Refusal) -> ServerError {
     }
 }
 
-/// The prefixes of `cidrs`.
-fn prefixes(cidrs: &[Cidr]) -> Vec<Prefix> {
-    cidrs.iter().map(|cidr| cidr.prefix()).collect()
-}
-
 /// Checks that `delegations` may be delegated together to a peer, as [`check_delegations`] does,
 /// given the CIDRs of the database and the delegations that it holds for other peers than the one
 /// with the public key `holder`, if any. Returns the CIDR of the peer, which its delegations
@@ -473,7 +449,7 @@ pub(crate) fn check_new_delegations(
     delegations: &[Prefix],
     holder: Option<&[u8; 32]>,
 ) -> Result<Option<Prefix>, ServerError> {
-    let cidrs = prefixes(&DatabaseCidr::list(conn)?);
+    let cidrs = DatabaseCidr::prefixes(&DatabaseCidr::list(conn)?);
     let mut stmt = conn.prepare_cached(
         "SELECT d.address, d.prefix_len, p.public_key, p.name
          FROM delegations d JOIN peers p ON p.public_key = d.public_key

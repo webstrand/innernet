@@ -1,6 +1,6 @@
 use crate::{
     check_delegations, hosts_fallback, interface_config::InterfaceInfo, peer::NewPeerInfo,
-    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, Association, Cidr, CidrContents, CidrTree,
+    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, Association, Cidr, CidrTree,
     DelegationOpts, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt,
     ListenPortOpts, OverridePeerEndpointOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
 };
@@ -74,8 +74,12 @@ where
     .interact_text()
 }
 
-/// Bring up a prompt to create a new CIDR. Returns the peer request.
-pub fn add_cidr(cidrs: &[Cidr], request: &AddCidrOpts) -> Result<Option<CidrContents>, Error> {
+/// Bring up a prompt to create a new CIDR. Returns the CIDR request.
+///
+/// The parent of a CIDR is the smallest CIDR that holds it, so the CIDR must lie within the parent
+/// that the operator selects, and in none of its children; the CIDR is refused before the server
+/// is asked otherwise.
+pub fn add_cidr(cidrs: &[Cidr], request: &AddCidrOpts) -> Result<Option<Cidr>, Error> {
     let parent_cidr = if let Some(parent_name) = &request.parent {
         cidrs
             .iter()
@@ -91,13 +95,27 @@ pub fn add_cidr(cidrs: &[Cidr], request: &AddCidrOpts) -> Result<Option<CidrCont
         input("Name", Prefill::None)?
     };
 
-    let cidr = if let Some(cidr) = request.cidr {
-        cidr
+    let cidr: Prefix = if let Some(cidr) = request.cidr {
+        Prefix::new(cidr)?
     } else {
         input("CIDR", Prefill::None)?
     };
 
-    let cidr_request = CidrContents::new(name.to_string(), cidr, parent_cidr);
+    let cidr_request = Cidr {
+        name: name.to_string(),
+        cidr,
+    };
+    if let Some(existing) = cidrs.iter().find(|existing| existing.cidr == cidr) {
+        bail!("The CIDR {cidr} exists already, as {}.", existing.name);
+    }
+    let parent = cidr_request.parent(cidrs);
+    if parent != Some(parent_cidr) {
+        bail!(
+            "The CIDR {cidr} can't be a child of {parent_cidr}: the smallest CIDR that holds it is \
+             {}.",
+            parent.map_or("none".to_string(), |parent| parent.to_string())
+        );
+    }
 
     Ok(
         if request.yes || confirm(&format!("Create CIDR \"{}\"?", cidr_request.name))? {
@@ -108,11 +126,9 @@ pub fn add_cidr(cidrs: &[Cidr], request: &AddCidrOpts) -> Result<Option<CidrCont
     )
 }
 
-/// Bring up a prompt to rename an existing CIDR. Returns the CIDR request.
-pub fn rename_cidr(
-    cidrs: &[Cidr],
-    args: &RenameCidrOpts,
-) -> Result<Option<(CidrContents, String)>, Error> {
+/// Bring up a prompt to rename an existing CIDR. Returns the CIDR with its new name, and its old
+/// name.
+pub fn rename_cidr(cidrs: &[Cidr], args: &RenameCidrOpts) -> Result<Option<(Cidr, String)>, Error> {
     let old_cidr = if let Some(name) = &args.name {
         cidrs
             .iter()
@@ -134,7 +150,7 @@ pub fn rename_cidr(
     };
 
     let mut new_cidr = old_cidr;
-    new_cidr.contents.name.clone_from(&new_name);
+    new_cidr.name.clone_from(&new_name);
 
     Ok(
         if args.yes
@@ -144,26 +160,25 @@ pub fn rename_cidr(
                 new_name.yellow()
             ))?
         {
-            Some((new_cidr.contents, old_name))
+            Some((new_cidr, old_name))
         } else {
             None
         },
     )
 }
 
-/// Bring up a prompt to delete a CIDR. Returns the peer request.
+/// Bring up a prompt to delete a CIDR, which has neither peers nor child CIDRs. Returns the CIDR
+/// as it was listed.
 pub fn delete_cidr(
     cidrs: &[Cidr],
     peers: &[PeerContents],
     request: &DeleteCidrOpts,
-) -> Result<i64, Error> {
+) -> Result<Cidr, Error> {
     let eligible_cidrs: Vec<_> = cidrs
         .iter()
         .filter(|cidr| {
-            !peers.iter().any(|peer| peer.cidr_id == cidr.id) &&
-            !cidrs.iter().any(
-                |cidr2| matches!(cidr2.contents.parent, Some(parent_id) if parent_id == cidr.id)
-            )
+            !peers.iter().any(|peer| peer.cidr(cidrs) == Some(*cidr))
+                && !cidrs.iter().any(|other| other.parent(cidrs) == Some(*cidr))
         })
         .collect();
     let cidr = if let Some(name) = &request.name {
@@ -176,7 +191,7 @@ pub fn delete_cidr(
     };
 
     if request.yes || confirm(&format!("Delete CIDR \"{}\"?", cidr.name))? {
-        Ok(cidr.id)
+        Ok(cidr.clone())
     } else {
         Err(anyhow!("Canceled"))
     }
@@ -201,37 +216,35 @@ pub fn choose_association<'a>(
             let cidr2 = find_cidr(cidrs, cidr2_name)?;
             associations
                 .iter()
-                .find(|association| {
-                    (association.cidr_id_1 == cidr1.id && association.cidr_id_2 == cidr2.id)
-                        || (association.cidr_id_1 == cidr2.id && association.cidr_id_2 == cidr1.id)
-                })
+                .find(|association| association.associates(&cidr1.cidr, &cidr2.cidr))
                 .ok_or_else(|| anyhow!("CIDR association does not exist"))
         },
         _ => {
             let names: Vec<_> = associations
                 .iter()
-                .map(|association| {
-                    format!(
-                        "{}: {} <=> {}",
-                        association.id,
-                        cidrs
-                            .iter()
-                            .find(|c| c.id == association.cidr_id_1)
-                            .unwrap()
-                            .name,
-                        cidrs
-                            .iter()
-                            .find(|c| c.id == association.cidr_id_2)
-                            .unwrap()
-                            .name
-                    )
-                })
+                .map(|association| describe_association(association, cidrs))
                 .collect();
             let (index, _) = select("Association", &names)?;
 
             Ok(&associations[index])
         },
     }
+}
+
+/// The association for display, by the names of its CIDRs among `cidrs`, or by the prefix of a
+/// CIDR that isn't among them.
+pub fn describe_association(association: &Association, cidrs: &[Cidr]) -> String {
+    let name = |prefix: &Prefix| {
+        cidrs
+            .iter()
+            .find(|cidr| cidr.cidr == *prefix)
+            .map_or_else(|| prefix.to_string(), |cidr| cidr.name.clone())
+    };
+    format!(
+        "{} <=> {}",
+        name(&association.cidr_1),
+        name(&association.cidr_2)
+    )
 }
 
 fn find_cidr<'a>(cidrs: &'a [Cidr], name: &str) -> Result<&'a Cidr, Error> {
@@ -294,7 +307,12 @@ pub fn delete_association<'a>(
     let association = choose_association(associations, cidrs, args)?;
 
     Ok(
-        if args.yes || confirm(&format!("Delete association #{}?", association.id))? {
+        if args.yes
+            || confirm(&format!(
+                "Delete association {}?",
+                describe_association(association, cidrs)
+            ))?
+        {
             Some(association)
         } else {
             None
@@ -323,7 +341,7 @@ pub fn gather_new_peer_info(
     let delegation = if let Some(delegation) = args.delegation {
         // A wider delegation is checked as the server checks it, so that a refusal is explained
         // before the server is asked.
-        if !cidr.prefix().contains(&delegation) {
+        if !cidr.cidr.contains(&delegation) {
             bail!("{delegation} is outside the CIDR {}", cidr.cidr);
         }
         let others: Vec<(Prefix, String)> = peers
@@ -344,7 +362,8 @@ pub fn gather_new_peer_info(
         delegation
     } else {
         let mut available_ip = None;
-        let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
+        let net = cidr.cidr.net();
+        let candidate_ips = net.hosts().filter(|ip| net.is_assignable(ip));
         for ip in candidate_ips {
             if !peers.iter().any(|peer| peer.holds(ip)) {
                 available_ip = Some(ip);
@@ -398,7 +417,6 @@ pub fn gather_new_peer_info(
         let input = NewPeerInfo {
             name,
             delegations: vec![delegation],
-            cidr_id: cidr.id,
             is_admin,
             invite_expires,
         };
@@ -576,7 +594,7 @@ pub fn add_delegation<'a>(
             peer.display_name()
         );
     }
-    let cidrs: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
+    let cidrs: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.cidr).collect();
     let others: Vec<(Prefix, String)> = peers
         .iter()
         .filter(|other| other.public_key != peer.public_key)
@@ -860,7 +878,6 @@ mod tests {
         PeerContents {
             name: Some(name.parse().unwrap()),
             delegations: delegations.iter().map(|d| d.parse().unwrap()).collect(),
-            cidr_id: 1,
             public_key: public_key.to_owned(),
             endpoint: None,
             persistent_keepalive_interval: None,
@@ -916,12 +933,8 @@ mod tests {
             &["10.0.0.16/28"],
         )];
         let cidrs = [Cidr {
-            id: 1,
-            contents: CidrContents {
-                name: "cidr".into(),
-                cidr: "10.0.0.0/24".parse().unwrap(),
-                parent: None,
-            },
+            name: "cidr".into(),
+            cidr: "10.0.0.0/24".parse().unwrap(),
         }];
         let tree = CidrTree::new(&cidrs);
         let offered = |args: &[&str]| {
@@ -959,6 +972,72 @@ mod tests {
     }
 
     #[test]
+    fn test_cidrs_by_prefix() {
+        let cidr = |name: &str, cidr: &str| Cidr {
+            name: name.into(),
+            cidr: cidr.parse().unwrap(),
+        };
+        let cidrs = [
+            cidr("root", "10.0.0.0/16"),
+            cidr("users", "10.0.1.0/24"),
+            cidr("empty", "10.0.2.0/24"),
+        ];
+        let add = |parent: &str, prefix: &str| {
+            add_cidr(
+                &cidrs,
+                &AddCidrOpts {
+                    name: Some("new".parse().unwrap()),
+                    cidr: Some(prefix.parse().unwrap()),
+                    parent: Some(parent.into()),
+                    yes: true,
+                },
+            )
+        };
+
+        // A new CIDR is named by its prefix, without a parent, and must lie in the parent
+        // selected, and in none of its children.
+        assert_eq!(
+            add("root", "10.0.3.0/24").unwrap(),
+            Some(cidr("new", "10.0.3.0/24"))
+        );
+        assert_eq!(
+            add("users", "10.0.1.64/26").unwrap(),
+            Some(cidr("new", "10.0.1.64/26"))
+        );
+        for (parent, prefix, reason) in [
+            (
+                "root",
+                "10.0.1.64/26",
+                "smallest CIDR that holds it is users",
+            ),
+            ("users", "10.1.0.0/24", "is none"),
+            ("root", "10.0.2.0/24", "exists already"),
+            ("root", "10.0.3.5/24", "not aligned"),
+        ] {
+            let error = add(parent, prefix).unwrap_err().to_string();
+            assert!(error.contains(reason), "{prefix}: {error}");
+        }
+
+        // Only a CIDR without peers and without children may be deleted.
+        let peers = [peer(
+            "peer1",
+            "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=",
+            &["10.0.1.9/32"],
+        )];
+        let delete = |name: &str| {
+            delete_cidr(
+                &cidrs,
+                &peers,
+                &DeleteCidrOpts {
+                    name: Some(name.into()),
+                    yes: true,
+                },
+            )
+        };
+        assert_eq!(delete("empty").unwrap(), cidrs[2]);
+    }
+
+    #[test]
     fn test_change_delegations() {
         let peers = [
             peer(
@@ -973,12 +1052,8 @@ mod tests {
             ),
         ];
         let cidrs = [Cidr {
-            id: 1,
-            contents: CidrContents {
-                name: "cidr".into(),
-                cidr: "10.0.0.0/24".parse().unwrap(),
-                parent: None,
-            },
+            name: "cidr".into(),
+            cidr: "10.0.0.0/24".parse().unwrap(),
         }];
 
         // An addition is checked as the server checks it, and returns the whole set.

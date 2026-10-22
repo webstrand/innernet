@@ -886,7 +886,10 @@ fn print_tree(
         .iter()
         .for_each(|child| print_tree(child, peers, level + 1, verbose, interface_config));
 
-    for peer in peers.iter().filter(|p| p.peer.cidr_id == cidr.id) {
+    for peer in peers
+        .iter()
+        .filter(|p| p.peer.cidr(cidr.all()) == Some(&**cidr))
+    {
         let endpoint_has_local_override = interface_config
             .endpoint_override_for_peer(peer.peer)
             .is_some();

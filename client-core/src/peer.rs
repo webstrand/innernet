@@ -84,7 +84,7 @@ pub async fn invite(
         server_info.external_endpoint = endpoint;
     }
 
-    let network = CidrTree::new(existing_cidrs).cidr;
+    let network = CidrTree::new(existing_cidrs).cidr.net();
     let invitation = match rest_client.admin_api().await? {
         AdminApi::ByKey => Invitation::offering(
             interface,

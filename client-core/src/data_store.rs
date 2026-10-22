@@ -1,15 +1,11 @@
 use anyhow::{bail, ensure, Context as _, Error};
-use innernet_node::{
-    db::CreateHook,
-    store::{self, StoredCidr},
-    Store,
-};
+use innernet_node::{db::CreateHook, store, Store};
 use innernet_shared::{
-    cidr_of_delegations, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents,
-    IoErrorContext, LegacyPeer, PeerContents, Prefix, State,
+    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, IoErrorContext, LegacyCidr,
+    LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
-use rusqlite::OptionalExtension as _;
+use rusqlite::{params, Connection, OptionalExtension as _};
 use serde::Deserialize;
 use std::{
     fs::OpenOptions,
@@ -58,18 +54,15 @@ impl Network {
     }
 }
 
-/// Server IDs aren't stored, so the CIDR of a peer outside every CIDR has this ID. The CIDRs are
-/// numbered from 1 as they are read.
-const UNKNOWN_ID: i64 = 0;
-
-/// The data store of the JSON file of earlier versions, whose peers have the IDs of the server.
+/// The data store of the JSON file of earlier versions, whose peers and CIDRs have the IDs that
+/// the server gave them.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "version")]
 enum LegacyContents {
     #[serde(rename = "1")]
     V1 {
         peers: Vec<LegacyPeer>,
-        cidrs: Vec<Cidr>,
+        cidrs: Vec<LegacyCidr>,
     },
 }
 
@@ -234,18 +227,7 @@ impl DataStore {
                 )?;
             }
         }
-        let cidrs: Vec<StoredCidr> = state
-            .cidrs
-            .iter()
-            .filter_map(|cidr| {
-                Some(StoredCidr {
-                    prefix: Prefix::new(cidr.cidr.trunc()).ok()?,
-                    name: cidr.name.clone(),
-                    infra: false,
-                })
-            })
-            .collect();
-        store::replace_cidrs(&tx, &cidrs)?;
+        write_cidrs(&tx, &state.cidrs)?;
         tx.commit()?;
         self.warn_if_own_address_lost()?;
         Ok(dropped)
@@ -289,21 +271,9 @@ impl DataStore {
             .collect()
     }
 
-    /// The peers, ordered by their hosts fallback addresses, those without one last, each with the
-    /// smallest CIDR that holds all its delegations as its CIDR.
+    /// The peers, ordered by their hosts fallback addresses, those without one last.
     pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
-        let cidrs = self.cidrs()?;
-        let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
-        Ok(store::load_peers(&self.store)?
-            .into_iter()
-            .map(|mut peer| {
-                peer.cidr_id = cidr_of_delegations(&peer.delegations, &prefixes)
-                    .and_then(|prefix| cidrs.iter().find(|cidr| cidr.prefix() == prefix))
-                    .map(|cidr| cidr.id)
-                    .unwrap_or(UNKNOWN_ID);
-                peer
-            })
-            .collect())
+        Ok(store::load_peers(&self.store)?)
     }
 
     /// Whether the peer with `public_key` is known to speak TLS.
@@ -332,34 +302,28 @@ impl DataStore {
         Ok(())
     }
 
-    /// The CIDRs, ordered by prefix and numbered from 1, each with the smallest CIDR that holds it
-    /// as its parent.
+    /// The CIDRs, ordered by prefix.
     pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
-        let mut cidrs: Vec<Cidr> = store::load_cidrs(&self.store)?
-            .into_iter()
-            .zip(1..)
-            .map(|(cidr, id)| Cidr {
-                id,
-                contents: CidrContents {
-                    name: cidr.name,
-                    cidr: cidr.prefix.net(),
-                    parent: None,
-                },
-            })
-            .collect();
-        let parents: Vec<Option<i64>> = cidrs
-            .iter()
-            .map(|child| {
-                smallest_containing(&cidrs, |cidr| {
-                    *cidr != child.cidr && cidr.contains(&child.cidr)
-                })
-            })
-            .collect();
-        for (cidr, parent) in cidrs.iter_mut().zip(parents) {
-            cidr.contents.parent = parent;
-        }
-        Ok(cidrs)
+        Ok(store::load_cidrs(&self.store)?)
     }
+}
+
+/// Replaces the CIDRs of the database with `cidrs`. They are only displayed, so of two CIDRs with
+/// the same prefix or the same name, the first is kept.
+fn write_cidrs(conn: &Connection, cidrs: &[Cidr]) -> Result<(), Error> {
+    conn.execute("DELETE FROM cidrs", [])?;
+    for cidr in cidrs {
+        conn.execute(
+            "INSERT INTO cidrs (address, prefix_len, name) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![
+                store::ip_to_bytes(cidr.cidr.first()),
+                cidr.cidr.prefix_len(),
+                cidr.name
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Imports the legacy data store at `path` into the new database, if there is one. The import
@@ -391,17 +355,9 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
             );
         }
     }
-    let cidrs: Vec<StoredCidr> = cidrs
-        .iter()
-        .filter_map(|cidr| {
-            Some(StoredCidr {
-                prefix: Prefix::new(cidr.cidr.trunc()).ok()?,
-                name: cidr.name.clone(),
-                infra: false,
-            })
-        })
-        .collect();
-    store::replace_cidrs(scope, &cidrs)?;
+    // A CIDR whose address has host bits set is the prefix of its network, as the server read it.
+    let cidrs: Vec<Cidr> = cidrs.into_iter().map(Cidr::from).collect();
+    write_cidrs(scope, &cidrs)?;
     log::info!(
         "imported {} peers from {} into the new data store.",
         peers.len(),
@@ -411,18 +367,9 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
     Ok(())
 }
 
-/// The ID of the smallest of `cidrs` for which `contains` holds.
-fn smallest_containing(cidrs: &[Cidr], contains: impl Fn(&IpNet) -> bool) -> Option<i64> {
-    cidrs
-        .iter()
-        .filter(|cidr| contains(&cidr.cidr))
-        .max_by_key(|cidr| cidr.cidr.prefix_len())
-        .map(|cidr| cidr.id)
-}
-
 /// The coordinator, at its internal address, and this client, with the delegations
-/// `delegations`, as the interface config and the invitation introduce them. Each record has
-/// neither a name nor a CIDR.
+/// `delegations`, as the interface config and the invitation introduce them. Each record has no
+/// name.
 fn introduced_peers(
     config: &InterfaceConfig,
     delegations: &[Prefix],
@@ -430,7 +377,6 @@ fn introduced_peers(
     let introduced = |delegations: Vec<Prefix>, public_key: String, endpoint| PeerContents {
         name: None,
         delegations,
-        cidr_id: UNKNOWN_ID,
         public_key,
         endpoint,
         persistent_keepalive_interval: None,
@@ -460,7 +406,7 @@ fn introduced_peers(
 mod tests {
     use super::*;
     use innernet_node::db::{APPLICATION_ID, BUSY_TIMEOUT, SCHEMA_VERSION};
-    use innernet_shared::{Cidr, CidrContents, LegacyPeerContents, PeerContents};
+    use innernet_shared::{LegacyCidrContents, LegacyPeerContents, PeerContents};
     use once_cell::sync::Lazy;
     use rusqlite::{config::DbConfig, Connection};
     use std::time::{Duration, UNIX_EPOCH};
@@ -468,7 +414,6 @@ mod tests {
         vec![PeerContents {
             name: Some("blah".parse().unwrap()),
             delegations: host("10.0.0.1"),
-            cidr_id: 1,
             public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
             endpoint: None,
             is_admin: false,
@@ -481,12 +426,8 @@ mod tests {
     });
     static BASE_CIDRS: Lazy<Vec<Cidr>> = Lazy::new(|| {
         vec![Cidr {
-            id: 1,
-            contents: CidrContents {
-                name: "cidr".to_string(),
-                cidr: "10.0.0.0/24".parse().unwrap(),
-                parent: None,
-            },
+            name: "cidr".to_string(),
+            cidr: "10.0.0.0/24".parse().unwrap(),
         }]
     });
 
@@ -514,14 +455,26 @@ mod tests {
     }
 
     /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it, with the
-    /// peers numbered from 1.
+    /// server IDs of the peers and of the CIDRs, numbered from 1, each peer in the first CIDR.
     fn write_legacy(dir: &Path, peers: &[PeerContents], cidrs: &[Cidr]) {
         let peers: Vec<LegacyPeer> = peers
             .iter()
             .zip(1..)
             .map(|(contents, id)| LegacyPeer {
                 id,
-                contents: LegacyPeerContents::from_peer(contents).unwrap(),
+                contents: LegacyPeerContents::from_peer(contents, 1).unwrap(),
+            })
+            .collect();
+        let cidrs: Vec<LegacyCidr> = cidrs
+            .iter()
+            .zip(1..)
+            .map(|(cidr, id)| LegacyCidr {
+                id,
+                contents: LegacyCidrContents {
+                    name: cidr.name.clone(),
+                    cidr: cidr.cidr.net(),
+                    parent: None,
+                },
             })
             .collect();
         let contents = serde_json::json!({ "version": "1", "peers": peers, "cidrs": cidrs });
@@ -657,10 +610,14 @@ mod tests {
         assert!(store
             .update_peers(&[without.clone(), BASE_PEERS[0].clone()])
             .is_empty());
-        without.cidr_id = UNKNOWN_ID;
         assert_eq!(
             store.peers().unwrap(),
             [BASE_PEERS[0].clone(), without.clone()]
+        );
+        assert_eq!(without.cidr(&store.cidrs().unwrap()), None);
+        assert_eq!(
+            BASE_PEERS[0].cidr(&store.cidrs().unwrap()),
+            Some(&BASE_CIDRS[0])
         );
         assert_eq!(
             open(dir.path(), false).unwrap().peers().unwrap(),
@@ -1023,14 +980,11 @@ mod tests {
         replaced[0].public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         assert_eq!(store.update_peers(&replaced).len(), 1);
 
-        // The server's record of the coordinator replaces the introduced one. The data store
-        // holds no CIDRs, so the coordinator has none.
+        // The server's record of the coordinator replaces the introduced one.
         assert!(store
             .update_peers(std::slice::from_ref(&*COORDINATOR))
             .is_empty());
-        let mut expected = COORDINATOR.clone();
-        expected.cidr_id = UNKNOWN_ID;
-        assert_eq!(store.peers().unwrap()[0], expected);
+        assert_eq!(store.peers().unwrap()[0], *COORDINATOR);
         assert_eq!(store.peers().unwrap().len(), 2);
 
         // Only a new data store is introduced.
@@ -1055,30 +1009,25 @@ mod tests {
         domain.delegations = host("10.0.1.1");
         domain.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         domain.endpoint = Some("vpn.example.com:51820".parse().unwrap());
-        domain.cidr_id = 2;
         vec![v4, domain]
     }
 
     fn varied_cidrs() -> Vec<Cidr> {
-        let cidr = |id, name: &str, cidr: &str, parent| Cidr {
-            id,
-            contents: CidrContents {
-                name: name.to_string(),
-                cidr: cidr.parse().unwrap(),
-                parent,
-            },
+        let cidr = |name: &str, cidr: &str| Cidr {
+            name: name.to_string(),
+            cidr: cidr.parse().unwrap(),
         };
         vec![
-            cidr(1, "cidr", "10.0.0.0/24", Some(3)),
-            cidr(2, "other", "10.0.1.0/24", Some(3)),
-            cidr(3, "root", "10.0.0.0/16", None),
+            cidr("cidr", "10.0.0.0/24"),
+            cidr("other", "10.0.1.0/24"),
+            cidr("root", "10.0.0.0/16"),
         ]
     }
 
     #[test]
     fn test_round_trip() {
-        // Every field survives the database, the CIDRs are numbered by prefix, each with the
-        // smallest CIDR containing it as its parent, and each peer with the smallest CIDR
+        // Every field survives the database, the CIDRs are ordered by prefix, the parent of each
+        // is the smallest CIDR containing it, and the CIDR of each peer is the smallest CIDR
         // containing its IP.
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path(), true).unwrap();
@@ -1094,23 +1043,20 @@ mod tests {
         let expected_cidrs = {
             let mut cidrs = varied_cidrs();
             // The CIDRs are ordered by address, then prefix length.
-            cidrs.sort_by_key(|c| (c.cidr.addr(), c.cidr.prefix_len()));
-            for (i, cidr) in cidrs.iter_mut().enumerate() {
-                cidr.id = i as i64 + 1;
-            }
-            cidrs[1].contents.parent = Some(1);
-            cidrs[2].contents.parent = Some(1);
+            cidrs.sort_by_key(|c| c.cidr);
             cidrs
         };
-        let mut expected_peers = varied_peers();
-        expected_peers[0].cidr_id = 2;
-        expected_peers[1].cidr_id = 3;
-        assert_eq!(store.cidrs().unwrap(), expected_cidrs);
-        assert_eq!(store.peers().unwrap(), expected_peers);
-
-        let store = open(dir.path(), false).unwrap();
-        assert_eq!(store.cidrs().unwrap(), expected_cidrs);
-        assert_eq!(store.peers().unwrap(), expected_peers);
+        let expected_peers = varied_peers();
+        for store in [store, open(dir.path(), false).unwrap()] {
+            let cidrs = store.cidrs().unwrap();
+            assert_eq!(cidrs, expected_cidrs);
+            assert_eq!(store.peers().unwrap(), expected_peers);
+            assert_eq!(cidrs[0].parent(&cidrs), None);
+            assert_eq!(cidrs[1].parent(&cidrs), Some(&cidrs[0]));
+            assert_eq!(cidrs[2].parent(&cidrs), Some(&cidrs[0]));
+            assert_eq!(store.peers().unwrap()[0].cidr(&cidrs), Some(&cidrs[1]));
+            assert_eq!(store.peers().unwrap()[1].cidr(&cidrs), Some(&cidrs[2]));
+        }
     }
 
     #[test]
@@ -1119,7 +1065,6 @@ mod tests {
         let network: IpNet = "fd00::/64".parse().unwrap();
         let mut peer = BASE_PEERS[0].clone();
         peer.delegations = host("fd00::1");
-        peer.cidr_id = UNKNOWN_ID;
         peer.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
         let mut store = DataStore::open_with_paths(
             &db_path(dir.path()),
@@ -1141,11 +1086,11 @@ mod tests {
         write_legacy(dir.path(), &legacy_peers, &varied_cidrs());
         let legacy = std::fs::read(legacy_path(dir.path())).unwrap();
         let mut store = open(dir.path(), false).unwrap();
-        let mut expected_peers = varied_peers();
-        expected_peers[0].cidr_id = 2;
-        expected_peers[1].cidr_id = 3;
+        let expected_peers = varied_peers();
         assert_eq!(store.peers().unwrap(), expected_peers);
-        assert_eq!(store.cidrs().unwrap().len(), 3);
+        let mut expected_cidrs = varied_cidrs();
+        expected_cidrs.sort_by_key(|c| c.cidr);
+        assert_eq!(store.cidrs().unwrap(), expected_cidrs);
 
         // From then on the database is the data store, and the legacy one is never read again.
         store.update_peers(&[]);

@@ -10,8 +10,7 @@ use indoc::printdoc;
 use innernet_node::Store;
 use innernet_publicip::Preference;
 use innernet_shared::{
-    prompts, CidrContents, Endpoint, IpNetExt, PeerContents, Prefix,
-    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    prompts, Endpoint, IpNetExt, PeerContents, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
 use std::{
@@ -71,34 +70,27 @@ struct DbInitData {
 fn populate_database(store: &Store, db_init_data: DbInitData) -> Result<(), Error> {
     const SERVER_NAME: &str = "innernet-server";
 
-    let root_cidr = DatabaseCidr::create(
+    DatabaseCidr::create(
         store,
-        CidrContents {
-            name: db_init_data.network_name.clone(),
-            cidr: db_init_data.network_cidr,
-            parent: None,
-        },
+        db_init_data.network_name.clone(),
+        Prefix::new(db_init_data.network_cidr.trunc())?,
     )
     .map_err(|_| anyhow!("failed to create root CIDR"))?;
 
+    // Every peer sees the peers of the server's CIDR, which its delegation gives it.
     let server_cidr = DatabaseCidr::create(
         store,
-        CidrContents {
-            name: SERVER_NAME.into(),
-            cidr: db_init_data.server_cidr,
-            parent: Some(root_cidr.id),
-        },
+        SERVER_NAME.into(),
+        Prefix::new(db_init_data.server_cidr)?,
     )
     .map_err(|_| anyhow!("failed to create innernet-server CIDR"))?;
-    // Every peer sees the peers of the server's CIDR.
-    DatabaseCidr::set_infra(store, server_cidr.id)?;
+    DatabaseCidr::set_infra(store, &server_cidr.prefix)?;
 
     DatabasePeer::create(
         store,
         PeerContents {
             name: Some(SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?),
             delegations: vec![Prefix::host(db_init_data.our_ip)],
-            cidr_id: server_cidr.id,
             public_key: db_init_data.public_key_base64,
             endpoint: Some(db_init_data.endpoint),
             is_admin: true,

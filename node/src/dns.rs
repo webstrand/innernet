@@ -445,7 +445,6 @@ mod tests {
         let peer = |name: &str, ip: &str, is_disabled| innernet_shared::PeerContents {
             name: name.parse().ok(),
             delegations: vec![innernet_shared::Prefix::host(ip.parse().unwrap())],
-            cidr_id: 0,
             public_key: wireguard_control::KeyPair::generate().public.to_base64(),
             endpoint: None,
             persistent_keepalive_interval: None,

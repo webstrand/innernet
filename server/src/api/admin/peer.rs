@@ -82,11 +82,11 @@ async fn peer_form_body(req: Request<Body>) -> Result<PeerContents, ServerError>
     Ok(PeerContents::deserialize(form)?)
 }
 
-/// The tag of `value`, a resource of a peer of the kind `kind`: a hash of the kind and the value,
-/// and of nothing else, so that a tag depends only on the state that it was computed for. Clients
-/// treat tags as opaque. The hash is SHA-512, which XEdDSA uses already, cut to 128 bits: a tag
-/// only tells states apart, and needs no more resistance to collisions.
-fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
+/// The tag of `value`, a resource of the kind `kind`, such as a peer or a CIDR: a hash of the kind
+/// and the value, and of nothing else, so that a tag depends only on the state that it was
+/// computed for. Clients treat tags as opaque. The hash is SHA-512, which XEdDSA uses already,
+/// cut to 128 bits: a tag only tells states apart, and needs no more resistance to collisions.
+pub(super) fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
     let mut hasher = Sha512::new();
     hasher.update(kind.as_bytes());
     hasher.update([0]);
@@ -283,7 +283,7 @@ mod handlers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test;
+    use crate::{db::DatabaseCidr, test};
     use bytes::Buf;
     use innernet_shared::{Endpoint, Error, LegacyPeer, Prefix, State};
     use wireguard_control::KeyPair;
@@ -459,7 +459,7 @@ mod tests {
         } else {
             "10.80.2.1"
         };
-        let peer = test::peer_contents("developer3", ip, test::ROOT_CIDR_ID, false)?;
+        let peer = test::peer_contents("developer3", ip, false)?;
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
@@ -672,8 +672,10 @@ mod tests {
 
         // Clients that predate TLS see the lowest address of its delegations as its IP.
         let id = DatabasePeer::plain_http_ids(&server.db.lock())?[&peer.public_key];
-        let legacy = stored.legacy(id).unwrap();
+        let cidrs = DatabaseCidr::list(&server.db.lock())?;
+        let legacy = stored.legacy(id, &cidrs).unwrap();
         assert_eq!(Some(legacy.ip), stored.hosts_fallback());
+        assert_eq!(legacy.cidr_id, test::DEVELOPER_CIDR_ID);
         Ok(())
     }
 
@@ -895,7 +897,8 @@ mod tests {
         );
         let without = DatabasePeer::get_from_public_key(&server.db.lock(), &key)?;
         assert!(without.delegations.is_empty());
-        assert!(without.legacy(test::DEVELOPER1_PEER_ID).is_none());
+        let cidrs = DatabaseCidr::list(&server.db.lock())?;
+        assert!(without.legacy(test::DEVELOPER1_PEER_ID, &cidrs).is_none());
 
         // A non-admin can't, and an unknown key is not found.
         let tag = get(path.clone()).await.tag;

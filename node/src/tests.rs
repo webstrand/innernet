@@ -14,7 +14,6 @@ fn peer(name: &str, ip: &str) -> PeerContents {
     PeerContents {
         name: Some(name.parse().unwrap()),
         delegations: vec![Prefix::host(ip.parse().unwrap())],
-        cidr_id: 0,
         public_key: KeyPair::generate().public.to_base64(),
         endpoint: None,
         persistent_keepalive_interval: None,

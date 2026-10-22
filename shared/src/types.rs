@@ -1,4 +1,4 @@
-use crate::{hosts_fallback, wg::PeerInfoExt, Prefix};
+use crate::{cidr_of_delegations, hosts_fallback, parent_cidr, wg::PeerInfoExt, Prefix};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -208,65 +208,76 @@ impl From<Option<Endpoint>> for EndpointContents {
     }
 }
 
+/// An association of two CIDRs, whose peers see each other's, without the ID by which the API of
+/// plain-HTTP sessions names it. The API of TLS sessions names an association by the prefixes of
+/// its CIDRs, in either order, and transfers associations in this form.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Association {
+    pub cidr_1: Prefix,
+    pub cidr_2: Prefix,
+}
+
+impl Association {
+    /// Whether the association is that of the CIDRs `a` and `b`, in either order.
+    pub fn associates(&self, a: &Prefix, b: &Prefix) -> bool {
+        (self.cidr_1 == *a && self.cidr_2 == *b) || (self.cidr_1 == *b && self.cidr_2 == *a)
+    }
+
+    /// The path of the association in the API of TLS sessions, under `/admin/associations`: the
+    /// path segments of its two CIDRs, as [`Prefix::api_path_segment`] writes them.
+    pub fn api_path(&self) -> String {
+        format!(
+            "{}/{}",
+            self.cidr_1.api_path_segment(),
+            self.cidr_2.api_path_segment()
+        )
+    }
+}
+
+/// An association as clients that predate TLS know it, without its ID: the CIDRs it associates,
+/// by their IDs.
 #[derive(Deserialize, Serialize, Debug)]
-pub struct AssociationContents {
+pub struct LegacyAssociationContents {
     pub cidr_id_1: i64,
     pub cidr_id_2: i64,
 }
 
+/// An association with the ID by which the API of plain-HTTP sessions names it, as clients that
+/// predate TLS transfer associations. The API of TLS sessions transfers associations as
+/// [`Association`].
 #[derive(Deserialize, Serialize, Debug)]
-pub struct Association {
+pub struct LegacyAssociation {
     pub id: i64,
 
     #[serde(flatten)]
-    pub contents: AssociationContents,
+    pub contents: LegacyAssociationContents,
 }
 
-impl Deref for Association {
-    type Target = AssociationContents;
+impl Deref for LegacyAssociation {
+    type Target = LegacyAssociationContents;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, PartialOrd, Eq, Ord)]
-pub struct CidrContents {
-    pub name: String,
-    pub cidr: IpNet,
-    pub parent: Option<i64>,
-}
-
-impl CidrContents {
-    pub fn new(name: String, cidr: IpNet, parent: &Cidr) -> Self {
-        Self {
-            name,
-            cidr,
-            parent: Some(parent.id),
-        }
-    }
-
-    /// The CIDR as an aligned prefix. A CIDR whose address has host bits set, as a server that
-    /// predates TLS may hold, is the prefix of its network.
-    pub fn prefix(&self) -> Prefix {
-        Prefix::new(self.cidr.trunc()).expect("a truncated prefix is aligned")
-    }
-}
-
-impl Deref for CidrContents {
-    type Target = IpNet;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cidr
-    }
-}
-
+/// A CIDR, without the ID by which the API of plain-HTTP sessions names it. The API of TLS
+/// sessions names a CIDR by its prefix, and transfers CIDRs in this form, without a parent: the
+/// parent of a CIDR is the smallest other CIDR that holds it, as [`Cidr::parent`] finds it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Cidr {
-    pub id: i64,
+    pub name: String,
+    pub cidr: Prefix,
+}
 
-    #[serde(flatten)]
-    pub contents: CidrContents,
+impl Cidr {
+    /// The parent of the CIDR among `cidrs`: the smallest of them that holds it, other than
+    /// itself, or `None` for a root.
+    pub fn parent<'a>(&self, cidrs: &'a [Cidr]) -> Option<&'a Cidr> {
+        let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.cidr).collect();
+        let parent = parent_cidr(&self.cidr, &prefixes)?;
+        cidrs.iter().find(|cidr| cidr.cidr == parent)
+    }
 }
 
 impl Display for Cidr {
@@ -275,11 +286,63 @@ impl Display for Cidr {
     }
 }
 
-impl Deref for Cidr {
-    type Target = CidrContents;
+/// A CIDR and its tag: the body of `GET` and `PUT /admin/cidrs/{prefix}` in TLS sessions. A `PUT`
+/// renames the CIDR: it carries the CIDR with its new name and the tag of the CIDR as the admin
+/// read it, and the server refuses it if the CIDR has changed since.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TaggedCidr {
+    pub cidr: Cidr,
+    pub tag: String,
+}
+
+/// The body of `DELETE /admin/cidrs/{prefix}` in TLS sessions. `tag` is that of the CIDR as the
+/// admin read it, and the server refuses the deletion if the CIDR has changed since.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CidrDeletion {
+    pub tag: String,
+}
+
+/// A CIDR as clients that predate TLS know it, without its ID: with its parent by ID.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LegacyCidrContents {
+    pub name: String,
+    pub cidr: IpNet,
+    pub parent: Option<i64>,
+}
+
+impl LegacyCidrContents {
+    /// The CIDR as an aligned prefix. A CIDR whose address has host bits set, as a server that
+    /// predates TLS may hold, is the prefix of its network.
+    pub fn prefix(&self) -> Prefix {
+        Prefix::new(self.cidr.trunc()).expect("a truncated prefix is aligned")
+    }
+}
+
+/// A CIDR with the ID by which the API of plain-HTTP sessions names it, as clients that predate
+/// TLS transfer CIDRs. The API of TLS sessions transfers CIDRs as [`Cidr`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LegacyCidr {
+    pub id: i64,
+
+    #[serde(flatten)]
+    pub contents: LegacyCidrContents,
+}
+
+impl Deref for LegacyCidr {
+    type Target = LegacyCidrContents;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
+    }
+}
+
+impl From<LegacyCidr> for Cidr {
+    /// The CIDR without its ID and its parent.
+    fn from(cidr: LegacyCidr) -> Self {
+        Self {
+            cidr: cidr.prefix(),
+            name: cidr.contents.name,
+        }
     }
 }
 
@@ -313,10 +376,11 @@ impl<'a> CidrTree<'a> {
         }
     }
 
+    /// The children of the CIDR: the CIDRs whose parent it is, the smallest CIDR that holds them.
     pub fn children(&self) -> impl Iterator<Item = CidrTree<'_>> {
         self.cidrs
             .iter()
-            .filter(move |c| c.parent == Some(self.contents.id))
+            .filter(move |c| c.parent(self.cidrs) == Some(self.contents))
             .map(move |c| CidrTree {
                 cidrs: self.cidrs,
                 contents: c,
@@ -324,20 +388,25 @@ impl<'a> CidrTree<'a> {
     }
 
     pub fn leaves(&self) -> Vec<Cidr> {
-        if !self.cidrs.iter().any(|cidr| cidr.parent == Some(self.id)) {
+        if self.children().next().is_none() {
             vec![self.contents.clone()]
         } else {
             self.children().flat_map(|child| child.leaves()).collect()
         }
     }
 
+    /// Every CIDR of the tree, not only of this subtree.
+    pub fn all(&self) -> &'a [Cidr] {
+        self.cidrs
+    }
+
     /// The prefixes of every CIDR of the tree, not only of this subtree.
     pub fn prefixes(&self) -> Vec<Prefix> {
-        self.cidrs.iter().map(|cidr| cidr.prefix()).collect()
+        self.cidrs.iter().map(|cidr| cidr.cidr).collect()
     }
 
     pub fn ip_net_for(&self, ip: IpAddr) -> Result<IpNet, PrefixLenError> {
-        IpNet::new(ip, self.contents.prefix_len())
+        IpNet::new(ip, self.contents.cidr.prefix_len())
     }
 }
 
@@ -665,10 +734,10 @@ pub struct PeerContents {
     /// The delegations of the peer: the prefixes of its CIDR whose addresses are the peer's,
     /// sorted, no two of which share an address. A lone address is a `/32` or `/128`. A list that
     /// isn't sorted is sorted when it is deserialized, and one with two delegations that share an
-    /// address fails to deserialize. A peer may have no delegation at all.
+    /// address fails to deserialize. A peer may have no delegation at all. The CIDR of the peer
+    /// is that of its delegations, as [`Self::cidr`] finds it.
     #[serde(deserialize_with = "deserialize_delegations")]
     pub delegations: Vec<Prefix>,
-    pub cidr_id: i64,
     #[serde(deserialize_with = "deserialize_public_key")]
     pub public_key: String,
     pub endpoint: Option<Endpoint>,
@@ -719,6 +788,14 @@ impl PeerContents {
             .map(Prefix::to_string)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The CIDR of the peer among `cidrs`: the smallest that holds every delegation of the peer,
+    /// or `None` for a peer without a delegation, which has no CIDR.
+    pub fn cidr<'a>(&self, cidrs: &'a [Cidr]) -> Option<&'a Cidr> {
+        let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.cidr).collect();
+        let cidr = cidr_of_delegations(&self.delegations, &prefixes)?;
+        cidrs.iter().find(|candidate| candidate.cidr == cidr)
     }
 
     /// The prefixes that WireGuard routes to the peer: its delegations.
@@ -915,15 +992,16 @@ pub struct LegacyPeerContents {
 }
 
 impl LegacyPeerContents {
-    /// `peer` as clients that predate TLS know it, with its hosts fallback address as its IP, or
-    /// `None` if they can't represent it: a peer without a name or without a hosts fallback
-    /// address. The other addresses of its delegations are left out.
-    pub fn from_peer(peer: &PeerContents) -> Option<Self> {
+    /// `peer` as clients that predate TLS know it, with its hosts fallback address as its IP, and
+    /// `cidr_id` as the ID of its CIDR, or `None` if they can't represent it: a peer without a
+    /// name or without a hosts fallback address. The other addresses of its delegations are left
+    /// out.
+    pub fn from_peer(peer: &PeerContents, cidr_id: i64) -> Option<Self> {
         peer.name.as_ref()?;
         Some(Self {
             name: peer.name.clone(),
             ip: peer.hosts_fallback()?,
-            cidr_id: peer.cidr_id,
+            cidr_id,
             public_key: peer.public_key.clone(),
             endpoint: peer.endpoint.clone(),
             persistent_keepalive_interval: peer.persistent_keepalive_interval,
@@ -937,12 +1015,12 @@ impl LegacyPeerContents {
 }
 
 impl From<LegacyPeerContents> for PeerContents {
-    /// The peer, with its IP as its only delegation, a host prefix.
+    /// The peer, with its IP as its only delegation, a host prefix, which gives it its CIDR, and
+    /// without the ID of its CIDR.
     fn from(peer: LegacyPeerContents) -> Self {
         Self {
             name: peer.name,
             delegations: vec![Prefix::host(peer.ip)],
-            cidr_id: peer.cidr_id,
             public_key: peer.public_key,
             endpoint: peer.endpoint,
             persistent_keepalive_interval: peer.persistent_keepalive_interval,
@@ -1183,8 +1261,8 @@ impl From<PeerDiff<'_>> for PeerConfigBuilder {
 /// This model is sent as a response to the /state endpoint, and is meant
 /// to include all the data a client needs to update its WireGuard interface.
 ///
-/// The API of TLS sessions sends the peers without IDs. A state that a server sends in plain HTTP,
-/// as [`LegacyState`], converts into this form, without the IDs.
+/// The API of TLS sessions sends the peers and the CIDRs without IDs. A state that a server sends
+/// in plain HTTP, as [`LegacyState`], converts into this form, without the IDs.
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     /// This list will be only the peers visible to the user requesting this
@@ -1222,12 +1300,12 @@ impl<'de> Deserialize<'de> for State {
     }
 }
 
-/// The state that the API of plain-HTTP sessions sends, in which each peer has the ID that
-/// clients that predate TLS expect.
+/// The state that the API of plain-HTTP sessions sends, in which each peer and each CIDR has the
+/// ID that clients that predate TLS expect.
 #[derive(Debug, Clone, Serialize)]
 pub struct LegacyState {
     pub peers: Vec<LegacyPeer>,
-    pub cidrs: Vec<Cidr>,
+    pub cidrs: Vec<LegacyCidr>,
 
     /// The public keys of the peers that failed to deserialize, as in [`State`]. It is never
     /// sent.
@@ -1242,7 +1320,7 @@ impl<'de> Deserialize<'de> for LegacyState {
         #[derive(Deserialize)]
         struct Fields {
             peers: Vec<MaybePeer<LegacyPeer>>,
-            cidrs: Vec<Cidr>,
+            cidrs: Vec<LegacyCidr>,
         }
 
         let Fields { peers, cidrs } = Fields::deserialize(deserializer)?;
@@ -1256,15 +1334,23 @@ impl<'de> Deserialize<'de> for LegacyState {
 }
 
 impl From<LegacyState> for State {
-    /// The state without the IDs of the peers.
+    /// The state without the IDs of the peers and the CIDRs. Of two CIDRs with the same prefix,
+    /// as a server that predates TLS may hold if their addresses have host bits set, the first is
+    /// kept.
     fn from(state: LegacyState) -> Self {
+        let mut cidrs: Vec<Cidr> = vec![];
+        for cidr in state.cidrs.into_iter().map(Cidr::from) {
+            if !cidrs.iter().any(|kept| kept.cidr == cidr.cidr) {
+                cidrs.push(cidr);
+            }
+        }
         Self {
             peers: state
                 .peers
                 .into_iter()
                 .map(|peer| peer.contents.into())
                 .collect(),
-            cidrs: state.cidrs,
+            cidrs,
             invalid_peer_keys: state.invalid_peer_keys,
         }
     }
@@ -1448,7 +1534,6 @@ mod tests {
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec![Prefix::host(ip)],
-            cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
             persistent_keepalive_interval: None,
@@ -1480,7 +1565,6 @@ mod tests {
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec![Prefix::host(ip)],
-            cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
             persistent_keepalive_interval: Some(15),
@@ -1512,7 +1596,6 @@ mod tests {
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec![Prefix::host(ip)],
-            cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: Some("1.1.1.1:1111".parse().unwrap()),
             persistent_keepalive_interval: None,
@@ -1554,7 +1637,6 @@ mod tests {
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec!["10.0.0.1/32".parse().unwrap()],
-            cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: Some("1.1.1.1:1111".parse().unwrap()),
             persistent_keepalive_interval: None,
@@ -1616,7 +1698,6 @@ mod tests {
             serde_json::from_value::<PeerContents>(serde_json::json!({
                 "name": name,
                 "delegations": ["10.0.0.1/32"],
-                "cidr_id": 1,
                 "public_key": PUBKEY,
                 "endpoint": null,
                 "persistent_keepalive_interval": null,
@@ -1671,7 +1752,6 @@ mod tests {
         let peer = serde_json::json!({
             "name": "peer\n10.0.0.1 example.com",
             "delegations": ["10.0.0.1/32"],
-            "cidr_id": 1,
             "public_key": PUBKEY,
             "endpoint": null,
             "persistent_keepalive_interval": null,
@@ -1693,7 +1773,6 @@ mod tests {
         PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: delegations.iter().map(|d| d.parse().unwrap()).collect(),
-            cidr_id: 1,
             public_key: "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=".to_owned(),
             endpoint: None,
             persistent_keepalive_interval: None,
@@ -1748,9 +1827,10 @@ mod tests {
         assert_eq!(without.hosts_fallback(), None);
         assert_eq!(without.display_address(), "[no delegation]");
         assert!(without.allowed_ips().is_empty());
-        assert!(LegacyPeerContents::from_peer(&without).is_none());
-        let legacy = LegacyPeerContents::from_peer(&peer).unwrap();
+        assert!(LegacyPeerContents::from_peer(&without, 1).is_none());
+        let legacy = LegacyPeerContents::from_peer(&peer, 1).unwrap();
         assert_eq!(legacy.ip.to_string(), "10.0.0.7");
+        assert_eq!(legacy.cidr_id, 1);
         assert_eq!(
             PeerContents::from(legacy).delegations,
             ["10.0.0.7/32".parse::<Prefix>().unwrap()]
@@ -1843,10 +1923,103 @@ mod tests {
             ["10.0.0.1/32".parse::<Prefix>().unwrap()]
         );
         assert_eq!(state.invalid_peer_keys, [INVALID_KEY]);
-        assert!(LegacyPeerContents::from_peer(&PeerContents {
-            name: None,
-            ..state.peers[0].clone()
-        })
+        assert!(LegacyPeerContents::from_peer(
+            &PeerContents {
+                name: None,
+                ..state.peers[0].clone()
+            },
+            1
+        )
         .is_none());
+    }
+
+    #[test]
+    fn test_legacy_cidrs() {
+        // A state that a server sends in plain HTTP names CIDRs and their parents by ID, and
+        // converts into one whose CIDRs are known by their prefixes: a CIDR whose address has
+        // host bits set by the prefix of its network, and of two with the same prefix, the first.
+        let cidr = |id: i64, name: &str, cidr: &str, parent: Option<i64>| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "cidr": cidr,
+                "parent": parent,
+            })
+        };
+        let state: LegacyState = serde_json::from_value(serde_json::json!({
+            "peers": [],
+            "cidrs": [
+                cidr(1, "root", "10.0.0.0/16", None),
+                cidr(2, "users", "10.0.1.5/24", Some(1)),
+                cidr(3, "again", "10.0.1.0/24", Some(1)),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(state.cidrs[1].contents.parent, Some(1));
+        let state = State::from(state);
+        let prefix = |prefix: &str| prefix.parse::<Prefix>().unwrap();
+        assert_eq!(
+            state.cidrs,
+            [
+                Cidr {
+                    name: "root".into(),
+                    cidr: prefix("10.0.0.0/16")
+                },
+                Cidr {
+                    name: "users".into(),
+                    cidr: prefix("10.0.1.0/24")
+                },
+            ]
+        );
+
+        // Over TLS, a CIDR has no ID nor parent, and its prefix must be aligned.
+        let tls = serde_json::to_value(&state.cidrs[1]).unwrap();
+        assert_eq!(
+            tls,
+            serde_json::json!({ "name": "users", "cidr": "10.0.1.0/24" })
+        );
+        assert!(serde_json::from_value::<Cidr>(
+            serde_json::json!({ "name": "users", "cidr": "10.0.1.5/24" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_cidrs_and_peers_by_prefix() {
+        let cidr = |name: &str, cidr: &str| Cidr {
+            name: name.into(),
+            cidr: cidr.parse().unwrap(),
+        };
+        let cidrs = [
+            cidr("users", "10.0.1.0/24"),
+            cidr("root", "10.0.0.0/16"),
+            cidr("admins", "10.0.1.0/26"),
+            cidr("other", "10.0.2.0/24"),
+        ];
+
+        // The parent of a CIDR is the smallest other CIDR that holds it.
+        assert_eq!(cidrs[0].parent(&cidrs), Some(&cidrs[1]));
+        assert_eq!(cidrs[1].parent(&cidrs), None);
+        assert_eq!(cidrs[2].parent(&cidrs), Some(&cidrs[0]));
+        let tree = CidrTree::new(&cidrs);
+        assert_eq!(tree.name, "root");
+        let children: Vec<_> = tree.children().map(|child| child.name.clone()).collect();
+        assert_eq!(children, ["users", "other"]);
+        let leaves: Vec<_> = tree.leaves().into_iter().map(|leaf| leaf.name).collect();
+        assert_eq!(leaves, ["admins", "other"]);
+
+        // The CIDR of a peer is that of its delegations, and a peer without one has none.
+        assert_eq!(peer_with(&["10.0.1.7/32"]).cidr(&cidrs), Some(&cidrs[2]));
+        assert_eq!(peer_with(&["10.0.1.70/32"]).cidr(&cidrs), Some(&cidrs[0]));
+        assert_eq!(peer_with(&[]).cidr(&cidrs), None);
+
+        // An association is the same in either order.
+        let association = Association {
+            cidr_1: cidrs[0].cidr,
+            cidr_2: cidrs[3].cidr,
+        };
+        assert!(association.associates(&cidrs[3].cidr, &cidrs[0].cidr));
+        assert!(!association.associates(&cidrs[3].cidr, &cidrs[1].cidr));
+        assert_eq!(association.api_path(), "10.0.1.0_24/10.0.2.0_24");
     }
 }

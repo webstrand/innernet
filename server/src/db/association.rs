@@ -4,241 +4,191 @@
 
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_node::store::{self, ip_to_bytes};
-use innernet_shared::{Association, AssociationContents, Prefix};
+use innernet_node::store::{ip_to_bytes, prefix_from_row};
+use innernet_shared::{Association, Prefix};
 use rusqlite::{params, Connection};
-use std::ops::{Deref, DerefMut};
 
-#[derive(Debug)]
+/// An association of two CIDRs, whose peers see each other's. `cidr_1` is the lower of the two
+/// prefixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseAssociation {
-    pub inner: Association,
-}
-
-impl From<Association> for DatabaseAssociation {
-    fn from(inner: Association) -> Self {
-        Self { inner }
-    }
-}
-
-impl Deref for DatabaseAssociation {
-    type Target = Association;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for DatabaseAssociation {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
+    pub cidr_1: Prefix,
+    pub cidr_2: Prefix,
 }
 
 impl DatabaseAssociation {
-    pub fn create(
-        conn: &Connection,
-        contents: AssociationContents,
-    ) -> Result<Association, ServerError> {
-        let AssociationContents {
-            cidr_id_1,
-            cidr_id_2,
-        } = &contents;
-        let cidrs = DatabaseCidr::list(conn)?;
-        let prefix_of = |id: &i64| {
-            cidrs
-                .iter()
-                .find(|cidr| cidr.id == *id)
-                .and_then(|cidr| Prefix::new(cidr.cidr).ok())
-                .ok_or(ServerError::InvalidQuery)
-        };
-        let (a, b) = (prefix_of(cidr_id_1)?, prefix_of(cidr_id_2)?);
-        let (prefix_1, prefix_2) = (a.min(b), a.max(b));
-        if prefix_1 == prefix_2 {
-            log::warn!("tried to associate the CIDR {prefix_1} with itself.");
+    /// The association as the API of TLS sessions transfers it.
+    pub fn contents(&self) -> Association {
+        Association {
+            cidr_1: self.cidr_1,
+            cidr_2: self.cidr_2,
+        }
+    }
+
+    /// Associates the CIDRs `a` and `b`, which must be two CIDRs that no association names yet,
+    /// in either order.
+    pub fn create(conn: &Connection, a: Prefix, b: Prefix) -> Result<Self, ServerError> {
+        let (cidr_1, cidr_2) = (a.min(b), a.max(b));
+        if cidr_1 == cidr_2 {
+            log::warn!("tried to associate the CIDR {cidr_1} with itself.");
             return Err(ServerError::InvalidQuery);
         }
-
+        for prefix in [cidr_1, cidr_2] {
+            if matches!(DatabaseCidr::get(conn, &prefix), Err(ServerError::NotFound)) {
+                log::warn!("tried to associate the CIDR {prefix}, which doesn't exist.");
+                return Err(ServerError::InvalidQuery);
+            }
+        }
         // An existing association of the two refuses the new one.
         conn.execute(
             "INSERT INTO associations (address_1, prefix_len_1, address_2, prefix_len_2)
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                ip_to_bytes(prefix_1.first()),
-                prefix_1.prefix_len(),
-                ip_to_bytes(prefix_2.first()),
-                prefix_2.prefix_len()
+                ip_to_bytes(cidr_1.first()),
+                cidr_1.prefix_len(),
+                ip_to_bytes(cidr_2.first()),
+                cidr_2.prefix_len()
             ],
         )?;
-        let id = Self::list(conn)?
-            .iter()
-            .find(|association| {
-                let pair = (association.cidr_id_1, association.cidr_id_2);
-                pair == (*cidr_id_1, *cidr_id_2) || pair == (*cidr_id_2, *cidr_id_1)
-            })
-            .map(|association| association.id)
-            .ok_or(ServerError::NotFound)?;
-        Ok(Association { id, contents })
+        Ok(Self { cidr_1, cidr_2 })
     }
 
-    pub fn delete(conn: &Connection, id: i64) -> Result<(), ServerError> {
-        let (prefix_1, prefix_2) = Self::stored(conn)?
-            .into_iter()
-            .zip(1..)
-            .find(|(_, position)| *position == id)
-            .map(|(pair, _)| pair)
-            .ok_or(ServerError::NotFound)?;
-        conn.execute(
-            "DELETE FROM associations
-             WHERE address_1 = ?1 AND prefix_len_1 = ?2 AND address_2 = ?3 AND prefix_len_2 = ?4",
+    /// Deletes the association of the CIDRs `a` and `b`, in either order, or refuses with
+    /// [`ServerError::NotFound`] if there is none.
+    pub fn delete(conn: &Connection, a: &Prefix, b: &Prefix) -> Result<(), ServerError> {
+        let (cidr_1, cidr_2) = (a.min(b), a.max(b));
+        let deleted = conn.execute(
+            "DELETE FROM associations WHERE address_1 = ?1 AND prefix_len_1 = ?2
+               AND address_2 = ?3 AND prefix_len_2 = ?4",
             params![
-                ip_to_bytes(prefix_1.first()),
-                prefix_1.prefix_len(),
-                ip_to_bytes(prefix_2.first()),
-                prefix_2.prefix_len()
+                ip_to_bytes(cidr_1.first()),
+                cidr_1.prefix_len(),
+                ip_to_bytes(cidr_2.first()),
+                cidr_2.prefix_len()
             ],
         )?;
-        Ok(())
+        match deleted {
+            0 => Err(ServerError::NotFound),
+            _ => Ok(()),
+        }
     }
 
-    /// The associations, each as its pair of prefixes, ordered by its CIDRs.
-    fn stored(conn: &Connection) -> Result<Vec<(Prefix, Prefix)>, ServerError> {
+    /// Every association, ordered by its CIDRs.
+    pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
         let mut stmt = conn.prepare_cached(
             "SELECT address_1, prefix_len_1, address_2, prefix_len_2 FROM associations
              ORDER BY length(address_1), address_1, prefix_len_1,
                       length(address_2), address_2, prefix_len_2",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut stored = vec![];
-        while let Some(row) = rows.next()? {
-            stored.push((
-                store::prefix_from_row(row.get(0)?, row.get(1)?)?,
-                store::prefix_from_row(row.get(2)?, row.get(3)?)?,
-            ));
-        }
-        Ok(stored)
-    }
-
-    /// The associations, numbered from 1 in the order of their CIDRs, as the API of plain HTTP
-    /// names them, each with the CIDRs that it joins by their IDs.
-    pub fn list(conn: &Connection) -> Result<Vec<Association>, ServerError> {
-        let cidrs = DatabaseCidr::list(conn)?;
-        let id_of = |prefix: &Prefix| {
-            cidrs
-                .iter()
-                .find(|cidr| cidr.cidr == prefix.net())
-                .map(|cidr| cidr.id)
-                .unwrap_or(0)
-        };
-        Ok(Self::stored(conn)?
-            .into_iter()
-            .zip(1..)
-            .map(|((prefix_1, prefix_2), id)| Association {
-                id,
-                contents: AssociationContents {
-                    cidr_id_1: id_of(&prefix_1),
-                    cidr_id_2: id_of(&prefix_2),
-                },
+        let associations = stmt.query_map(params![], |row| {
+            Ok(Self {
+                cidr_1: prefix_from_row(row.get(0)?, row.get(1)?)?,
+                cidr_2: prefix_from_row(row.get(2)?, row.get(3)?)?,
             })
-            .collect())
+        })?;
+        Ok(associations.collect::<Result<Vec<_>, rusqlite::Error>>()?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::test;
-    use innernet_shared::{CidrContents, Error};
+    use hyper::StatusCode;
+    use innernet_shared::Error;
 
     use super::*;
 
     #[tokio::test]
-    async fn test_double_add() -> Result<(), Error> {
+    async fn test_associations_by_prefix_over_tls() -> Result<(), Error> {
+        // A TLS session names associations by the prefixes of their CIDRs, in either order.
         let server = test::Server::new()?;
-
-        let contents = AssociationContents {
-            cidr_id_1: 1,
-            cidr_id_2: 2,
+        let developer: Prefix = test::DEVELOPER_CIDR.parse()?;
+        let user: Prefix = test::USER_CIDR.parse()?;
+        let association = Association {
+            cidr_1: user,
+            cidr_2: developer,
         };
-        let contents_flipped = AssociationContents {
-            cidr_id_1: 2,
-            cidr_id_2: 1,
-        };
-        let res = server
-            .form_request(
+        let post = |association: serde_json::Value| {
+            server.form_request(
                 test::ADMIN_PEER_IP,
                 "POST",
                 "/v1/admin/associations",
-                &contents,
+                association,
             )
-            .await;
-        assert!(res.status().is_success());
-
-        let res = server
-            .form_request(
-                test::ADMIN_PEER_IP,
-                "POST",
-                "/v1/admin/associations",
-                &contents,
-            )
-            .await;
+        };
+        let res = post(serde_json::to_value(association)?).await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let flipped = Association {
+            cidr_1: developer,
+            cidr_2: user,
+        };
+        let res = post(serde_json::to_value(flipped)?).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // IDs aren't understood.
+        let res = post(serde_json::json!({ "cidr_id_1": 1, "cidr_id_2": 2 })).await;
         assert!(res.status().is_client_error());
 
         let res = server
-            .form_request(
-                test::ADMIN_PEER_IP,
-                "POST",
-                "/v1/admin/associations",
-                &contents_flipped,
-            )
+            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/associations")
             .await;
-        assert!(res.status().is_client_error());
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let listed: Vec<Association> = serde_json::from_slice(&body)?;
+        assert_eq!(listed, [flipped]);
+
+        // A deletion names the CIDRs in either order, and an unknown association is not found.
+        let path = format!("/v1/admin/associations/{}", association.api_path());
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        // A path that names no pair of prefixes is no route of the server.
+        for path in [
+            "/v1/admin/associations/1",
+            &format!("/v1/admin/associations/{}", user.api_path_segment()),
+            &format!(
+                "/v1/admin/associations/{}/{}/x",
+                user.api_path_segment(),
+                developer.api_path_segment()
+            ),
+        ] {
+            let res = server.request(test::ADMIN_PEER_IP, "DELETE", path).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_nonexistent_cidr_id() -> Result<(), Error> {
+    #[test]
+    fn test_associations_name_two_cidrs_once() -> Result<(), Error> {
         let server = test::Server::new()?;
+        let store = server.db.lock();
+        let developer: Prefix = test::DEVELOPER_CIDR.parse()?;
+        let user: Prefix = test::USER_CIDR.parse()?;
 
-        // Verify both provided CIDR IDs exist
-        let last_cidr_id: i64 =
-            server
-                .db()
-                .lock()
-                .query_row("SELECT COUNT(*) FROM cidrs", params![], |r| r.get(0))?;
-        let contents = AssociationContents {
-            cidr_id_1: 1,
-            cidr_id_2: last_cidr_id + 1,
-        };
-        let res = server
-            .form_request(
-                test::ADMIN_PEER_IP,
-                "POST",
-                "/v1/admin/associations",
-                &contents,
-            )
-            .await;
-        assert!(!res.status().is_success());
+        // A pair is held once, the lower prefix first, whichever order names it.
+        let created = DatabaseAssociation::create(&store, user, developer)?;
+        assert_eq!((created.cidr_1, created.cidr_2), (developer, user));
+        assert!(DatabaseAssociation::create(&store, developer, user).is_err());
+        assert!(DatabaseAssociation::create(&store, user, user).is_err());
+        let absent: Prefix = test::EXPERIMENTAL_CIDR.parse()?;
+        assert!(DatabaseAssociation::create(&store, absent, user).is_err());
+        assert_eq!(
+            DatabaseAssociation::list(&store)?,
+            std::slice::from_ref(&created)
+        );
 
-        let cidr = CidrContents {
-            name: "experimental".to_string(),
-            cidr: test::EXPERIMENTAL_CIDR.parse()?,
-            parent: Some(test::ROOT_CIDR_ID),
-        };
+        // The association is deleted, and then no longer found.
+        DatabaseAssociation::delete(&store, &user, &developer)?;
+        assert!(matches!(
+            DatabaseAssociation::delete(&store, &user, &developer),
+            Err(ServerError::NotFound)
+        ));
 
-        let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", &cidr)
-            .await;
-        assert!(res.status().is_success());
-
-        let res = server
-            .form_request(
-                test::ADMIN_PEER_IP,
-                "POST",
-                "/v1/admin/associations",
-                &contents,
-            )
-            .await;
-        assert!(res.status().is_success());
-
+        // A CIDR that an association names can't be deleted.
+        let experimental = DatabaseCidr::create(&store, "experimental".into(), absent)?;
+        let association = DatabaseAssociation::create(&store, experimental.prefix, developer)?;
+        assert!(DatabaseCidr::delete(&store, &absent).is_err());
+        DatabaseAssociation::delete(&store, &association.cidr_1, &association.cidr_2)?;
+        DatabaseCidr::delete(&store, &absent)?;
         Ok(())
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::interface::interface_is_up;
 pub use innernet_shared::{
-    interface_config::Invitation, Cidr, CidrContents, CidrTree, Endpoint, HostsOpts, LegacyPeer,
+    interface_config::Invitation, Association, Cidr, CidrTree, Endpoint, HostsOpts, LegacyPeer,
     NatOpts, NetworkOpts, PeerContents, WrappedIoError,
 };
 pub use wireguard_control::Backend;

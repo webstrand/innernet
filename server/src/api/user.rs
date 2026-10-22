@@ -59,22 +59,24 @@ mod handlers {
     /// This endpoint returns the visible CIDRs and Peers, providing all the necessary
     /// information for the peer to create connections to all of them.
     ///
-    /// A TLS session gets the peers without IDs. A plain-HTTP session, that of a client that
-    /// predates TLS, gets each with an ID, as [`DatabasePeer::plain_http_ids`] numbers them,
-    /// without the peers that have no name, which such clients can't read. Such a client takes a
-    /// peer that it no longer sees for disabled.
+    /// A TLS session gets the peers and the CIDRs without IDs. A plain-HTTP session, that of a
+    /// client that predates TLS, gets each peer with an ID, as [`DatabasePeer::plain_http_ids`]
+    /// numbers them, and the ID of its CIDR, without the peers that have no name, which such
+    /// clients can't read, and each CIDR with an ID and the ID of its parent, as
+    /// [`DatabaseCidr::id_of`] numbers them. Such a client takes a peer that it no longer sees for
+    /// disabled.
     pub async fn state(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let selected_peer = session.peer.reload(&conn)?;
 
-        let cidrs: Vec<_> = DatabaseCidr::list(&conn)?;
+        let cidrs = DatabaseCidr::list(&conn)?;
 
         let mut peers = selected_peer.get_all_allowed_peers(&conn)?;
         inject_endpoints(&session, peers.iter_mut().map(|peer| &mut peer.inner));
         if session.over_tls {
             json_response(State {
                 peers: peers.into_iter().map(|peer| peer.inner).collect(),
-                cidrs,
+                cidrs: cidrs.iter().map(DatabaseCidr::contents).collect(),
                 invalid_peer_keys: vec![],
             })
         } else {
@@ -82,9 +84,9 @@ mod handlers {
             json_response(LegacyState {
                 peers: peers
                     .iter()
-                    .filter_map(|peer| peer.legacy(ids[&peer.public_key]))
+                    .filter_map(|peer| peer.legacy(ids[&peer.public_key], &cidrs))
                     .collect(),
-                cidrs,
+                cidrs: cidrs.iter().map(|cidr| cidr.legacy(&cidrs)).collect(),
                 invalid_peer_keys: vec![],
             })
         }
@@ -170,8 +172,7 @@ mod tests {
     use crate::{db::DatabaseAssociation, test};
     use bytes::Buf;
     use innernet_shared::{
-        AssociationContents, CidrContents, Endpoint, EndpointContents, Error, LegacyPeer,
-        PeerContents,
+        Endpoint, EndpointContents, Error, LegacyPeer, LegacyState, PeerContents,
     };
 
     #[tokio::test]
@@ -217,6 +218,7 @@ mod tests {
         let peers = peers_of(res).await;
         assert_eq!(peers.len(), 3);
         assert!(peers.iter().all(|peer| peer.get("id").is_none()));
+        assert!(peers.iter().all(|peer| peer.get("cidr_id").is_none()));
 
         // A plain-HTTP session gets them with the IDs that the server names them by.
         let res = server
@@ -227,6 +229,29 @@ mod tests {
         let ids = DatabasePeer::plain_http_ids(&server.db().lock())?;
         for peer in peers {
             assert_eq!(peer.id, ids[&peer.public_key]);
+        }
+
+        // So do the CIDRs, each with the ID of its parent, and each peer with the ID of its CIDR.
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let state: LegacyState = serde_json::from_slice(&body)?;
+        let developer = state
+            .cidrs
+            .iter()
+            .find(|cidr| cidr.name == "developer")
+            .unwrap();
+        assert_eq!(developer.id, test::DEVELOPER_CIDR_ID);
+        assert_eq!(developer.parent, Some(test::ROOT_CIDR_ID));
+        let server_peer = test::peer(&server.db().lock(), test::SERVER_PEER_ID);
+        for peer in &state.peers {
+            let cidr_id = if peer.public_key == server_peer.public_key {
+                test::INFRA_CIDR_ID
+            } else {
+                test::DEVELOPER_CIDR_ID
+            };
+            assert_eq!(peer.cidr_id, cidr_id, "{}", peer.public_key);
         }
         Ok(())
     }
@@ -262,14 +287,15 @@ mod tests {
             .find(|peer| peer.public_key == developer2.public_key)
             .unwrap();
         assert!(listed.delegations.is_empty());
+        let cidrs = DatabaseCidr::list(&server.db().lock())?;
         assert!(test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID)
-            .legacy(1)
+            .legacy(1, &cidrs)
             .is_some());
         let without = DatabasePeer::get_from_public_key(
             &server.db().lock(),
             &wireguard_control::Key::from_base64(&developer2.public_key)?,
         )?;
-        assert!(without.legacy(1).is_none());
+        assert!(without.legacy(1, &cidrs).is_none());
         Ok(())
     }
 
@@ -338,45 +364,23 @@ mod tests {
             let db = server.db.lock();
             let cidr = DatabaseCidr::create(
                 &db,
-                CidrContents {
-                    name: "experiment cidr".to_string(),
-                    cidr: test::EXPERIMENTAL_CIDR.parse()?,
-                    parent: Some(test::ROOT_CIDR_ID),
-                },
+                "experiment cidr".to_string(),
+                test::EXPERIMENTAL_CIDR.parse()?,
             )?;
-            let subcidr = DatabaseCidr::create(
+            DatabaseCidr::create(
                 &db,
-                CidrContents {
-                    name: "experiment subcidr".to_string(),
-                    cidr: test::EXPERIMENTAL_SUBCIDR.parse()?,
-                    parent: Some(cidr.id),
-                },
+                "experiment subcidr".to_string(),
+                test::EXPERIMENTAL_SUBCIDR.parse()?,
             )?;
+            // The peer's CIDR is the subcidr, which holds its IP.
             DatabasePeer::create(
                 &db,
-                test::peer_contents(
-                    "experiment-peer",
-                    test::EXPERIMENT_SUBCIDR_PEER_IP,
-                    subcidr.id,
-                    false,
-                )?,
+                test::peer_contents("experiment-peer", test::EXPERIMENT_SUBCIDR_PEER_IP, false)?,
             )?;
 
             // Add a peering between the developer's CIDR and the experimental *parent* cidr.
-            DatabaseAssociation::create(
-                &db,
-                AssociationContents {
-                    cidr_id_1: test::DEVELOPER_CIDR_ID,
-                    cidr_id_2: cidr.id,
-                },
-            )?;
-            DatabaseAssociation::create(
-                &db,
-                AssociationContents {
-                    cidr_id_1: test::INFRA_CIDR_ID,
-                    cidr_id_2: cidr.id,
-                },
-            )?;
+            DatabaseAssociation::create(&db, test::DEVELOPER_CIDR.parse()?, cidr.prefix)?;
+            DatabaseAssociation::create(&db, test::SERVER_CIDR.parse()?, cidr.prefix)?;
         }
 
         for ip in &[test::DEVELOPER1_PEER_IP, test::EXPERIMENT_SUBCIDR_PEER_IP] {
@@ -408,21 +412,14 @@ mod tests {
     async fn test_redeem() -> Result<(), Error> {
         let server = test::Server::new()?;
 
-        let experimental_cidr = DatabaseCidr::create(
+        DatabaseCidr::create(
             &server.db().lock(),
-            CidrContents {
-                name: "experimental".to_string(),
-                cidr: test::EXPERIMENTAL_CIDR.parse()?,
-                parent: Some(test::ROOT_CIDR_ID),
-            },
+            "experimental".to_string(),
+            test::EXPERIMENTAL_CIDR.parse()?,
         )?;
 
-        let mut peer_contents = test::peer_contents(
-            "experiment-peer",
-            test::EXPERIMENT_SUBCIDR_PEER_IP,
-            experimental_cidr.id,
-            false,
-        )?;
+        let mut peer_contents =
+            test::peer_contents("experiment-peer", test::EXPERIMENT_SUBCIDR_PEER_IP, false)?;
         peer_contents.is_redeemed = false;
         peer_contents.invite_expires = Some(SystemTime::now() + Duration::from_secs(100));
         let _experiment_peer = DatabasePeer::create(&server.db().lock(), peer_contents)?;
@@ -470,21 +467,14 @@ mod tests {
     async fn test_redeem_expired() -> Result<(), Error> {
         let server = test::Server::new()?;
 
-        let experimental_cidr = DatabaseCidr::create(
+        DatabaseCidr::create(
             &server.db().lock(),
-            CidrContents {
-                name: "experimental".to_string(),
-                cidr: test::EXPERIMENTAL_CIDR.parse()?,
-                parent: Some(test::ROOT_CIDR_ID),
-            },
+            "experimental".to_string(),
+            test::EXPERIMENTAL_CIDR.parse()?,
         )?;
 
-        let mut peer_contents = test::peer_contents(
-            "experiment-peer",
-            test::EXPERIMENT_SUBCIDR_PEER_IP,
-            experimental_cidr.id,
-            false,
-        )?;
+        let mut peer_contents =
+            test::peer_contents("experiment-peer", test::EXPERIMENT_SUBCIDR_PEER_IP, false)?;
         peer_contents.is_redeemed = false;
         peer_contents.invite_expires = Some(SystemTime::now() - Duration::from_secs(1));
         let _experiment_peer = DatabasePeer::create(&server.db().lock(), peer_contents)?;
@@ -525,12 +515,7 @@ mod tests {
         let server = test::Server::new()?;
         let (user_ip, admin_ip) = new_user_and_admin_ips();
         for (name, ip, is_admin) in [("new-user", user_ip, false), ("new-admin", admin_ip, true)] {
-            let cidr_id = if is_admin {
-                test::ADMIN_CIDR_ID
-            } else {
-                test::USER_CIDR_ID
-            };
-            let mut contents = test::peer_contents(name, ip, cidr_id, is_admin)?;
+            let mut contents = test::peer_contents(name, ip, is_admin)?;
             contents.is_redeemed = false;
             DatabasePeer::create(&server.db().lock(), contents)?;
 

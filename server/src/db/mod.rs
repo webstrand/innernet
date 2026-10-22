@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use innernet_node::{
     db::{self as node_db, CreateHook, APPLICATION_ID, SCHEMA_VERSION},
-    store::{self, key_to_bytes, StoredCidr},
+    store::{self, key_to_bytes},
     Store,
 };
 use innernet_shared::{
@@ -135,13 +135,14 @@ fn rebuild(
             let prefix = Prefix::new(IpNet::new(ip, prefix_len)?.trunc())
                 .map_err(|e| anyhow!("CIDR {id}: {e}"))?;
             cidrs.push((id, prefix, row.get(4)?));
-            store::insert_cidr(
-                &tx,
-                &StoredCidr {
-                    prefix,
+            tx.execute(
+                "INSERT INTO cidrs (address, prefix_len, name, infra) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    store::ip_to_bytes(prefix.first()),
+                    prefix.prefix_len(),
                     name,
-                    infra: id == ORIGIN_INFRA_CIDR_ID,
-                },
+                    id == ORIGIN_INFRA_CIDR_ID
+                ],
             )?;
         }
     }
@@ -257,7 +258,6 @@ fn rebuild(
                     .map_err(|_| anyhow!("peer {id} has an invalid name"))?,
             ),
             delegations: vec![Prefix::host(ip)],
-            cidr_id,
             public_key: public_key.clone(),
             endpoint,
             persistent_keepalive_interval: Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS),
@@ -419,33 +419,28 @@ mod tests {
 
         // The infra CIDR is marked, and a CIDR whose address has host bits set is the prefix of
         // its network.
-        let cidrs = store::load_cidrs(&store).unwrap();
-        let infra: Vec<&str> = cidrs
-            .iter()
-            .filter(|cidr| cidr.infra)
-            .map(|cidr| cidr.name.as_str())
-            .collect();
-        assert_eq!(infra, ["innernet-server"]);
+        assert_eq!(
+            DatabaseCidr::infra(&store).unwrap(),
+            ["10.0.0.1/32".parse().unwrap()]
+        );
+        let cidrs = DatabaseCidr::list(&store).unwrap();
         assert_eq!(cidrs[3].name, "loose");
         assert_eq!(cidrs[3].prefix, "10.0.2.0/24".parse().unwrap());
 
         // The association joins the CIDRs that it joined, the lower first, and the association of
         // a CIDR with itself and the second one of the same CIDRs are dropped.
-        let associations: Vec<String> = store
-            .prepare("SELECT hex(address_1), prefix_len_1, hex(address_2) FROM associations")
+        let associations: Vec<(Prefix, Prefix)> = DatabaseAssociation::list(&store)
             .unwrap()
-            .query_map([], |r| {
-                Ok(format!(
-                    "{}/{} {}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?
-                ))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(associations, ["0A000001/32 0A000100"]);
+            .iter()
+            .map(|association| (association.cidr_1, association.cidr_2))
+            .collect();
+        assert_eq!(
+            associations,
+            [(
+                "10.0.0.1/32".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap()
+            )]
+        );
 
         // The copy is the database of 2.0.0, and opening again changes nothing.
         let copy = Connection::open(dir.path().join("wg0.db.v2.0.0")).unwrap();

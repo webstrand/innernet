@@ -6,7 +6,8 @@ use crate::{
 };
 use anyhow::anyhow;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
-use innernet_shared::{Cidr, CidrContents, Error, PeerContents, Prefix};
+use innernet_node::Store;
+use innernet_shared::{Error, LegacyPeerContents, PeerContents, Prefix};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
@@ -63,11 +64,22 @@ mod v6 {
 #[cfg(feature = "v6-test")]
 pub use v6::*;
 
+// The IDs by which the API of plain-HTTP sessions names the CIDRs, their positions in the order
+// of their prefixes, as [`DatabaseCidr::id_of`] numbers them. The database stores no such ID.
 pub const ROOT_CIDR_ID: i64 = 1;
 pub const INFRA_CIDR_ID: i64 = 2;
 pub const ADMIN_CIDR_ID: i64 = 3;
 pub const DEVELOPER_CIDR_ID: i64 = 4;
 pub const USER_CIDR_ID: i64 = 5;
+
+/// The CIDRs of the test database, by ID.
+const CIDR_IDS: [(i64, &str); 5] = [
+    (ROOT_CIDR_ID, ROOT_CIDR),
+    (INFRA_CIDR_ID, SERVER_CIDR),
+    (ADMIN_CIDR_ID, ADMIN_CIDR),
+    (DEVELOPER_CIDR_ID, DEVELOPER_CIDR),
+    (USER_CIDR_ID, USER_CIDR),
+];
 
 // The IDs by which the API of plain-HTTP sessions names the peers, their positions in the order of
 // their IPs, as [`DatabasePeer::plain_http_ids`] numbers them. The database stores no such ID:
@@ -145,12 +157,9 @@ impl Server {
             config.network(),
             &public_key,
         )?;
-        assert_eq!(ADMIN_CIDR_ID, create_cidr(&db, "admin", ADMIN_CIDR)?.id);
+        create_cidr(&db, "admin", ADMIN_CIDR)?;
         DatabasePeer::create(&db, admin_peer_contents("admin", ADMIN_PEER_IP)?)?;
-        assert_eq!(
-            DEVELOPER_CIDR_ID,
-            create_cidr(&db, "developer", DEVELOPER_CIDR)?.id
-        );
+        create_cidr(&db, "developer", DEVELOPER_CIDR)?;
 
         let developer_1 = developer_peer_contents("developer1", DEVELOPER1_PEER_IP)?;
         let developer_1_public_key = developer_1.public_key.clone();
@@ -159,12 +168,17 @@ impl Server {
         let developer_2 = developer_peer_contents("developer2", DEVELOPER2_PEER_IP)?;
         let developer_2_public_key = developer_2.public_key.clone();
         DatabasePeer::create(&db, developer_2)?;
-        assert_eq!(USER_CIDR_ID, create_cidr(&db, "user", USER_CIDR)?.id);
+        create_cidr(&db, "user", USER_CIDR)?;
         DatabasePeer::create(&db, user_peer_contents("user1", USER1_PEER_IP)?)?;
         DatabasePeer::create(&db, user_peer_contents("user2", USER2_PEER_IP)?)?;
         let ids = DatabasePeer::plain_http_ids(&db)?;
         for id in PEER_IDS {
             assert_eq!(ids[&peer(&db, id).public_key], id);
+        }
+        let cidrs = DatabaseCidr::list(&db)?;
+        for (id, prefix) in CIDR_IDS {
+            let cidr = DatabaseCidr::get(&db, &prefix.parse()?)?;
+            assert_eq!(cidr.legacy(&cidrs).id, id);
         }
 
         let db = Arc::new(Mutex::new(db));
@@ -327,16 +341,16 @@ impl Server {
     }
 }
 
-pub fn create_cidr(db: &rusqlite::Connection, name: &str, cidr_str: &str) -> Result<Cidr, Error> {
-    let cidr = DatabaseCidr::create(
-        db,
-        CidrContents {
-            name: name.to_string(),
-            cidr: cidr_str.parse()?,
-            parent: Some(ROOT_CIDR_ID),
-        },
-    )?;
+/// The ID by which the API of plain-HTTP sessions names the CIDR `cidr`.
+pub fn cidr_id(store: &Store, cidr: &DatabaseCidr) -> i64 {
+    cidr.legacy(&DatabaseCidr::list(store).unwrap()).id
+}
 
+/// Creates the CIDR `cidr_str` named `name`, which is to be a child of the root CIDR.
+pub fn create_cidr(db: &Store, name: &str, cidr_str: &str) -> Result<DatabaseCidr, Error> {
+    let cidr = DatabaseCidr::create(db, name.to_string(), cidr_str.parse()?)?;
+    let cidrs = DatabaseCidr::list(db)?;
+    assert_eq!(cidr.legacy(&cidrs).parent, Some(ROOT_CIDR_ID));
     Ok(cidr)
 }
 
@@ -344,18 +358,13 @@ pub fn create_cidr(db: &rusqlite::Connection, name: &str, cidr_str: &str) -> Res
 // Below are helper functions for writing tests.
 //
 
-pub fn peer_contents(
-    name: &str,
-    ip_str: &str,
-    cidr_id: i64,
-    is_admin: bool,
-) -> Result<PeerContents, Error> {
+/// A peer at `ip_str`, whose CIDR is the one that holds it.
+pub fn peer_contents(name: &str, ip_str: &str, is_admin: bool) -> Result<PeerContents, Error> {
     let public_key = KeyPair::generate().public;
 
     Ok(PeerContents {
         name: Some(name.parse().map_err(|e: &str| anyhow!(e))?),
         delegations: vec![Prefix::host(ip_str.parse()?)],
-        cidr_id,
         public_key: public_key.to_base64(),
         is_admin,
         endpoint: None,
@@ -367,18 +376,37 @@ pub fn peer_contents(
     })
 }
 
+/// `contents` as a client that predates TLS sends it in plain HTTP, with the ID of the CIDR of the
+/// test server that holds its address, or 0 if none does.
+pub fn legacy(contents: &PeerContents) -> LegacyPeerContents {
+    // The CIDRs of the test server, children before their parent.
+    let cidrs = [
+        (SERVER_CIDR, INFRA_CIDR_ID),
+        (ADMIN_CIDR, ADMIN_CIDR_ID),
+        (DEVELOPER_CIDR, DEVELOPER_CIDR_ID),
+        (USER_CIDR, USER_CIDR_ID),
+        (ROOT_CIDR, ROOT_CIDR_ID),
+    ];
+    let ip = contents.hosts_fallback().unwrap();
+    let cidr_id = cidrs
+        .iter()
+        .find(|(cidr, _)| cidr.parse::<Prefix>().unwrap().contains_addr(&ip))
+        .map_or(0, |(_, id)| *id);
+    LegacyPeerContents::from_peer(contents, cidr_id).unwrap()
+}
+
 pub fn admin_peer_contents(name: &str, ip_str: &str) -> Result<PeerContents, Error> {
-    peer_contents(name, ip_str, ADMIN_CIDR_ID, true)
+    peer_contents(name, ip_str, true)
 }
 
 pub fn infra_peer_contents(name: &str, ip_str: &str) -> Result<PeerContents, Error> {
-    peer_contents(name, ip_str, INFRA_CIDR_ID, false)
+    peer_contents(name, ip_str, false)
 }
 
 pub fn developer_peer_contents(name: &str, ip_str: &str) -> Result<PeerContents, Error> {
-    peer_contents(name, ip_str, DEVELOPER_CIDR_ID, false)
+    peer_contents(name, ip_str, false)
 }
 
 pub fn user_peer_contents(name: &str, ip_str: &str) -> Result<PeerContents, Error> {
-    peer_contents(name, ip_str, USER_CIDR_ID, false)
+    peer_contents(name, ip_str, false)
 }

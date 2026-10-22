@@ -2,8 +2,10 @@ use crate::data_store::DataStore;
 use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response, StatusCode};
 use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo},
-    tls, Cidr, CidrContents, LegacyPeer, LegacyPeerContents, LegacyState, PeerContents, PeerUpdate,
-    Prefix, State, TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
+    parent_cidr, smallest_cidr_holding, tls, Association, Cidr, CidrDeletion, LegacyAssociation,
+    LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
+    LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr, TaggedPeer,
+    TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -85,16 +87,209 @@ impl<'a> RestClient<'a> {
         self.speaks_tls.get()
     }
 
-    pub async fn create_cidr(&self, cidr_contents: &CidrContents) -> Result<Cidr, RestError> {
-        self.http_form("POST", "/admin/cidrs", cidr_contents).await
+    /// Creates the CIDR `cidr`, under the parent that its prefix gives it, and returns it as the
+    /// server created it. A server in plain HTTP is sent the ID of the parent, the smallest of
+    /// its CIDRs that holds `cidr`, and returns the CIDR with its ID, which is left out.
+    pub async fn create_cidr(&self, cidr: &Cidr) -> Result<Cidr, RestError> {
+        match self.admin_api().await? {
+            AdminApi::ByKey => self.http_form("POST", "/admin/cidrs", cidr).await,
+            AdminApi::Legacy => {
+                let cidrs = self.get_legacy_cidrs().await?;
+                let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
+                let parent = parent_cidr(&cidr.cidr, &prefixes)
+                    .map(|parent| legacy_cidr_id(&cidrs, &parent))
+                    .transpose()?;
+                let contents = LegacyCidrContents {
+                    name: cidr.name.clone(),
+                    cidr: cidr.cidr.net(),
+                    parent,
+                };
+                let created: LegacyCidr = self.http_form("POST", "/admin/cidrs", contents).await?;
+                Ok(created.into())
+            },
+        }
     }
 
+    /// Lists every CIDR of the network. A server in plain HTTP lists the CIDRs with their IDs and
+    /// the IDs of their parents, which are left out: the parent of a CIDR is the smallest other
+    /// CIDR that holds it.
     pub async fn get_cidrs(&self) -> Result<Vec<Cidr>, RestError> {
+        let (transport, body) = self.request_raw::<()>("GET", "/admin/cidrs", None).await?;
+        match transport {
+            Transport::Tls => decode(&body),
+            Transport::Plain => decode::<Vec<LegacyCidr>>(&body)
+                .map(|cidrs| cidrs.into_iter().map(Cidr::from).collect()),
+        }
+    }
+
+    /// Lists every CIDR of the network as a server in plain HTTP lists them, with their IDs.
+    async fn get_legacy_cidrs(&self) -> Result<Vec<LegacyCidr>, RestError> {
         self.http("GET", "/admin/cidrs").await
     }
 
+    /// Reads the CIDR `listed` and its tag in the API of TLS sessions, as long as the CIDR is
+    /// still as it was listed. A CIDR that has changed since it was listed is refused as
+    /// [`RestError::CidrChanged`], and one that the server doesn't hold as
+    /// [`RestError::NoSuchCidr`].
+    pub async fn get_tagged_cidr(&self, listed: &Cidr) -> Result<TaggedCidr, RestError> {
+        let path = format!("/admin/cidrs/{}", listed.cidr.api_path_segment());
+        let tagged: TaggedCidr = self
+            .http("GET", &path)
+            .await
+            .map_err(RestError::cidr_refusal)?;
+        if tagged.cidr != *listed {
+            return Err(RestError::CidrChanged);
+        }
+        Ok(tagged)
+    }
+
+    /// Renames the CIDR `listed`, as it was listed, to `name`. A CIDR that the server doesn't
+    /// hold is refused as [`RestError::NoSuchCidr`]. In the API of TLS sessions, a CIDR that has
+    /// changed since it was listed is refused as [`RestError::CidrChanged`]: the client refuses
+    /// it when it reads it with its tag, and the server refuses it if it changes between the read
+    /// and the rename. A server in plain HTTP names the CIDR by an ID, so the client lists the
+    /// CIDRs again for the ID of the CIDR with the prefix of `listed`.
+    pub async fn rename_cidr(&self, listed: &Cidr, name: &str) -> Result<(), RestError> {
+        match self.admin_api().await? {
+            AdminApi::ByKey => {
+                let TaggedCidr { tag, .. } = self.get_tagged_cidr(listed).await?;
+                let path = format!("/admin/cidrs/{}", listed.cidr.api_path_segment());
+                let renamed = TaggedCidr {
+                    cidr: Cidr {
+                        name: name.to_string(),
+                        cidr: listed.cidr,
+                    },
+                    tag,
+                };
+                self.http_form("PUT", &path, renamed)
+                    .await
+                    .map_err(RestError::cidr_refusal)
+            },
+            AdminApi::Legacy => {
+                let cidrs = self.get_legacy_cidrs().await?;
+                let legacy = cidrs
+                    .iter()
+                    .find(|legacy| legacy.prefix() == listed.cidr)
+                    .ok_or(RestError::NoSuchCidr)?;
+                let contents = LegacyCidrContents {
+                    name: name.to_string(),
+                    ..legacy.contents.clone()
+                };
+                self.http_form("PUT", &format!("/admin/cidrs/{}", legacy.id), contents)
+                    .await
+            },
+        }
+    }
+
+    /// Deletes the CIDR `listed`, as it was listed, which must have neither peers nor children.
+    /// A CIDR that the server doesn't hold is refused as [`RestError::NoSuchCidr`], and in the
+    /// API of TLS sessions, one that has changed since it was listed as
+    /// [`RestError::CidrChanged`], as [`Self::rename_cidr`] refuses it.
+    pub async fn delete_cidr(&self, listed: &Cidr) -> Result<(), RestError> {
+        match self.admin_api().await? {
+            AdminApi::ByKey => {
+                let TaggedCidr { tag, .. } = self.get_tagged_cidr(listed).await?;
+                let path = format!("/admin/cidrs/{}", listed.cidr.api_path_segment());
+                self.http_form("DELETE", &path, CidrDeletion { tag })
+                    .await
+                    .map_err(RestError::cidr_refusal)
+            },
+            AdminApi::Legacy => {
+                let path = format!(
+                    "/admin/cidrs/{}",
+                    legacy_cidr_id(&self.get_legacy_cidrs().await?, &listed.cidr)?
+                );
+                self.http("DELETE", &path)
+                    .await
+                    .map_err(|e| e.not_found_as(RestError::NoSuchCidr))
+            },
+        }
+    }
+
+    /// Lists every association of the network. A server in plain HTTP names the CIDRs of each
+    /// association by ID, so the client lists the CIDRs too, for their prefixes.
+    pub async fn get_associations(&self) -> Result<Vec<Association>, RestError> {
+        let (transport, body) = self
+            .request_raw::<()>("GET", "/admin/associations", None)
+            .await?;
+        match transport {
+            Transport::Tls => decode(&body),
+            Transport::Plain => {
+                let associations: Vec<LegacyAssociation> = decode(&body)?;
+                let cidrs = self.get_legacy_cidrs().await?;
+                let prefix = |id: i64| {
+                    cidrs
+                        .iter()
+                        .find(|cidr| cidr.id == id)
+                        .map(|cidr| cidr.prefix())
+                        .ok_or(RestError::NoSuchCidr)
+                };
+                associations
+                    .iter()
+                    .map(|association| {
+                        Ok(Association {
+                            cidr_1: prefix(association.cidr_id_1)?,
+                            cidr_2: prefix(association.cidr_id_2)?,
+                        })
+                    })
+                    .collect()
+            },
+        }
+    }
+
+    /// Associates the CIDRs of `association`. A server in plain HTTP names the CIDRs by ID, so
+    /// the client lists the CIDRs for their IDs.
+    pub async fn create_association(&self, association: &Association) -> Result<(), RestError> {
+        match self.admin_api().await? {
+            AdminApi::ByKey => {
+                self.http_form("POST", "/admin/associations", association)
+                    .await
+            },
+            AdminApi::Legacy => {
+                let cidrs = self.get_legacy_cidrs().await?;
+                let contents = LegacyAssociationContents {
+                    cidr_id_1: legacy_cidr_id(&cidrs, &association.cidr_1)?,
+                    cidr_id_2: legacy_cidr_id(&cidrs, &association.cidr_2)?,
+                };
+                self.http_form("POST", "/admin/associations", contents)
+                    .await
+            },
+        }
+    }
+
+    /// Deletes the association of the CIDRs of `association`, in either order. An association
+    /// that the server doesn't hold is refused as [`RestError::NoSuchAssociation`]. A server in
+    /// plain HTTP names an association by ID, so the client lists the associations and the CIDRs
+    /// again for its ID.
+    pub async fn delete_association(&self, association: &Association) -> Result<(), RestError> {
+        let path = match self.admin_api().await? {
+            AdminApi::ByKey => format!("/admin/associations/{}", association.api_path()),
+            AdminApi::Legacy => {
+                let cidrs = self.get_legacy_cidrs().await?;
+                let (id_1, id_2) = (
+                    legacy_cidr_id(&cidrs, &association.cidr_1)?,
+                    legacy_cidr_id(&cidrs, &association.cidr_2)?,
+                );
+                let associations: Vec<LegacyAssociation> =
+                    self.http("GET", "/admin/associations").await?;
+                let listed = associations
+                    .iter()
+                    .find(|listed| {
+                        (listed.cidr_id_1, listed.cidr_id_2) == (id_1, id_2)
+                            || (listed.cidr_id_1, listed.cidr_id_2) == (id_2, id_1)
+                    })
+                    .ok_or(RestError::NoSuchAssociation)?;
+                format!("/admin/associations/{}", listed.id)
+            },
+        };
+        self.http("DELETE", &path)
+            .await
+            .map_err(|e| e.not_found_as(RestError::NoSuchAssociation))
+    }
+
     /// Creates a peer, and returns it as the server created it. A server in plain HTTP is sent the
-    /// peer as clients that predate TLS know it, and returns the peer with its ID, which is left
+    /// peer as clients that predate TLS know it, with the ID of its CIDR, the smallest of the
+    /// server's CIDRs that holds its address, and returns the peer with its ID, which is left
     /// out. A peer that such clients can't represent is refused without a request: one without a
     /// name as [`RestError::NamelessUnsupported`], and one whose delegations are anything but a
     /// single address as [`RestError::DelegationsUnsupported`].
@@ -108,11 +303,19 @@ impl<'a> RestClient<'a> {
                 if peer_contents.name.is_none() {
                     return Err(RestError::NamelessUnsupported);
                 }
-                if !matches!(&peer_contents.delegations[..], [address] if address.is_host()) {
+                let [address] = &peer_contents.delegations[..] else {
+                    return Err(RestError::DelegationsUnsupported);
+                };
+                if !address.is_host() {
                     return Err(RestError::DelegationsUnsupported);
                 }
-                let legacy = LegacyPeerContents::from_peer(peer_contents)
-                    .ok_or(RestError::DelegationsUnsupported)?;
+                let cidrs = self.get_legacy_cidrs().await?;
+                let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
+                let cidr =
+                    smallest_cidr_holding(address, &prefixes).ok_or(RestError::NoSuchCidr)?;
+                let legacy =
+                    LegacyPeerContents::from_peer(peer_contents, legacy_cidr_id(&cidrs, &cidr)?)
+                        .ok_or(RestError::DelegationsUnsupported)?;
                 let peer: LegacyPeer = self.http_form("POST", "/admin/peers", legacy).await?;
                 Ok(peer.contents.into())
             },
@@ -445,6 +648,16 @@ fn same_but_untagged(a: &PeerContents, b: &PeerContents) -> bool {
     tagged(a) == tagged(b)
 }
 
+/// The ID by which a server in plain HTTP names the CIDR `prefix`, among `cidrs` as it lists them,
+/// or [`RestError::NoSuchCidr`] if it lists no CIDR with the prefix.
+fn legacy_cidr_id(cidrs: &[LegacyCidr], prefix: &Prefix) -> Result<i64, RestError> {
+    cidrs
+        .iter()
+        .find(|cidr| cidr.prefix() == *prefix)
+        .map(|cidr| cidr.id)
+        .ok_or(RestError::NoSuchCidr)
+}
+
 /// Decodes the body of an answer as JSON. An empty body decodes as `null`, so that it decodes as
 /// `()`.
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, RestError> {
@@ -561,6 +774,21 @@ pub enum RestError {
          delegations. The operator must upgrade the server first."
     )]
     DelegationsUnsupported,
+    #[error(
+        "The innernet server has no CIDR with this prefix (it may have been deleted), so the \
+         change was not made. Running the command again lists the CIDRs anew."
+    )]
+    NoSuchCidr,
+    #[error(
+        "The CIDR has changed since it was listed, so the change was not made. Running the \
+         command again lists the CIDRs anew."
+    )]
+    CidrChanged,
+    #[error(
+        "The innernet server has no association of these CIDRs (it may have been deleted), so \
+         the change was not made. Running the command again lists the associations anew."
+    )]
+    NoSuchAssociation,
     /// The request failed to reach the server, or the server failed to answer it.
     #[error("Error sending request: {0}")]
     RequestSend(Box<dyn std::error::Error + Send + Sync>),
@@ -598,6 +826,27 @@ impl RestError {
             RestError::PeerChanged
         } else if self.has_status_of(404) {
             RestError::NoSuchPeer
+        } else {
+            self
+        }
+    }
+
+    /// Turns the statuses with which the server refuses a request about a CIDR named by its
+    /// prefix into errors that say why: [`Self::CidrChanged`] for a CIDR that has changed since
+    /// it was read, and [`Self::NoSuchCidr`] for a prefix that no CIDR has.
+    fn cidr_refusal(self) -> Self {
+        if self.has_status_of(409) {
+            RestError::CidrChanged
+        } else {
+            self.not_found_as(RestError::NoSuchCidr)
+        }
+    }
+
+    /// Turns a refusal with 404, which a server answers for a resource that it doesn't hold, into
+    /// `error`, which says what was not found.
+    fn not_found_as(self, error: Self) -> Self {
+        if self.has_status_of(404) {
+            error
         } else {
             self
         }
@@ -781,7 +1030,6 @@ mod tests {
         PeerContents {
             name: Some("peer".parse().unwrap()),
             delegations: vec!["10.0.0.7/32".parse().unwrap()],
-            cidr_id: 1,
             public_key: wireguard_control::Key(bytes).to_base64(),
             endpoint: None,
             persistent_keepalive_interval: None,
@@ -799,7 +1047,7 @@ mod tests {
             .iter()
             .map(|contents| LegacyPeer {
                 id: 7,
-                contents: LegacyPeerContents::from_peer(contents).unwrap(),
+                contents: LegacyPeerContents::from_peer(contents, 1).unwrap(),
             })
             .collect();
         json_response("200 OK", &serde_json::to_string(&peers).unwrap())
@@ -980,7 +1228,7 @@ mod tests {
             r#"{{"peers": {}, "cidrs": []}}"#,
             serde_json::to_string(&[LegacyPeer {
                 id: 7,
-                contents: LegacyPeerContents::from_peer(&peer).unwrap(),
+                contents: LegacyPeerContents::from_peer(&peer, 1).unwrap(),
             }])
             .unwrap()
         );
@@ -1074,6 +1322,221 @@ mod tests {
 
         let error = client.set_delegations(&peer, vec![]).await.unwrap_err();
         assert!(matches!(error, RestError::PeerChanged), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_cidrs_and_associations_by_prefix_over_tls() {
+        let server_key = KeyPair::generate();
+        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+        let users = users_cidr();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                tagged_cidr_response(&users, "ab"),
+                NO_CONTENT.into(),
+                not_found.clone(),
+                NO_CONTENT.into(),
+                not_found,
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        let association = Association {
+            cidr_1: users.cidr,
+            cidr_2: "fd00::/64".parse().unwrap(),
+        };
+
+        // A CIDR is named by its prefix, and an association by the prefixes of its CIDRs, and
+        // the server's 404 says which is gone. The client reads a CIDR with its tag, and renames
+        // it with the tag it read.
+        client.rename_cidr(&users, "people").await.unwrap();
+        let get = requests.recv().unwrap();
+        assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
+        let put = requests.recv().unwrap();
+        assert!(put.starts_with("PUT /v1/admin/cidrs/10.0.1.0_24 "), "{put}");
+        let body: TaggedCidr = serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            TaggedCidr {
+                cidr: Cidr {
+                    name: "people".into(),
+                    cidr: users.cidr
+                },
+                tag: "ab".into()
+            }
+        );
+        let error = client.delete_cidr(&users).await.unwrap_err();
+        assert!(matches!(error, RestError::NoSuchCidr), "{error:?}");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "));
+        client.delete_association(&association).await.unwrap();
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("DELETE /v1/admin/associations/10.0.1.0_24/fd00::_64 "));
+        let error = client.delete_association(&association).await.unwrap_err();
+        assert!(matches!(error, RestError::NoSuchAssociation), "{error:?}");
+    }
+
+    /// The CIDR `users`, as a client lists it.
+    fn users_cidr() -> Cidr {
+        Cidr {
+            name: "users".into(),
+            cidr: "10.0.1.0/24".parse().unwrap(),
+        }
+    }
+
+    /// The server's answer to a read of `cidr` with the tag `tag`.
+    fn tagged_cidr_response(cidr: &Cidr, tag: &str) -> String {
+        let tagged = TaggedCidr {
+            cidr: cidr.clone(),
+            tag: tag.into(),
+        };
+        json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_deletes_cidrs_by_tag_over_tls() {
+        let server_key = KeyPair::generate();
+        let users = users_cidr();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![tagged_cidr_response(&users, "ab"), NO_CONTENT.into()],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+
+        // The client reads the CIDR by prefix, and deletes it with the tag it read.
+        client.delete_cidr(&users).await.unwrap();
+        let get = requests.recv().unwrap();
+        assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
+        let delete = requests.recv().unwrap();
+        assert!(
+            delete.starts_with("DELETE /v1/admin/cidrs/10.0.1.0_24 "),
+            "{delete}"
+        );
+        let body: CidrDeletion =
+            serde_json::from_str(delete.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, CidrDeletion { tag: "ab".into() });
+    }
+
+    #[tokio::test]
+    async fn test_refuses_cidrs_changed_since_listed() {
+        let server_key = KeyPair::generate();
+        let users = users_cidr();
+        let renamed = Cidr {
+            name: "people".into(),
+            ..users.clone()
+        };
+        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".to_string();
+        let bad_request = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                // The CIDR changed between the listing and the read.
+                tagged_cidr_response(&renamed, "ab"),
+                tagged_cidr_response(&renamed, "ab"),
+                // The CIDR changed between the read and the change.
+                tagged_cidr_response(&users, "ab"),
+                conflict.clone(),
+                tagged_cidr_response(&users, "ab"),
+                conflict,
+                // The server refuses a change that it can't read, as one without a tag.
+                tagged_cidr_response(&users, "ab"),
+                bad_request,
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        let error = client.rename_cidr(&users, "people").await.unwrap_err();
+        assert!(matches!(error, RestError::CidrChanged), "{error:?}");
+        let error = client.delete_cidr(&users).await.unwrap_err();
+        assert!(matches!(error, RestError::CidrChanged), "{error:?}");
+        let error = client.rename_cidr(&users, "people").await.unwrap_err();
+        assert!(matches!(error, RestError::CidrChanged), "{error:?}");
+        let error = client.delete_cidr(&users).await.unwrap_err();
+        assert!(matches!(error, RestError::CidrChanged), "{error:?}");
+        let error = client.rename_cidr(&users, "people").await.unwrap_err();
+        assert!(error.has_status_of(400), "{error:?}");
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request.split(' ').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            ["GET", "GET", "GET", "PUT", "GET", "DELETE", "GET", "PUT"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cidrs_and_associations_by_id_in_plain_http() {
+        // A server in plain HTTP names CIDRs and associations by ID, so the client lists them
+        // for the IDs, and leaves the IDs out of what it returns.
+        let cidrs = r#"[
+            {"id": 1, "name": "root", "cidr": "10.0.0.0/16", "parent": null},
+            {"id": 3, "name": "users", "cidr": "10.0.1.0/24", "parent": 1}
+        ]"#;
+        let created = r#"{"id": 4, "name": "new", "cidr": "10.0.1.128/25", "parent": 3}"#;
+        let associations = r#"[{"id": 5, "cidr_id_1": 3, "cidr_id_2": 1}]"#;
+        let server_key = KeyPair::generate();
+        let (addr, server) = plain_http_server_answering(vec![
+            NO_CONTENT_CLOSE.into(),
+            NO_CONTENT_CLOSE.into(),
+            json_response("200 OK", cidrs),
+            json_response("201 Created", created),
+            json_response("200 OK", cidrs),
+            NO_CONTENT_CLOSE.into(),
+            json_response("200 OK", associations),
+            json_response("200 OK", cidrs),
+            json_response("200 OK", cidrs),
+            json_response("200 OK", associations),
+            NO_CONTENT_CLOSE.into(),
+            json_response("200 OK", cidrs),
+            NO_CONTENT_CLOSE.into(),
+        ]);
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+        let prefix = |prefix: &str| prefix.parse::<Prefix>().unwrap();
+        let new = Cidr {
+            name: "new".into(),
+            cidr: prefix("10.0.1.128/25"),
+        };
+        assert_eq!(client.admin_api().await.unwrap(), AdminApi::Legacy);
+        assert_eq!(client.create_cidr(&new).await.unwrap(), new);
+        let association = Association {
+            cidr_1: prefix("10.0.0.0/16"),
+            cidr_2: prefix("10.0.1.0/24"),
+        };
+        client.create_association(&association).await.unwrap();
+        assert_eq!(
+            client.get_associations().await.unwrap(),
+            [Association {
+                cidr_1: association.cidr_2,
+                cidr_2: association.cidr_1,
+            }]
+        );
+        client.delete_association(&association).await.unwrap();
+        client.delete_cidr(&users_cidr()).await.unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                TLS_HANDSHAKE,
+                "GET /v1/user/capabilities HTTP/1.1",
+                "GET /v1/admin/cidrs HTTP/1.1",
+                "POST /v1/admin/cidrs HTTP/1.1",
+                "GET /v1/admin/cidrs HTTP/1.1",
+                "POST /v1/admin/associations HTTP/1.1",
+                "GET /v1/admin/associations HTTP/1.1",
+                "GET /v1/admin/cidrs HTTP/1.1",
+                "GET /v1/admin/cidrs HTTP/1.1",
+                "GET /v1/admin/associations HTTP/1.1",
+                "DELETE /v1/admin/associations/5 HTTP/1.1",
+                "GET /v1/admin/cidrs HTTP/1.1",
+                "DELETE /v1/admin/cidrs/3 HTTP/1.1",
+            ]
+        );
     }
 
     #[tokio::test]

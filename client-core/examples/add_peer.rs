@@ -30,7 +30,6 @@ async fn main() -> Result<(), Error> {
     let new_peer_info = NewPeerInfo {
         name: "joe".parse().unwrap(),
         delegations: vec![Prefix::host(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))],
-        cidr_id: cidrs[0].id,
         is_admin: false,
         invite_expires: "1m".parse().unwrap(),
     };

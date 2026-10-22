@@ -275,7 +275,6 @@ mod tests {
         PeerContents {
             name: Some("peer1".parse().unwrap()),
             delegations: vec![crate::Prefix::host(ip)],
-            cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
             persistent_keepalive_interval: None,

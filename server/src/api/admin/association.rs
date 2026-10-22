@@ -10,23 +10,27 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::AssociationContents;
+use innernet_shared::{Association, Prefix};
 
+/// Serves `/admin/associations`, in which a path names an association by the prefixes of its two
+/// CIDRs, in either order, each as [`Prefix::api_path_segment`] writes it:
+/// `/admin/associations/{cidr}/{cidr}`.
 pub async fn routes(
     req: Request<Body>,
-    mut components: VecDeque<String>,
+    components: VecDeque<String>,
     session: Session,
 ) -> Result<Response<Body>, ServerError> {
-    match (req.method(), components.pop_front().as_deref()) {
-        (&Method::GET, None) => handlers::list(session).await,
-        (&Method::POST, None) => {
+    let prefixes = components
+        .iter()
+        .map(|segment| Prefix::from_api_path_segment(segment).ok_or(ServerError::NotFound))
+        .collect::<Result<Vec<_>, _>>()?;
+    match (req.method(), &prefixes[..]) {
+        (&Method::GET, []) => handlers::list(session).await,
+        (&Method::POST, []) => {
             let form = form_body(req).await?;
             handlers::create(form, session).await
         },
-        (&Method::DELETE, Some(id)) => {
-            let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
-            handlers::delete(id, session).await
-        },
+        (&Method::DELETE, [a, b]) => handlers::delete(a, b, session).await,
         _ => Err(ServerError::NotFound),
     }
 }
@@ -35,26 +39,33 @@ mod handlers {
     use super::*;
 
     pub async fn create(
-        contents: AssociationContents,
+        contents: Association,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
 
-        DatabaseAssociation::create(&conn, contents)?;
+        DatabaseAssociation::create(&conn, contents.cidr_1, contents.cidr_2)?;
 
         status_response(StatusCode::CREATED)
     }
 
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let auths = DatabaseAssociation::list(&conn)?;
+        let auths: Vec<_> = DatabaseAssociation::list(&conn)?
+            .iter()
+            .map(DatabaseAssociation::contents)
+            .collect();
 
         json_response(auths)
     }
 
-    pub async fn delete(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
+    pub async fn delete(
+        a: &Prefix,
+        b: &Prefix,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        DatabaseAssociation::delete(&conn, id)?;
+        DatabaseAssociation::delete(&conn, a, b)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
