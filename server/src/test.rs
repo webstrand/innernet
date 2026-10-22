@@ -9,7 +9,11 @@ use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_shared::{Cidr, CidrContents, Error, PeerContents, Prefix};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 use tempfile::TempDir;
 use wireguard_control::{InterfaceName, Key, KeyPair};
 
@@ -105,6 +109,7 @@ pub struct Server {
     interface: InterfaceName,
     conf: ServerConfig,
     public_key: Key,
+    internal_address: IpAddr,
     // The directory will be removed during destruction.
     _test_dir: TempDir,
 }
@@ -114,7 +119,6 @@ impl Server {
         let test_dir = tempfile::tempdir()?;
         let test_dir_path = test_dir.path();
 
-        let public_key = Key::generate_private().get_public();
         // Run the init wizard to initialize the database and create basic
         // cidrs and peers.
         let interface = "test".to_string();
@@ -135,11 +139,11 @@ impl Server {
         let interface = interface.parse().unwrap();
         // Add developer CIDR and user CIDR and some peers for testing.
         let config = crate::ConfigFile::from_file(conf.config_path(&interface))?;
-        let server_key = Key::from_base64(&config.private_key)?.get_public();
+        let public_key = Key::from_base64(&config.private_key)?.get_public();
         let db = crate::db::open(
             &conf.database_path(&interface),
             config.network(),
-            &server_key,
+            &public_key,
         )?;
         assert_eq!(ADMIN_CIDR_ID, create_cidr(&db, "admin", ADMIN_CIDR)?.id);
         DatabasePeer::create(&db, admin_peer_contents("admin", ADMIN_PEER_IP)?)?;
@@ -183,6 +187,7 @@ impl Server {
             endpoints,
             interface,
             public_key,
+            internal_address: config.address,
             _test_dir: test_dir,
         })
     }
@@ -203,6 +208,16 @@ impl Server {
             .unwrap();
     }
 
+    /// Delegates `prefix` to the peer with the ID `id`, beside its delegations.
+    pub fn delegate(&self, id: i64, prefix: &str) {
+        let store = self.db.lock();
+        let mut peer = peer(&store, id);
+        let mut delegations = peer.delegations.clone();
+        delegations.push(prefix.parse().unwrap());
+        peer.set_delegations(&store, delegations, &self.public_key, self.internal_address)
+            .unwrap();
+    }
+
     pub fn db(&self) -> Db {
         self.db.clone()
     }
@@ -212,6 +227,7 @@ impl Server {
             db: self.db.clone(),
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
+            internal_address: self.internal_address,
             changed: Default::default(),
             invitations: Default::default(),
         }

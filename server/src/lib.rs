@@ -1,6 +1,6 @@
 use anyhow::bail;
 use colored::*;
-use coordinator::{Coordinator, Hooks, Sockets};
+use coordinator::{Coordinator, CoordinatorConfig, Hooks, Sockets};
 use db::DatabasePeer;
 use dialoguer::Confirm;
 use innernet_client_core::rest_client::{RestClient, RestError};
@@ -327,6 +327,9 @@ pub async fn serve(
 
     log::info!("innernet-server {} starting.", VERSION);
     let coordinator = Coordinator::spawn(
+        CoordinatorConfig {
+            address: config.address,
+        },
         &config.private_key,
         db,
         Sockets {

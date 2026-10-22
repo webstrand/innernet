@@ -8,7 +8,8 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Hostname, PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerEndpoints,
+    Hostname, PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerDelegations,
+    TaggedPeerEndpoints,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,11 @@ pub async fn routes(
         (&Method::PUT, Some(key), Some("endpoints")) => {
             let form = form_body(req).await?;
             handlers::set_endpoints(key, form, session).await
+        },
+        (&Method::GET, Some(key), Some("delegations")) => handlers::delegations(key, session).await,
+        (&Method::PUT, Some(key), Some("delegations")) => {
+            let form = form_body(req).await?;
+            handlers::set_delegations(key, form, session).await
         },
         _ => Err(ServerError::NotFound),
     }
@@ -116,6 +122,11 @@ fn peer_endpoints(peer: &PeerContents) -> PeerEndpoints {
 /// The tag of a peer's endpoints: that of its public key, endpoint and candidates.
 fn endpoints_tag(peer: &PeerContents) -> Result<String, ServerError> {
     tag("endpoints", &(&peer.public_key, peer_endpoints(peer)))
+}
+
+/// The tag of a peer's delegations: that of its public key and delegations.
+fn delegations_tag(peer: &PeerContents) -> Result<String, ServerError> {
+    tag("delegations", &(&peer.public_key, &peer.delegations))
 }
 
 /// The peer with the public key `key`, if `tag_of` the peer is still `tag`. A peer that has
@@ -222,6 +233,41 @@ mod handlers {
         status_response(StatusCode::NO_CONTENT)
     }
 
+    /// The delegations of the peer with the public key `key`, and their tag.
+    pub async fn delegations(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let peer = DatabasePeer::get_from_public_key(&conn, &key)?;
+        json_response(TaggedPeerDelegations {
+            delegations: peer.delegations.clone(),
+            tag: delegations_tag(&peer)?,
+        })
+    }
+
+    /// Replaces the delegations of the peer with the public key `key` as a whole, if they
+    /// haven't changed since the admin read them with the tag that the request carries.
+    pub async fn set_delegations(
+        key: Key,
+        form: TaggedPeerDelegations,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        let store = session.context.db.lock();
+        let mut peer = get_unchanged(&store, &key, &form.tag, delegations_tag)?;
+        peer.set_delegations(
+            &store,
+            form.delegations,
+            &session.context.public_key,
+            session.context.internal_address,
+        )?;
+        log::info!(
+            "set the delegations of peer {} to {}",
+            *peer,
+            peer.display_delegations()
+        );
+        session.context.changed.notify();
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
     /// List all peers, including disabled ones, without IDs. This is an admin-only endpoint.
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
@@ -239,7 +285,7 @@ mod tests {
     use super::*;
     use crate::test;
     use bytes::Buf;
-    use innernet_shared::{Endpoint, Error, LegacyPeer, State};
+    use innernet_shared::{Endpoint, Error, LegacyPeer, Prefix, State};
     use wireguard_control::KeyPair;
 
     #[tokio::test]
@@ -708,6 +754,189 @@ mod tests {
         assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
         assert_eq!(new_peer.endpoint, Some(endpoint));
         assert_eq!(new_peer.candidates, vec![candidate]);
+        Ok(())
+    }
+
+    /// Prefixes of the developer CIDR: a wider prefix, one misaligned, one outside the CIDR, and
+    /// the IP of developer2 as a host prefix.
+    fn developer_prefixes() -> [String; 4] {
+        let host = if cfg!(feature = "v6-test") { 128 } else { 32 };
+        let [wider, misaligned, outside] = if cfg!(feature = "v6-test") {
+            [
+                "fd00:1337::2:0:1:0/112",
+                "fd00:1337::2:0:1:1/112",
+                "fd00:1337::5:0:0:0/112",
+            ]
+        } else {
+            ["10.80.64.16/28", "10.80.64.17/28", "10.80.65.0/28"]
+        };
+        [
+            wider.into(),
+            misaligned.into(),
+            outside.into(),
+            format!("{}/{host}", test::DEVELOPER2_PEER_IP),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_delegations() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let peer_path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let path = format!("{peer_path}/delegations");
+        let [wider, misaligned, outside, taken] = developer_prefixes();
+        let get = |path: String| {
+            let server = &server;
+            async move {
+                let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+                assert_eq!(res.status(), StatusCode::OK);
+                let body = hyper::body::aggregate(res).await.unwrap();
+                serde_json::from_reader::<_, TaggedPeerDelegations>(body.reader()).unwrap()
+            }
+        };
+        let put = |path: &str, delegations: &[&str], tag: &str| {
+            let body = serde_json::json!({ "delegations": delegations, "tag": tag });
+            let path = path.to_string();
+            let server = &server;
+            async move {
+                server
+                    .form_request(test::ADMIN_PEER_IP, "PUT", &path, body)
+                    .await
+            }
+        };
+
+        let seen = get(path.clone()).await;
+        let own = seen.delegations[0].to_string();
+        assert_eq!(seen.delegations.len(), 1);
+        let peer_tag = get_tagged(&server, &peer_path).await.tag;
+
+        // The delegations are replaced as a whole, and routed from then on.
+        let res = put(&path, &[&wider, &own], &seen.tag).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let current = get(path.clone()).await;
+        let mut expected: Vec<Prefix> = vec![own.parse()?, wider.parse()?];
+        expected.sort();
+        assert_eq!(current.delegations, expected);
+        assert_ne!(current.tag, seen.tag);
+        let wider_prefix: Prefix = wider.parse()?;
+        let within = DatabasePeer::get_by_address(&server.db.lock(), wider_prefix.last())?;
+        assert_eq!(
+            within.public_key,
+            peer(&server, test::DEVELOPER1_PEER_ID).public_key
+        );
+
+        // The delegations are tagged apart from the rest of the peer.
+        assert_eq!(get_tagged(&server, &peer_path).await.tag, peer_tag);
+
+        // A change based on delegations read before is refused, as is one without a tag or with
+        // a misaligned prefix, and delegations that break the rules are refused with an
+        // explanation.
+        assert_eq!(
+            put(&path, &[&own], &seen.tag).await.status(),
+            StatusCode::CONFLICT
+        );
+        let untagged = serde_json::json!({ "delegations": [own] });
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            put(&path, &[&misaligned], &current.tag).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        for (delegations, reason) in [
+            (vec![outside.as_str()], "outside"),
+            (vec![taken.as_str()], "delegated to peer developer2"),
+            (
+                vec![wider.as_str(), wider.as_str()],
+                "another of the delegations",
+            ),
+        ] {
+            let res = put(&path, &delegations, &current.tag).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = hyper::body::to_bytes(res.into_body()).await?;
+            assert!(String::from_utf8_lossy(&body).contains(reason), "{reason}");
+        }
+        assert_eq!(get(path.clone()).await, current);
+
+        // A withdrawn delegation stays pinned to the peer's key, so the server's node refuses it
+        // to another peer, with an explanation.
+        let res = put(&path, &[&own], &current.tag).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let other_path = format!(
+            "{}/delegations",
+            key_path(&server, test::DEVELOPER2_PEER_ID)
+        );
+        let other = get(other_path.clone()).await;
+        let other_own = other.delegations[0].to_string();
+        let res = put(&other_path, &[&other_own, &wider], &other.tag).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("pinned"));
+        assert_eq!(get(other_path).await, other);
+
+        // A peer may be left without a delegation, which leaves it out of the legacy view.
+        let current = get(path.clone()).await;
+        let key = Key::from_base64(&peer(&server, test::DEVELOPER1_PEER_ID).public_key)?;
+        assert_eq!(
+            put(&path, &[], &current.tag).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let without = DatabasePeer::get_from_public_key(&server.db.lock(), &key)?;
+        assert!(without.delegations.is_empty());
+        assert!(without.legacy(test::DEVELOPER1_PEER_ID).is_none());
+
+        // A non-admin can't, and an unknown key is not found.
+        let tag = get(path.clone()).await.tag;
+        let res = server
+            .form_request(
+                test::DEVELOPER2_PEER_IP,
+                "PUT",
+                &path,
+                TaggedPeerDelegations {
+                    delegations: vec![],
+                    tag,
+                },
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let unknown = PeerContents {
+            public_key: KeyPair::generate().public.to_base64(),
+            ..without.inner.clone()
+        };
+        let unknown_path = format!("/v1/admin/peers/{}/delegations", unknown.api_path_segment());
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", &unknown_path)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_keeps_its_internal_address() -> Result<(), Error> {
+        // The server's own peer can't lose the delegation that holds its internal address.
+        let server = test::Server::new()?;
+        let path = format!("{}/delegations", key_path(&server, test::SERVER_PEER_ID));
+        let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let seen: TaggedPeerDelegations = serde_json::from_slice(&body)?;
+        let res = server
+            .form_request(
+                test::ADMIN_PEER_IP,
+                "PUT",
+                &path,
+                TaggedPeerDelegations {
+                    delegations: vec![],
+                    tag: seen.tag,
+                },
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("internal address"));
+        assert_eq!(
+            peer(&server, test::SERVER_PEER_ID).delegations,
+            seen.delegations
+        );
         Ok(())
     }
 

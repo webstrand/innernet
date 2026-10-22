@@ -1,6 +1,7 @@
 use super::DatabaseCidr;
 use crate::ServerError;
 use innernet_node::{
+    accept::Refusal,
     store::{self, ip_to_bytes, key_to_bytes, prefix_from_row, row_key, EndpointKind},
     Store,
 };
@@ -101,7 +102,7 @@ impl DatabasePeer {
         let tx = store.unchecked_transaction()?;
         if let Err(refusal) = store.accept(&[&contents])?.remove(0) {
             log::warn!("the server's node refuses the peer: {refusal}");
-            return Err(ServerError::InvalidQuery);
+            return Err(refused(refusal));
         }
         // A peer that the server creates is redeemed and used by a client that speaks TLS, so
         // that nothing else on its machine can act as the peer, and above all as an admin. Only
@@ -125,7 +126,8 @@ impl DatabasePeer {
 
     /// Applies the changes an admin may make to the peer: its name, which it may lose, whether it
     /// is an admin, and whether it is disabled. The other fields of `contents` are ignored. The
-    /// peer alone sets its endpoint and candidates, and its IP, public key and CIDR never change.
+    /// peer alone sets its endpoint and candidates, its delegations change with
+    /// [`Self::set_delegations`], and its public key never changes.
     pub fn update(&mut self, store: &Store, contents: PeerContents) -> Result<(), ServerError> {
         if contents.is_admin && !self.is_admin && !self.requires_tls {
             log::warn!(
@@ -142,11 +144,63 @@ impl DatabasePeer {
         };
         if let Err(refusal) = store.accept(&[&updated])?.remove(0) {
             log::warn!("the server's node refuses the change: {refusal}");
-            return Err(ServerError::InvalidQuery);
+            return Err(refused(refusal));
         }
         self.inner.name = updated.name;
         self.inner.is_admin = updated.is_admin;
         self.inner.is_disabled = updated.is_disabled;
+        Ok(())
+    }
+
+    /// Replaces the delegations of the peer with `delegations` as a whole, together or not at
+    /// all. The delegations must follow the rules of [`check_delegations`] within the peer's CIDR,
+    /// that of its current delegations, or for a peer without one, that of the new ones, with the
+    /// delegations of the other peers. The server's node must accept them: no delegation may
+    /// overlap a prefix pinned to another key, as one that was delegated to another peer stays.
+    /// The peer may be left without a delegation, which leaves it in effect disabled, except the
+    /// server's own peer, the one with the public key `server_key`, which must keep the delegation
+    /// that holds `internal_address`, the address that the server serves its API on.
+    pub fn set_delegations(
+        &mut self,
+        store: &Store,
+        mut delegations: Vec<Prefix>,
+        server_key: &Key,
+        internal_address: IpAddr,
+    ) -> Result<(), ServerError> {
+        delegations.sort();
+        let key = self.key()?;
+        if key == server_key.0
+            && !delegations
+                .iter()
+                .any(|delegation| delegation.contains_addr(&internal_address))
+        {
+            return Err(ServerError::Delegation(format!(
+                "the server's own peer must keep a delegation that holds {internal_address}, the \
+                 internal address of the server"
+            )));
+        }
+        let cidrs = DatabaseCidr::list(store)?;
+        if let Some(cidr) =
+            cidr_of(&self.delegations, &cidrs).or_else(|| cidr_of(&delegations, &cidrs))
+        {
+            check_new_delegations(store, &delegations, &cidr.cidr, Some(&key))?;
+        } else if let Some(delegation) = delegations.first() {
+            return Err(ServerError::Delegation(format!(
+                "{delegation} is outside every CIDR"
+            )));
+        }
+
+        let updated = PeerContents {
+            delegations,
+            ..self.stored(store)?
+        };
+        let tx = store.unchecked_transaction()?;
+        if let Err(refusal) = store.accept(&[&updated])?.remove(0) {
+            log::warn!("the server's node refuses the delegations: {refusal}");
+            return Err(refused(refusal));
+        }
+        tx.commit()?;
+        self.inner.delegations = updated.delegations;
         Ok(())
     }
 
@@ -241,7 +295,7 @@ impl DatabasePeer {
         store::forget_peer(&tx, &self.key()?)?;
         if let Err(refusal) = store.accept(&[&redeemed])?.remove(0) {
             log::warn!("the server's node refuses the redeemed peer: {refusal}");
-            return Err(ServerError::InvalidQuery);
+            return Err(refused(refusal));
         }
         if self.requires_tls {
             tx.execute(
@@ -390,6 +444,17 @@ impl DatabasePeer {
             store::forget_peer(conn, key)?;
         }
         Ok(expired.len())
+    }
+}
+
+/// The error of a change that the server's node refuses with `refusal`: the delegations that it
+/// refuses are explained, as [`check_new_delegations`] explains those that break the rules.
+fn refused(refusal: Refusal) -> ServerError {
+    match refusal {
+        Refusal::Pinned { .. } | Refusal::Overlapping | Refusal::OutsideNetwork { .. } => {
+            ServerError::Delegation(refusal.to_string())
+        },
+        _ => ServerError::InvalidQuery,
     }
 }
 

@@ -791,6 +791,16 @@ pub struct TaggedPeerEndpoints {
     pub tag: String,
 }
 
+/// A peer's delegations and their tag: the body of `GET` and `PUT /admin/peers/{key}/delegations`
+/// in TLS sessions. A `PUT` replaces the delegations of the peer with `delegations` as a whole,
+/// and carries the tag of the delegations as the admin read them; the server refuses it if they
+/// have changed since. The delegations are tagged apart from the rest of the peer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TaggedPeerDelegations {
+    pub delegations: Vec<Prefix>,
+    pub tag: String,
+}
+
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
 /// canonical base64 encoding, so that public keys can be compared as strings.
 fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {

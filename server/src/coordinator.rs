@@ -22,6 +22,13 @@ use tokio::{net::TcpStream, sync::Notify, task::JoinHandle, time::timeout};
 use tokio_rustls::{rustls, TlsAcceptor};
 use wireguard_control::Key;
 
+/// What the coordinator serves, as its host configures it.
+#[derive(Clone, Debug)]
+pub struct CoordinatorConfig {
+    /// The address at which the coordinator serves its API: the primary IP of its node.
+    pub address: IpAddr,
+}
+
 /// The sockets at which the coordinator serves its API, which the host binds.
 pub struct Sockets {
     /// The TCP listener of the API, in TLS and in plain HTTP.
@@ -44,12 +51,19 @@ pub struct Coordinator {
 impl Coordinator {
     /// Starts the coordinator with the private key `private_key`, in base64, on `db`, the
     /// database that it shares with its node, in the current Tokio runtime.
-    pub fn spawn(private_key: &str, db: Db, sockets: Sockets, hooks: Hooks) -> Result<Self, Error> {
+    pub fn spawn(
+        config: CoordinatorConfig,
+        private_key: &str,
+        db: Db,
+        sockets: Sockets,
+        hooks: Hooks,
+    ) -> Result<Self, Error> {
         let public_key = Key::from_base64(private_key)?.get_public();
         let context = Context {
             db: db.clone(),
             endpoints: hooks.endpoints,
             public_key,
+            internal_address: config.address,
             changed: hooks.changed.clone(),
             invitations: Arc::default(),
         };
@@ -120,6 +134,8 @@ pub struct Context {
     /// The endpoints at which the tunnel of the coordinator's node observes the peers.
     pub endpoints: Endpoints,
     pub public_key: Key,
+    /// The address that the server serves its API on, within the delegations of its own peer.
+    pub internal_address: IpAddr,
     /// Tells the coordinator's node that the coordinator changed what the node holds.
     pub changed: StoreChanged,
     /// Tells the sweeper of invitations that one was created or redeemed, so that it sleeps until
@@ -427,6 +443,47 @@ mod tests {
             .request(test::USER1_PEER_IP, "GET", "/v1/admin/peers")
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_authentication_by_delegated_address() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (prefix, within) = if cfg!(feature = "v6-test") {
+            ("fd00:1337::2:0:1:0/112", "fd00:1337::2:0:1:5")
+        } else {
+            ("10.80.64.16/28", "10.80.64.20")
+        };
+        server.delegate(test::DEVELOPER1_PEER_ID, prefix);
+        let developer1 = test::peer(&server.db.lock(), test::DEVELOPER1_PEER_ID);
+        let key = Key::from_base64(&developer1.public_key)?;
+        let path = if cfg!(feature = "v6-test") {
+            format!("http://[{}]/v1/user/state", test::WG_MANAGE_PEER_IP)
+        } else {
+            format!("http://{}/v1/user/state", test::WG_MANAGE_PEER_IP)
+        };
+        let request = || {
+            Request::builder()
+                .uri(&path)
+                .header(INNERNET_PUBKEY_HEADER, server_key(&server))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Over TLS, the peer's key is accepted from any address of its delegations.
+        let res = server
+            .raw_request_as(within, Some(key.clone()), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = server
+            .raw_request_as(test::DEVELOPER2_PEER_IP, Some(key), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // In plain HTTP, any address of its delegations identifies the peer.
+        server.predate_tls(test::DEVELOPER1_PEER_ID);
+        let res = server.plain_request(within, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
         Ok(())
     }
 
