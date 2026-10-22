@@ -276,6 +276,7 @@ pub async fn serve(
     log::debug!("opening database connection...");
     let store = open_database_connection(&interface, conf)?;
     let public_key = check_database_matches_config(&store, &config)?;
+    check_internal_address(&DatabasePeer::own(&store, &public_key)?, config.address)?;
 
     log::info!("bringing up interface.");
     wg::up(
@@ -380,6 +381,20 @@ fn check_database_matches_config(
     Ok(public_key)
 }
 
+/// Checks that the server's own peer `myself` holds `address`, the internal address that the
+/// server serves its API on. Clients route the address to the server's key through the server's
+/// delegations, so an address outside them is unreachable.
+fn check_internal_address(myself: &DatabasePeer, address: IpAddr) -> Result<(), Error> {
+    if !myself.holds(address) {
+        bail!(
+            "the server's internal address {address}, from its config, lies outside the \
+             delegations of its own peer ({}); the config or the database is inconsistent",
+            myself.display_address()
+        );
+    }
+    Ok(())
+}
+
 /// This function differs per OS, because different operating systems have
 /// opposing characteristics when binding to a specific IP address.
 /// On Linux, binding to a specific local IP address does *not* bind it to
@@ -440,6 +455,19 @@ mod tests {
         };
         assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_internal_address_lies_in_the_server_delegation() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let config = ConfigFile::from_file(server.wg_conf_path())?;
+        let store = server.db.lock();
+        let key = Key::from_base64(&config.private_key)?.get_public();
+        let myself = DatabasePeer::own(&store, &key)?;
+        check_internal_address(&myself, config.address)?;
+        let error = check_internal_address(&myself, test::ADMIN_PEER_IP.parse()?).unwrap_err();
+        assert!(error.to_string().contains("outside"), "{error}");
         Ok(())
     }
 

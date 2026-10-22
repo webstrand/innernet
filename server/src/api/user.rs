@@ -506,7 +506,7 @@ mod tests {
 
             // The redeemed peer keeps the invitation's latch.
             let ip = ip.parse()?;
-            assert!(DatabasePeer::get_from_ip(&server.db().lock(), ip)?.requires_tls);
+            assert!(DatabasePeer::get_by_address(&server.db().lock(), ip)?.requires_tls);
         }
         Ok(())
     }
@@ -530,7 +530,7 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let ip = ip.parse()?;
-        assert!(!DatabasePeer::get_from_ip(&server.db().lock(), ip)?.requires_tls);
+        assert!(!DatabasePeer::get_by_address(&server.db().lock(), ip)?.requires_tls);
         Ok(())
     }
 

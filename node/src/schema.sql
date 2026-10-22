@@ -38,6 +38,22 @@ CREATE TABLE peers (
 -- No name belongs to two peers.
 CREATE UNIQUE INDEX names_once ON peers (name);
 
+-- The delegations of the peers: the aligned prefixes that the coordinator assigns each peer,
+-- whose addresses are routed to the peer and accepted from it. A lone address is a /32 or /128.
+-- `address` is the first address of the prefix, whose host bits are zero, and `last` its last
+-- address, so that the delegation of an address, and delegations that overlap, are found by
+-- comparing addresses of the same length. A client records the delegations that the coordinator
+-- reports. They follow their peer when its key changes, and go with it when it is deleted.
+CREATE TABLE delegations (
+  address    BLOB PRIMARY KEY CHECK (length(address) IN (4, 16)),
+  prefix_len INTEGER NOT NULL CHECK (prefix_len BETWEEN 0 AND length(address) * 8),
+  last       BLOB NOT NULL CHECK (length(last) = length(address) AND last >= address),
+  public_key BLOB NOT NULL REFERENCES peers ON UPDATE CASCADE ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX delegations_by_key ON delegations (public_key);
+CREATE INDEX delegations_by_last ON delegations (last);
+
 -- The CIDRs of the network, each keyed by its prefix. The parent of a CIDR is the smallest other
 -- CIDR that holds it, and the CIDR of a peer the smallest that holds its address. Every peer sees
 -- the peers of an `infra` CIDR.

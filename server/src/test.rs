@@ -96,7 +96,7 @@ pub fn peer(conn: &rusqlite::Connection, id: i64) -> DatabasePeer {
         USER2_PEER_ID => USER2_PEER_IP,
         _ => panic!("the test database has no peer with the ID {id}"),
     };
-    DatabasePeer::get_from_ip(conn, ip.parse().unwrap()).unwrap()
+    DatabasePeer::get_by_address(conn, ip.parse().unwrap()).unwrap()
 }
 
 pub struct Server {
@@ -225,7 +225,7 @@ impl Server {
     /// peer at `ip_str`, or as `plain_request` does if there is no peer there.
     pub async fn raw_request(&self, ip_str: &str, req: Request<Body>) -> Response<Body> {
         let ip = ip_str.parse().unwrap();
-        let client_key = DatabasePeer::get_from_ip(&self.db.lock(), ip)
+        let client_key = DatabasePeer::get_by_address(&self.db.lock(), ip)
             .ok()
             .map(|peer| Key::from_base64(&peer.public_key).unwrap());
         self.raw_request_as(ip_str, client_key, req).await

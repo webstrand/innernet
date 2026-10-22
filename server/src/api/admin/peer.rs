@@ -315,7 +315,12 @@ mod tests {
         let old_peers = DatabasePeer::list(&server.db().lock())?;
 
         // Try to add a peer with a name that is already taken.
-        let peer = test::developer_peer_contents("developer2", "10.80.64.4")?;
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:3"
+        } else {
+            "10.80.64.4"
+        };
+        let peer = test::developer_peer_contents("developer2", ip)?;
 
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
@@ -336,14 +341,16 @@ mod tests {
 
         let old_peers = DatabasePeer::list(&server.db().lock())?;
 
-        // Try to add a peer with an IP that is already taken.
-        let peer = test::developer_peer_contents("developer3", "10.80.64.3")?;
+        // Try to add a peer with an IP that is already taken, which the server explains.
+        let peer = test::developer_peer_contents("developer3", test::DEVELOPER2_PEER_IP)?;
 
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
 
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("delegated to peer developer2"));
 
         // The number of peer entries in the database should not change.
         let new_peers = DatabasePeer::list(&server.db().lock())?;
@@ -358,26 +365,29 @@ mod tests {
 
         let old_peers = DatabasePeer::list(&server.db().lock())?;
 
-        // Try to add IP outside of the CIDR network.
-        let peer = test::developer_peer_contents("developer3", "10.80.65.4")?;
-        let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        // Try to use the network address as peer IP.
-        let peer = test::developer_peer_contents("developer3", "10.80.64.0")?;
-        let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        // Try to use the broadcast address as peer IP.
-        let peer = test::developer_peer_contents("developer3", "10.80.64.255")?;
-        let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // An IP outside of the CIDR network, its network address and its broadcast address are
+        // refused, with an explanation. In IPv6, only the network address is reserved.
+        let refused: &[(&str, &str)] = if cfg!(feature = "v6-test") {
+            &[
+                ("fd00:1337::5:0:0:4", "outside"),
+                ("fd00:1337::2:0:0:0", "network or broadcast"),
+            ]
+        } else {
+            &[
+                ("10.80.65.4", "outside"),
+                ("10.80.64.0", "network or broadcast"),
+                ("10.80.64.255", "network or broadcast"),
+            ]
+        };
+        for (ip, reason) in refused {
+            let peer = test::developer_peer_contents("developer3", ip)?;
+            let res = server
+                .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+                .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = hyper::body::to_bytes(res.into_body()).await?;
+            assert!(String::from_utf8_lossy(&body).contains(reason), "{ip}");
+        }
 
         // The number of peer entries in the database should not change.
         let new_peers = DatabasePeer::list(&server.db().lock())?;
@@ -760,14 +770,14 @@ mod tests {
         // change, which names the peer by its old key, finds no peer.
         {
             let store = server.db.lock();
-            let mut invitee = DatabasePeer::get_from_ip(&store, ip.parse()?)?;
+            let mut invitee = DatabasePeer::get_by_address(&store, ip.parse()?)?;
             invitee.redeem(&store, &KeyPair::generate().public.to_base64())?;
         }
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
             .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        let invitee = DatabasePeer::get_from_ip(&server.db.lock(), ip.parse()?)?;
+        let invitee = DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?;
         assert_eq!(invitee.name.as_deref(), Some("invitee"));
         Ok(())
     }

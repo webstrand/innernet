@@ -1,13 +1,14 @@
 use super::DatabaseCidr;
 use crate::ServerError;
 use innernet_node::{
-    store::{self, key_to_bytes, EndpointKind},
+    store::{self, ip_to_bytes, key_to_bytes, prefix_from_row, row_key, EndpointKind},
     Store,
 };
 use innernet_shared::{
-    xeddsa, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents,
+    check_delegations, xeddsa, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents, Prefix,
     PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
+use ipnet::IpNet;
 use rusqlite::{params, Connection};
 use std::{
     collections::{HashMap, HashSet},
@@ -67,10 +68,11 @@ impl DatabasePeer {
             .collect())
     }
 
-    /// Creates the peer `contents`, which must lie within the CIDR that it names, a CIDR without
-    /// child CIDRs, at an address that the CIDR can assign, and which the server's node must
-    /// accept: a name, if it has one, that no other peer has, and an address and a key that are
-    /// pinned to no other key and address.
+    /// Creates the peer `contents`, which the server offers its IP as a host-prefix delegation.
+    /// The delegation must follow the rules of [`check_delegations`] within the CIDR that the peer
+    /// names, a CIDR without child CIDRs, and the server's node must accept the peer: a name, if
+    /// it has one, that no other peer has, and an address and a key that are pinned to no other
+    /// key and address.
     pub fn create(store: &Store, contents: PeerContents) -> Result<Self, ServerError> {
         log::info!("creating peer {:?}", contents);
 
@@ -80,10 +82,6 @@ impl DatabasePeer {
         }
 
         let cidr = DatabaseCidr::get(store, contents.cidr_id)?;
-        if !cidr.cidr.contains(&contents.ip) {
-            log::warn!("tried to add peer with IP outside of parent CIDR range.");
-            return Err(ServerError::InvalidQuery);
-        }
         if DatabaseCidr::list(store)?
             .iter()
             .any(|other| other.parent == Some(cidr.id))
@@ -91,13 +89,7 @@ impl DatabasePeer {
             log::warn!("tried to add peer to a CIDR that has child CIDRs.");
             return Err(ServerError::InvalidQuery);
         }
-        if !innernet_shared::IpNetExt::is_assignable(&cidr.cidr, &contents.ip) {
-            println!(
-                "Peer IP {} is not unicast assignable in CIDR {}",
-                contents.ip, cidr.cidr
-            );
-            return Err(ServerError::InvalidQuery);
-        }
+        check_new_delegations(store, &[Prefix::host(contents.ip)], &cidr.cidr, None)?;
 
         let key = key_to_bytes(&contents.public_key).map_err(|_| ServerError::InvalidQuery)?;
         let tx = store.unchecked_transaction()?;
@@ -275,12 +267,22 @@ impl DatabasePeer {
             .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
-    /// The peer at `ip`, as the pins of the node find it.
-    pub fn get_from_ip(conn: &Connection, ip: IpAddr) -> Result<Self, rusqlite::Error> {
-        let holder = store::holders_of(conn, ip)?
-            .pop()
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        Self::get_by_key(conn, &holder)
+    /// The peer whose delegations hold the address `ip`.
+    pub fn get_by_address(conn: &Connection, ip: IpAddr) -> Result<Self, rusqlite::Error> {
+        // Delegations never overlap, so only the one with the highest first address at or below
+        // `ip` may hold it.
+        let address = ip_to_bytes(ip);
+        let (public_key, last): ([u8; 32], Vec<u8>) = conn.query_row(
+            "SELECT public_key, last FROM delegations
+             WHERE length(address) = length(?1) AND address <= ?1
+             ORDER BY address DESC LIMIT 1",
+            params![address],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if address > last {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Self::get_by_key(conn, &public_key)
             .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
@@ -385,12 +387,100 @@ impl DatabasePeer {
     }
 }
 
+/// Checks that `delegations` may be delegated together to a peer of the CIDR `cidr`, as
+/// [`check_delegations`] does, given the delegations that the database holds for other peers than
+/// the one with the public key `holder`, if any. A delegation that breaks the rules is refused as
+/// [`ServerError::Delegation`], which explains why.
+pub(crate) fn check_new_delegations(
+    conn: &Connection,
+    delegations: &[Prefix],
+    cidr: &IpNet,
+    holder: Option<&[u8; 32]>,
+) -> Result<(), ServerError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT d.address, d.prefix_len, p.public_key, p.name
+         FROM delegations d JOIN peers p ON p.public_key = d.public_key
+         WHERE length(d.address) = length(?1) AND d.address <= ?2 AND ?1 <= d.last
+           AND p.public_key IS NOT ?3",
+    )?;
+    let mut others = vec![];
+    for delegation in delegations {
+        let mut rows = stmt.query(params![
+            ip_to_bytes(delegation.first()),
+            ip_to_bytes(delegation.last()),
+            holder,
+        ])?;
+        while let Some(row) = rows.next()? {
+            let prefix = prefix_from_row(row.get(0)?, row.get(1)?)?;
+            let holder = match row.get::<_, Option<String>>(3)? {
+                Some(name) => format!("peer {name}"),
+                None => format!("the peer with public key {}", row_key(row, 2)?),
+            };
+            others.push((prefix, holder));
+        }
+    }
+    let others = others
+        .iter()
+        .map(|(prefix, holder)| (prefix, holder.as_str()));
+    check_delegations(delegations, cidr, others).map_err(|e| {
+        log::warn!("refusing delegations {delegations:?}: {e}");
+        ServerError::Delegation(e.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test;
     use innernet_shared::Error;
     use std::time::Duration;
+
+    #[test]
+    fn test_delegations_follow_their_peer() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let store = server.db();
+        let store = store.lock();
+        let (ip, other) = if cfg!(feature = "v6-test") {
+            ("fd00:1337::3:0:0:9", "fd00:1337::3:0:0:a")
+        } else {
+            ("10.80.128.9", "10.80.128.10")
+        };
+        let delegations = |key: &Key| -> Result<i64, rusqlite::Error> {
+            store.query_row(
+                "SELECT count(*) FROM delegations WHERE public_key = ?1",
+                [key.0],
+                |r| r.get(0),
+            )
+        };
+        let mut invitee = DatabasePeer::create(
+            &store,
+            PeerContents {
+                is_redeemed: false,
+                ..test::user_peer_contents("invitee", ip)?
+            },
+        )?;
+        let old_key = Key::from_base64(&invitee.public_key)?;
+        assert_eq!(delegations(&old_key)?, 1);
+        assert_eq!(
+            DatabasePeer::get_by_address(&store, ip.parse()?)?.public_key,
+            invitee.public_key
+        );
+        assert!(matches!(
+            DatabasePeer::get_by_address(&store, other.parse()?),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+
+        // The delegation follows the peer to its new key.
+        let new_key = wireguard_control::KeyPair::generate().public;
+        invitee.redeem(&store, &new_key.to_base64())?;
+        assert_eq!(delegations(&old_key)?, 0);
+        assert_eq!(delegations(&new_key)?, 1);
+        assert_eq!(
+            DatabasePeer::get_by_address(&store, ip.parse()?)?.public_key,
+            new_key.to_base64()
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_invitations_expire() -> Result<(), Error> {
@@ -417,10 +507,8 @@ mod tests {
         assert!(next <= expires && next > expires - Duration::from_secs(1));
         assert_eq!(DatabasePeer::delete_expired_invites(&store)?, 1);
         assert_eq!(DatabasePeer::next_invite_expiry(&store)?, None);
-        DatabasePeer::create(
-            &store,
-            test::developer_peer_contents("again", "10.80.64.9")?,
-        )?;
+        assert!(DatabasePeer::get_by_address(&store, ip.parse()?).is_err());
+        DatabasePeer::create(&store, test::developer_peer_contents("again", ip)?)?;
         Ok(())
     }
 }

@@ -35,6 +35,10 @@ pub enum ServerError {
     )]
     PeerChanged,
 
+    /// Delegations that break the rules of delegations, with the explanation.
+    #[error("{0}")]
+    Delegation(String),
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -59,7 +63,7 @@ impl From<&ServerError> for StatusCode {
         use ServerError::*;
         match error {
             Unauthorized | TlsRequired => StatusCode::UNAUTHORIZED,
-            PromotionRequiresTls => StatusCode::UNPROCESSABLE_ENTITY,
+            PromotionRequiresTls | Delegation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
             PeerChanged => StatusCode::CONFLICT,
@@ -86,7 +90,8 @@ impl TryFrom<ServerError> for Response<Body> {
         let body = match e {
             ServerError::TlsRequired
             | ServerError::PromotionRequiresTls
-            | ServerError::PeerChanged => e.to_string().into(),
+            | ServerError::PeerChanged
+            | ServerError::Delegation(_) => e.to_string().into(),
             _ => Body::empty(),
         };
         Response::builder().status(StatusCode::from(&e)).body(body)

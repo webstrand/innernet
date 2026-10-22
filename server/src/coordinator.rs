@@ -262,8 +262,9 @@ async fn routes(
 }
 
 /// Identifies the peer making a request: by the key it authenticated with over TLS if it did,
-/// otherwise by its source IP, which anything on the peer's machine can send from. Peers that have
-/// once connected over TLS are refused the latter from then on.
+/// otherwise by its source IP, which must lie within one of the peer's delegations, and which
+/// anything on the peer's machine can send from. Peers that have once connected over TLS are
+/// refused the latter from then on.
 fn get_session(
     req: &Request<Body>,
     context: Context,
@@ -288,12 +289,12 @@ fn get_session(
         let store = context.db.lock();
         let mut peer = match client_key {
             Some(key) => DatabasePeer::get_from_public_key(&store, key),
-            None => DatabasePeer::get_from_ip(&store, addr),
+            None => DatabasePeer::get_by_address(&store, addr),
         }
         .map_err(not_found_is_unauthorized)?;
 
-        // WireGuard only delivers the peer's traffic from its own IP, so anything else means the
-        // connection didn't come through the tunnel.
+        // WireGuard only delivers the peer's traffic from the addresses of its delegations, so
+        // anything else means the connection didn't come through the tunnel.
         if !peer.holds(addr) {
             log::warn!("refusing {} connecting from {addr}.", *peer);
             return Err(ServerError::Unauthorized);

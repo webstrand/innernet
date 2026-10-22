@@ -70,9 +70,9 @@ fn is_origin(conn: &Connection) -> Result<bool, Error> {
 /// the copy fails, nothing is migrated. A record that the new tables can't hold, such as a public
 /// key that isn't base64 or a peer whose CIDR isn't the smallest that holds its IP, rolls the
 /// transaction back; an endpoint or candidates that the server couldn't read are dropped with a
-/// warning, as the server ignored them. The IDs of the peers, the CIDRs and the associations
-/// aren't kept: the API of plain HTTP numbers them by position. The invitations not yet redeemed
-/// are latched to TLS.
+/// warning, as the server ignored them. Each peer is delegated its IP, as a host prefix. The IDs
+/// of the peers, the CIDRs and the associations aren't kept: the API of plain HTTP numbers them by
+/// position. The invitations not yet redeemed are latched to TLS.
 fn rebuild(
     conn: &mut Connection,
     path: &Path,
@@ -348,6 +348,10 @@ mod tests {
         assert_eq!(peers[0].public_key, server.to_base64());
         assert_eq!(peers[1].display_name(), "alice");
         assert_eq!(peers[1].candidates, ["198.51.100.1:51820".parse().unwrap()]);
+
+        // Each peer's IP is its delegation, a host prefix.
+        let alice = DatabasePeer::get_by_address(&store, "10.0.1.2".parse().unwrap()).unwrap();
+        assert_eq!(alice.display_name(), "alice");
 
         // Only the invitation is latched to TLS.
         let latched: Vec<bool> = DatabasePeer::list(&store)
