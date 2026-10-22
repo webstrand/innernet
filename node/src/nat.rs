@@ -13,7 +13,7 @@ use innernet_shared::{
     wg::{DeviceExt, PeerInfoExt},
     Endpoint, PeerContents,
 };
-use std::{collections::BTreeMap, net::IpAddr, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
 pub const STEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -30,14 +30,14 @@ impl NatTraverse {
     pub fn new(
         interface: InterfaceName,
         backend: Backend,
-        endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+        endpoint_overrides: &BTreeMap<String, Endpoint>,
         diffs: &[Realized],
     ) -> Result<Self, Error> {
         // Filter out removed peers from diffs list.
         let mut remaining: Vec<_> = diffs
             .iter()
             .filter_map(|diff| diff.new.as_ref())
-            .filter(|peer| !endpoint_overrides.contains_key(&peer.ip))
+            .filter(|peer| !endpoint_overrides.contains_key(&peer.public_key))
             .cloned()
             .collect();
 

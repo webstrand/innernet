@@ -1,6 +1,7 @@
 use crate::{
     chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, PeerContents, WrappedIoError,
 };
+use anyhow::bail;
 use indoc::writedoc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
-use wireguard_control::{InterfaceName, KeyPair};
+use wireguard_control::{InterfaceName, Key, KeyPair};
 
 /// This struct contains everything necessary to establish an innernet connection: information about
 /// a local innernet interface and a remote innernet server.
@@ -30,11 +31,73 @@ pub struct InterfaceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsInfo>,
 
-    /// A configurable map of peer IP addresses to Endpoints which should
-    /// be used as the WireGuard endpoint for that peer.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    peer_endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
+    /// The endpoints that this client uses for peers instead of those that the server reports.
+    #[serde(default, skip_serializing_if = "EndpointOverrides::is_empty")]
+    peer_endpoint_overrides: EndpointOverrides,
+}
+
+/// The `[peer-endpoint-overrides]` table of the config: endpoints keyed by the peer's public key,
+/// in its canonical base64 encoding.
+///
+/// Versions before this one keyed overrides by peer IP. An IP-keyed entry is held apart, in
+/// `by_ip`, where no lookup reaches it, so that
+/// [`InterfaceConfig::refuse_ip_keyed_endpoint_overrides`] can refuse it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    try_from = "BTreeMap<String, Endpoint>",
+    into = "BTreeMap<String, Endpoint>"
+)]
+struct EndpointOverrides {
+    /// The overrides in use, keyed by the peer's canonical base64 public key.
+    by_public_key: BTreeMap<String, Endpoint>,
+    /// The overrides keyed by peer IP, which are refused.
+    by_ip: BTreeMap<IpAddr, Endpoint>,
+}
+
+impl EndpointOverrides {
+    fn is_empty(&self) -> bool {
+        self.by_public_key.is_empty() && self.by_ip.is_empty()
+    }
+}
+
+impl TryFrom<BTreeMap<String, Endpoint>> for EndpointOverrides {
+    type Error = String;
+
+    fn try_from(table: BTreeMap<String, Endpoint>) -> Result<Self, Self::Error> {
+        let mut overrides = Self::default();
+        for (key, endpoint) in table {
+            // A base64 public key never parses as an IP.
+            let duplicate = if let Ok(ip) = key.parse::<IpAddr>() {
+                overrides.by_ip.insert(ip, endpoint).is_some()
+            } else if let Ok(public_key) = Key::from_base64(&key) {
+                overrides
+                    .by_public_key
+                    .insert(public_key.to_base64(), endpoint)
+                    .is_some()
+            } else {
+                return Err(format!(
+                    "the endpoint override key {key:?} is neither a peer's public key nor a \
+                     peer IP"
+                ));
+            };
+            if duplicate {
+                return Err(format!(
+                    "the endpoint override key {key:?} names a peer that another key names too"
+                ));
+            }
+        }
+        Ok(overrides)
+    }
+}
+
+impl From<EndpointOverrides> for BTreeMap<String, Endpoint> {
+    fn from(overrides: EndpointOverrides) -> Self {
+        let by_ip = overrides
+            .by_ip
+            .into_iter()
+            .map(|(ip, endpoint)| (ip.to_string(), endpoint));
+        overrides.by_public_key.into_iter().chain(by_ip).collect()
+    }
 }
 
 /// The `[dns]` table of the config: a DNS server that answers queries for the hostnames of the
@@ -125,7 +188,7 @@ impl InterfaceConfig {
             interface,
             server,
             dns: None,
-            peer_endpoint_overrides: BTreeMap::new(),
+            peer_endpoint_overrides: EndpointOverrides::default(),
         }
     }
 
@@ -187,16 +250,55 @@ impl InterfaceConfig {
         Ok(Self::get_path(config_dir, interface))
     }
 
-    pub fn peer_endpoint_overrides(&self) -> &BTreeMap<IpAddr, Endpoint> {
-        &self.peer_endpoint_overrides
+    /// The endpoint overrides, keyed by the peer's canonical base64 public key.
+    pub fn peer_endpoint_overrides(&self) -> &BTreeMap<String, Endpoint> {
+        &self.peer_endpoint_overrides.by_public_key
     }
 
-    pub fn set_endpoint_override_for_peer(&mut self, peer_ip: IpAddr, endpoint: Endpoint) {
-        self.peer_endpoint_overrides.insert(peer_ip, endpoint);
+    pub fn endpoint_override_for_peer(&self, peer: &PeerContents) -> Option<&Endpoint> {
+        self.peer_endpoint_overrides
+            .by_public_key
+            .get(&peer.public_key)
     }
 
-    pub fn unset_endpoint_override_for_peer(&mut self, peer_ip: IpAddr) {
-        self.peer_endpoint_overrides.remove(&peer_ip);
+    pub fn set_endpoint_override_for_peer(&mut self, peer: &PeerContents, endpoint: Endpoint) {
+        self.peer_endpoint_overrides
+            .by_public_key
+            .insert(peer.public_key.clone(), endpoint);
+    }
+
+    pub fn unset_endpoint_override_for_peer(&mut self, peer: &PeerContents) {
+        self.peer_endpoint_overrides
+            .by_public_key
+            .remove(&peer.public_key);
+    }
+
+    /// Fails if the config keys an endpoint override by peer IP, as versions before this one wrote
+    /// them, which this version doesn't read. The error names each override as this version reads
+    /// it: keyed by the public key of the peer of `peers` that holds the IP, if exactly one does.
+    pub fn refuse_ip_keyed_endpoint_overrides(&self, peers: &[PeerContents]) -> Result<(), Error> {
+        let by_ip = &self.peer_endpoint_overrides.by_ip;
+        if by_ip.is_empty() {
+            return Ok(());
+        }
+        let mut lines = vec![];
+        for (ip, endpoint) in by_ip {
+            let mut holders = peers.iter().filter(|peer| peer.holds(*ip));
+            match (holders.next(), holders.next()) {
+                (Some(peer), None) => {
+                    lines.push(format!("\"{}\" = \"{endpoint}\" # {ip}", peer.public_key))
+                },
+                _ => lines.push(format!(
+                    "# \"{ip}\" = \"{endpoint}\": not exactly one peer holds {ip}"
+                )),
+            }
+        }
+        bail!(
+            "{}: the config keys endpoint overrides by peer IP, which this version doesn't read; \
+             [peer-endpoint-overrides] must key them by the peer's public key:\n{}",
+            self.interface.network_name,
+            lines.join("\n")
+        )
     }
 }
 
@@ -285,5 +387,111 @@ mod tests {
         assert!(config.server.has_feature(FEATURE_TLS));
         let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(config.server.features, ["tls", "from-the-future"]);
+    }
+
+    const KEY_A: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+    const KEY_B: &str = "GBfQ6Xqdrw2WsNsW8ZsANpyDLeffy6XqwOYpAyyZ3AQ=";
+
+    fn peer(ip: &str, public_key: &str) -> PeerContents {
+        PeerContents {
+            name: Some("peer1".parse().unwrap()),
+            ip: ip.parse().unwrap(),
+            cidr_id: 1,
+            public_key: public_key.to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        }
+    }
+
+    fn parse(overrides: &str) -> Result<InterfaceConfig, toml::de::Error> {
+        toml::from_str(&format!(
+            "{INVITATION}\n[peer-endpoint-overrides]\n{overrides}"
+        ))
+    }
+
+    /// The `[peer-endpoint-overrides]` table as `config` is written back.
+    fn written_overrides(config: &InterfaceConfig) -> BTreeMap<String, Endpoint> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct Written {
+            #[serde(default)]
+            peer_endpoint_overrides: BTreeMap<String, Endpoint>,
+        }
+        toml::from_str::<Written>(&config.as_toml())
+            .unwrap()
+            .peer_endpoint_overrides
+    }
+
+    fn endpoint(endpoint: &str) -> Endpoint {
+        endpoint.parse().unwrap()
+    }
+
+    #[test]
+    fn test_endpoint_overrides_keyed_by_public_key() {
+        let mut config = parse(&format!("\"{KEY_A}\" = \"198.51.100.7:51820\"")).unwrap();
+
+        // The override follows the key, wherever its peer is, and never the IP.
+        assert_eq!(
+            config.endpoint_override_for_peer(&peer("10.0.0.9", KEY_A)),
+            Some(&endpoint("198.51.100.7:51820"))
+        );
+        assert_eq!(
+            config.endpoint_override_for_peer(&peer("10.0.0.9", KEY_B)),
+            None
+        );
+        assert_eq!(
+            written_overrides(&config),
+            config.peer_endpoint_overrides().clone()
+        );
+
+        // An override is set and unset by the peer's key.
+        config.set_endpoint_override_for_peer(&peer("10.0.0.3", KEY_B), endpoint("1.1.1.1:1"));
+        config.unset_endpoint_override_for_peer(&peer("10.0.0.3", KEY_A));
+        assert_eq!(
+            written_overrides(&config),
+            BTreeMap::from([(KEY_B.to_string(), endpoint("1.1.1.1:1"))])
+        );
+
+        // A key that is neither a public key nor an IP is refused.
+        let error = parse("\"peer1\" = \"198.51.100.7:51820\"").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("neither a peer's public key nor a peer IP"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_ip_keyed_endpoint_overrides_are_refused() {
+        // A config that an earlier version wrote keys its overrides by IP, which are unused, and
+        // refused, each named as this version reads it.
+        let config = parse(&format!(
+            "\"10.0.0.3\" = \"198.51.100.7:51820\"\n\"10.0.0.4\" = \"198.51.100.8:51820\"\n\
+             \"{KEY_B}\" = \"198.51.100.10:51820\""
+        ))
+        .unwrap();
+        assert_eq!(config.peer_endpoint_overrides().len(), 1);
+        let peers = [peer("10.0.0.3", KEY_A), peer("10.0.0.5", KEY_B)];
+        let error = config
+            .refuse_ip_keyed_endpoint_overrides(&peers)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("\"{KEY_A}\" = \"198.51.100.7:51820\" # 10.0.0.3")),
+            "{error}"
+        );
+        assert!(
+            error.contains("not exactly one peer holds 10.0.0.4"),
+            "{error}"
+        );
+
+        let keyed = parse(&format!("\"{KEY_B}\" = \"198.51.100.10:51820\"")).unwrap();
+        assert!(keyed.refuse_ip_keyed_endpoint_overrides(&peers).is_ok());
     }
 }

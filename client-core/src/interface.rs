@@ -279,12 +279,18 @@ pub async fn round(
         "fetching state for {} from server...",
         interface.as_str_lossy().yellow()
     );
-    for (peer_ip, endpoint_override) in config.peer_endpoint_overrides() {
-        log::debug!(
-            "overriding peer IP {} with endpoint {}",
-            peer_ip,
-            endpoint_override
-        );
+    let store = DataStore::open_or_create(data_dir, interface, &config)?;
+    let peers = store.peers()?;
+    config.refuse_ip_keyed_endpoint_overrides(&peers)?;
+    for peer in &peers {
+        if let Some(endpoint_override) = config.endpoint_override_for_peer(peer) {
+            log::debug!(
+                "overriding peer {} ({}) with endpoint {}",
+                peer.display_name(),
+                peer.public_key,
+                endpoint_override
+            );
+        }
     }
     let device = Device::get(interface, network_opts.backend)?;
     let mut node = Node {
@@ -298,7 +304,6 @@ pub async fn round(
             events: state.events.clone(),
         }),
     };
-    let store = DataStore::open_or_create(data_dir, interface, &config)?;
     let mut link = RemoteLink {
         interface: *interface,
         store,

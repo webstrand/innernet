@@ -1,5 +1,5 @@
 use crate::util::all_installed;
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use clap::{ArgAction, Parser, Subcommand};
 use colored::*;
 use dialoguer::{Confirm, Input};
@@ -433,6 +433,18 @@ async fn up(
         return Ok(());
     };
 
+    // An endpoint override keyed by IP does not resolve itself, so it is fatal at startup.
+    for interface in installed()? {
+        let config = InterfaceConfig::from_interface(&opts.config_dir, &interface)
+            .with_context(|| interface.to_string())?;
+        let peers = if DataStore::exists(&opts.data_dir, &interface)? {
+            DataStore::open(&opts.data_dir, &interface, &config)?.peers()?
+        } else {
+            vec![]
+        };
+        config.refuse_ip_keyed_endpoint_overrides(&peers)?;
+    }
+
     // Each interface runs its node's rounds in a task of its own, at the interval, whenever the
     // host's addresses change, and on the timers of NAT traversal. The interfaces are listed again
     // at each interval, so that one installed or uninstalled meanwhile starts or stops.
@@ -627,16 +639,17 @@ fn override_peer_endpoint(
 ) -> Result<(), Error> {
     let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
+    let peers = data_store.peers()?;
+    config.refuse_ip_keyed_endpoint_overrides(&peers)?;
 
-    if let Some((peer, endpoint_opt)) = prompts::override_peer_endpoint_prompt(
-        &data_store.peers()?,
-        config.peer_endpoint_overrides(),
-        &sub_opts,
-    )? {
+    if let Some((peer, endpoint_opt)) =
+        prompts::override_peer_endpoint_prompt(&peers, config.peer_endpoint_overrides(), &sub_opts)?
+    {
         if let Some(endpoint) = endpoint_opt {
             log::info!(
-                "overriding endpoint for peer IP {} with endpoint {}",
-                peer.ip,
+                "overriding endpoint for peer {} ({}) with endpoint {}",
+                peer.display_name(),
+                peer.public_key,
                 endpoint
             );
 
@@ -649,7 +662,11 @@ fn override_peer_endpoint(
                 endpoint,
             )?;
         } else {
-            log::info!("unsetting endpoint override for peer IP {}", peer.ip);
+            log::info!(
+                "unsetting endpoint override for peer {} ({})",
+                peer.display_name(),
+                peer.public_key
+            );
 
             innernet_client_core::unset_endpoint_override_for_peer(
                 &opts.config_dir,
@@ -747,6 +764,7 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
             let device = Device::get(&name, opts.network.backend).with_str(name.as_str_lossy())?;
             let config = InterfaceConfig::from_interface(&opts.config_dir, &name)?;
             let store = DataStore::open(&opts.data_dir, &name, &config)?;
+            config.refuse_ip_keyed_endpoint_overrides(&store.peers()?)?;
 
             Ok(Some((device, store, config)))
         })
@@ -811,8 +829,8 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
         } else {
             for peer_state in peer_states {
                 let endpoint_has_local_override = interface_config
-                    .peer_endpoint_overrides()
-                    .contains_key(&peer_state.peer.ip);
+                    .endpoint_override_for_peer(peer_state.peer)
+                    .is_some();
                 print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
             }
         }
@@ -842,8 +860,8 @@ fn print_tree(
 
     for peer in peers.iter().filter(|p| p.peer.cidr_id == cidr.id) {
         let endpoint_has_local_override = interface_config
-            .peer_endpoint_overrides()
-            .contains_key(&peer.peer.ip);
+            .endpoint_override_for_peer(peer.peer)
+            .is_some();
         print_peer(peer, true, level, verbose, endpoint_has_local_override);
     }
 }

@@ -12,10 +12,7 @@ use crate::{
 use innernet_shared::{
     interface_config::DnsInfo, wg::DeviceExt as _, Endpoint, Error, PeerChange, PeerContents,
 };
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
-};
+use std::{collections::BTreeMap, net::SocketAddr};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
 
 /// What a tunnel backend changed of a peer when it realized a snapshot.
@@ -57,9 +54,9 @@ pub trait NamePublisher {
 pub struct WireGuard {
     pub interface: InterfaceName,
     pub backend: Backend,
-    /// The endpoint at which each peer is reached instead of the one that it states, by IP, as
-    /// the node's config overrides them.
-    pub endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
+    /// The endpoint at which each peer is reached instead of the one that it states, by public
+    /// key, as the node's config overrides them.
+    pub endpoint_overrides: BTreeMap<String, Endpoint>,
     /// The source of the events of the interface, which polls the device.
     pub events: EventSource,
 }

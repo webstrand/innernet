@@ -574,7 +574,7 @@ pub fn input_external_endpoint(
 /// Returns the peer and desired endpoint.
 pub fn override_peer_endpoint_prompt(
     peers: &[PeerContents],
-    peer_endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
+    peer_endpoint_overrides: &BTreeMap<String, Endpoint>,
     args: &OverridePeerEndpointOpts,
 ) -> Result<Option<(PeerContents, Option<Endpoint>)>, Error> {
     let eligible_peers = peers
@@ -582,7 +582,7 @@ pub fn override_peer_endpoint_prompt(
         .filter(|p| p.name.as_deref() != Some("innernet-server"))
         // If we're unsetting, filter eligible_peers to just be peers that have
         // an override already set.
-        .filter(|p| !args.unset || peer_endpoint_overrides.contains_key(&p.ip))
+        .filter(|p| !args.unset || peer_endpoint_overrides.contains_key(&p.public_key))
         .collect::<Vec<_>>();
 
     let peer = if let Some(name) = &args.name {
