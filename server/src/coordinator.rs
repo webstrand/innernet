@@ -54,6 +54,7 @@ pub struct Hooks {
 
 pub struct Coordinator {
     task: JoinHandle<Result<(), Error>>,
+    sweeper: JoinHandle<()>,
 }
 
 impl Coordinator {
@@ -78,7 +79,7 @@ impl Coordinator {
             changed: hooks.changed.clone(),
             invitations: Arc::default(),
         };
-        spawn_invitation_sweeper(db, hooks.changed, context.invitations.clone());
+        let sweeper = spawn_invitation_sweeper(db, hooks.changed, context.invitations.clone());
         let tls_config = tls::server_config(private_key)?;
         let tls_api = quic::serve(quic::endpoint(sockets.quic, tls_config)?, context.clone());
         let legacy = sockets
@@ -100,19 +101,30 @@ impl Coordinator {
                 },
             }
         });
-        Ok(Self { task })
+        Ok(Self { task, sweeper })
     }
 
     /// Waits until the coordinator stops, which it does only on an error.
     pub async fn join(self) -> Result<(), Error> {
         self.task.await?
     }
+
+    /// Stops the coordinator: its listeners and the sweeper of invitations. A request that is
+    /// being served may still complete.
+    pub fn shutdown(&self) {
+        self.task.abort();
+        self.sweeper.abort();
+    }
 }
 
 /// Deletes each invitation once it expires, and tells the node when it did. The sweeper sleeps
 /// until the next expiry that the database holds, and looks again when `invitations` signals that
 /// an invitation was created or redeemed.
-fn spawn_invitation_sweeper(db: Db, changed: StoreChanged, invitations: Arc<Notify>) {
+fn spawn_invitation_sweeper(
+    db: Db,
+    changed: StoreChanged,
+    invitations: Arc<Notify>,
+) -> JoinHandle<()> {
     tokio::task::spawn(async move {
         loop {
             let next = match DatabasePeer::next_invite_expiry(&db.lock()) {
@@ -147,7 +159,7 @@ fn spawn_invitation_sweeper(db: Db, changed: StoreChanged, invitations: Arc<Noti
                 _ => {},
             }
         }
-    });
+    })
 }
 
 /// The database that the coordinator shares with its node.

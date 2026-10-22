@@ -31,7 +31,7 @@ use wireguard_control::{InterfaceName, Key};
 
 mod api;
 pub mod config;
-mod coordinator;
+pub mod coordinator;
 mod db;
 mod error;
 pub mod initialize;
