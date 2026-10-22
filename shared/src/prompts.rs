@@ -106,7 +106,10 @@ pub fn add_cidr(cidrs: &[Cidr], request: &AddCidrOpts) -> Result<Option<Cidr>, E
         cidr,
     };
     if let Some(existing) = cidrs.iter().find(|existing| existing.cidr == cidr) {
-        bail!("The CIDR {cidr} exists already, as {}.", existing.name);
+        bail!(
+            "The CIDR {cidr} exists already, as {}.",
+            existing.name.escape_debug()
+        );
     }
     let parent = cidr_request.parent(cidrs);
     if parent != Some(parent_cidr) {
@@ -138,7 +141,10 @@ pub fn rename_cidr(cidrs: &[Cidr], args: &RenameCidrOpts) -> Result<Option<(Cidr
     } else {
         let (cidr_index, _) = select(
             "CIDR to rename",
-            &cidrs.iter().map(|ep| ep.name.clone()).collect::<Vec<_>>(),
+            &cidrs
+                .iter()
+                .map(|ep| ep.name.escape_debug().to_string())
+                .collect::<Vec<_>>(),
         )?;
         cidrs[cidr_index].clone()
     };
@@ -156,7 +162,7 @@ pub fn rename_cidr(cidrs: &[Cidr], args: &RenameCidrOpts) -> Result<Option<(Cidr
         if args.yes
             || confirm(&format!(
                 "Rename CIDR {} to {}?",
-                old_name.yellow(),
+                old_name.escape_debug().to_string().yellow(),
                 new_name.yellow()
             ))?
         {
@@ -190,7 +196,7 @@ pub fn delete_cidr(
         select("Delete CIDR", &eligible_cidrs)?.1
     };
 
-    if request.yes || confirm(&format!("Delete CIDR \"{}\"?", cidr.name))? {
+    if request.yes || confirm(&format!("Delete CIDR \"{}\"?", cidr.name.escape_debug()))? {
         Ok(cidr.clone())
     } else {
         Err(anyhow!("Canceled"))
@@ -231,14 +237,14 @@ pub fn choose_association<'a>(
     }
 }
 
-/// The association for display, by the names of its CIDRs among `cidrs`, or by the prefix of a
-/// CIDR that isn't among them.
+/// The association for display, by the names of its CIDRs among `cidrs`, escaped since the server
+/// chose them, or by the prefix of a CIDR that isn't among them.
 pub fn describe_association(association: &Association, cidrs: &[Cidr]) -> String {
     let name = |prefix: &Prefix| {
-        cidrs
-            .iter()
-            .find(|cidr| cidr.cidr == *prefix)
-            .map_or_else(|| prefix.to_string(), |cidr| cidr.name.clone())
+        cidrs.iter().find(|cidr| cidr.cidr == *prefix).map_or_else(
+            || prefix.to_string(),
+            |cidr| cidr.name.escape_debug().to_string(),
+        )
     };
     format!(
         "{} <=> {}",
@@ -277,8 +283,8 @@ pub fn add_association<'a>(
         if args.yes
             || confirm(&format!(
                 "Add association: {} <=> {}?",
-                cidr1.name.yellow().bold(),
-                cidr2.name.yellow().bold()
+                cidr1.name.escape_debug().to_string().yellow().bold(),
+                cidr2.name.escape_debug().to_string().yellow().bold()
             ))?
         {
             Some((cidr1, cidr2))

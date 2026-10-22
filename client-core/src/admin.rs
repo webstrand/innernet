@@ -33,7 +33,7 @@ pub async fn add_cidr(rest_client: &RestClient<'_>, sub_opts: AddCidrOpts) -> Re
 
             You'll need to add more associations for peers in diffent CIDRs to communicate.
             ",
-            cidr_name = cidr.name.bold()
+            cidr_name = cidr.name.escape_debug().to_string().bold()
         );
     } else {
         log::info!("exited without creating CIDR.");
@@ -275,12 +275,13 @@ pub async fn list_associations(rest_client: &RestClient<'_>) -> Result<(), Error
     log::info!("Fetching associations");
     let associations: Vec<Association> = rest_client.get_associations().await?;
 
-    // An association is named by its CIDRs, each by its name, or by its prefix if it has none.
+    // An association is named by its CIDRs, each by its name, escaped since the server chose it, or
+    // by its prefix if it has none.
     let name = |prefix: &Prefix| {
         cidrs
             .iter()
             .find(|c| c.cidr == *prefix)
-            .map_or_else(|| prefix.to_string(), |c| c.name.clone())
+            .map_or_else(|| prefix.to_string(), |c| c.name.escape_debug().to_string())
     };
     for association in associations {
         println!(

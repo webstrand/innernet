@@ -281,8 +281,10 @@ impl Cidr {
 }
 
 impl Display for Cidr {
+    /// The name of the CIDR, escaped as [`str::escape_debug`] escapes it, since the coordination
+    /// server chose it, and its prefix.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.name, self.cidr)
+        write!(f, "{} ({})", self.name.escape_debug(), self.cidr)
     }
 }
 
@@ -1623,6 +1625,16 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use wireguard_control::{Key, PeerConfigBuilder, PeerStats};
+
+    #[test]
+    fn test_cidr_display() {
+        // The name of a CIDR, which the coordination server chose, is shown escaped.
+        let cidr = Cidr {
+            name: "\x1b[2Joffice\n".to_string(),
+            cidr: "10.0.0.0/24".parse().unwrap(),
+        };
+        assert_eq!(cidr.to_string(), r"\u{1b}[2Joffice\n (10.0.0.0/24)");
+    }
 
     #[test]
     fn test_parse_host_suffix() {

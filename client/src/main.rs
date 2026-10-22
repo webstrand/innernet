@@ -596,7 +596,7 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
         colored::control::unset_override();
     } else {
         for cidr in &cidrs {
-            println!("{} {}", cidr.cidr, cidr.name);
+            println!("{} {}", cidr.cidr, cidr.name.escape_debug());
         }
     }
     Ok(())
@@ -877,7 +877,7 @@ fn print_tree(
         level * 2,
         "{} {}",
         cidr.cidr.to_string().bold().blue(),
-        cidr.name.blue(),
+        cidr.name.escape_debug().to_string().blue(),
     );
 
     let mut children: Vec<_> = cidr.children().collect();
