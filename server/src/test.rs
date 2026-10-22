@@ -9,16 +9,18 @@ use bytes::Buf;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_node::Store;
 use innernet_shared::{
+    announcement::{Announcement, SignedAnnouncement},
     cbor,
     problem::{self, Problem, ProblemType},
-    tls, Error, LegacyPeerContents, PeerContents, Prefix,
+    tls, xeddsa, Error, LegacyPeerContents, PeerContents, Prefix,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 use tempfile::TempDir;
 use wireguard_control::{InterfaceName, Key, KeyPair};
@@ -228,6 +230,24 @@ impl Server {
             .unwrap();
     }
 
+    /// The key pair of the peer with the ID `id`, whose private part the test holds, as
+    /// [`peer_contents`] generated it. The key of a peer never changes once anything is pinned
+    /// to it, so the test fixture keeps the private keys of the peers that it creates.
+    pub fn keypair(&self, id: i64) -> KeyPair {
+        let public_key = peer(&self.db.lock(), id).inner.public_key;
+        KEYPAIRS
+            .lock()
+            .get(&public_key)
+            .cloned()
+            .expect("the test fixture generated the key of the peer")
+    }
+
+    /// `announcement`, signed with `keypair`.
+    pub fn sign(&self, keypair: &KeyPair, announcement: &Announcement) -> SignedAnnouncement {
+        let private_key = xeddsa::PrivateKey::from_base64(&keypair.private.to_base64()).unwrap();
+        announcement.sign(&private_key).unwrap()
+    }
+
     /// Delegates `prefix` to the peer with the ID `id`, besides its other delegations, which the
     /// unsigned announcement that the server makes of a peer that has never announced then claims.
     pub fn delegate(&self, id: i64, prefix: &str) {
@@ -255,6 +275,7 @@ impl Server {
             public_key: self.public_key.clone(),
             internal_address: self.internal_address,
             quic_port: 54322,
+            network: ROOT_CIDR.parse().unwrap(),
             changed: Default::default(),
             invitations: Default::default(),
         }
@@ -535,9 +556,14 @@ pub fn create_cidr(db: &Store, name: &str, cidr_str: &str) -> Result<DatabaseCid
 // Below are helper functions for writing tests.
 //
 
+/// The key pairs that [`peer_contents`] generated, by public key.
+static KEYPAIRS: LazyLock<Mutex<HashMap<String, KeyPair>>> = LazyLock::new(Default::default);
+
 /// A peer at `ip_str`, whose CIDR is the one that holds it.
 pub fn peer_contents(name: &str, ip_str: &str, is_admin: bool) -> Result<PeerContents, Error> {
-    let public_key = KeyPair::generate().public;
+    let keypair = KeyPair::generate();
+    let public_key = keypair.public.clone();
+    KEYPAIRS.lock().insert(public_key.to_base64(), keypair);
 
     Ok(PeerContents {
         name: Some(name.parse().map_err(|e: &str| anyhow!(e))?),

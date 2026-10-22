@@ -12,7 +12,7 @@ use innernet_node::{
     events::EventSource,
     realize::{DnsService, Realized, WireGuard},
     runtime::{self, Link, Node, Round},
-    snapshot::Snapshot,
+    snapshot::{Snapshot, SnapshotConfig},
 };
 use innernet_shared::{
     interface_config::{ResolvedInvitation, FEATURE_TLS},
@@ -358,6 +358,7 @@ pub async fn round(
         interface: *interface,
         listen_port: device.listen_port.unwrap_or(51820),
         nat: nat.clone(),
+        snapshot_config: SnapshotConfig::default(),
         tunnel: Box::new(WireGuard {
             interface: *interface,
             backend: network_opts.backend,
@@ -441,8 +442,8 @@ impl Link for RemoteLink<'_> {
         Ok(())
     }
 
-    fn snapshot(&self) -> Result<Snapshot, Error> {
-        self.store.snapshot()
+    fn snapshot(&self, config: &SnapshotConfig) -> Result<Snapshot, Error> {
+        self.store.snapshot_as(config)
     }
 
     /// Reports `candidates` to a coordinator that the last sync reached.

@@ -163,7 +163,10 @@ pub async fn enable_or_disable_peer(
 /// network, through a coordinator that speaks TLS.
 async fn change_delegations(
     rest_client: &RestClient<'_>,
-    prompt: impl FnOnce(&[PeerContents], &[Cidr]) -> Result<Option<(PeerContents, Vec<Prefix>)>, Error>,
+    prompt: impl FnOnce(
+        &[PeerContents],
+        &[Cidr],
+    ) -> Result<Option<(PeerContents, Vec<Prefix>, Option<Prefix>)>, Error>,
 ) -> Result<(), Error> {
     if rest_client.admin_api().await? == AdminApi::Legacy {
         return Err(RestError::DelegationsUnsupported.into());
@@ -172,9 +175,9 @@ async fn change_delegations(
     log::info!("Fetching CIDRs and peers.");
     let cidrs = rest_client.get_cidrs().await?;
     let peers = rest_client.get_peers().await?;
-    if let Some((peer, delegations)) = prompt(&peers, &cidrs)? {
+    if let Some((peer, delegations, reclaim)) = prompt(&peers, &cidrs)? {
         rest_client
-            .set_delegations(&peer, delegations.clone())
+            .set_delegations(&peer, delegations.clone(), reclaim)
             .await?;
         let changed = PeerContents {
             delegations,
@@ -198,7 +201,7 @@ pub async fn add_delegation(
 ) -> Result<(), Error> {
     change_delegations(rest_client, |peers, cidrs| {
         Ok(prompts::add_delegation(peers, cidrs, &sub_opts)?
-            .map(|(peer, delegations)| (peer.clone(), delegations)))
+            .map(|(peer, delegations)| (peer.clone(), delegations, None)))
     })
     .await
 }
@@ -209,7 +212,18 @@ pub async fn withdraw_delegation(
 ) -> Result<(), Error> {
     change_delegations(rest_client, |peers, _| {
         Ok(prompts::withdraw_delegation(peers, &sub_opts)?
-            .map(|(peer, delegations)| (peer.clone(), delegations)))
+            .map(|(peer, delegations)| (peer.clone(), delegations, None)))
+    })
+    .await
+}
+
+pub async fn reclaim_delegation(
+    rest_client: &RestClient<'_>,
+    sub_opts: DelegationOpts,
+) -> Result<(), Error> {
+    change_delegations(rest_client, |peers, _| {
+        Ok(prompts::reclaim_delegation(peers, &sub_opts)?
+            .map(|(peer, prefix)| (peer.clone(), peer.delegations.clone(), Some(prefix))))
     })
     .await
 }

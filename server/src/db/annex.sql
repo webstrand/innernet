@@ -8,6 +8,16 @@ CREATE TABLE offered_names (
   name       TEXT NOT NULL UNIQUE
 ) STRICT, WITHOUT ROWID;
 
+-- The last announcement accepted from each peer as the peer signed it, which the coordinator
+-- relays to other peers and never decodes again: the payload, the exact bytes that the peer
+-- signed, and the signature. What the coordinator makes of a peer comes from the node's tables,
+-- so bytes that are lost or damaged here affect only what it relays.
+CREATE TABLE relayed_announcements (
+  public_key BLOB PRIMARY KEY REFERENCES peers ON UPDATE CASCADE ON DELETE CASCADE,
+  payload    BLOB NOT NULL,
+  signature  BLOB NOT NULL CHECK (length(signature) = 64)
+) STRICT, WITHOUT ROWID;
+
 -- The associations of CIDRs, whose peers see each other's: each names its two CIDRs by their
 -- prefixes, the lower first, in the order of prefixes, so that a pair is held once.
 CREATE TABLE associations (

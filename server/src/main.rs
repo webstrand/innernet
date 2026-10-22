@@ -112,6 +112,17 @@ enum Command {
         args: DelegationOpts,
     },
 
+    /// Mark a delegation of a peer to be reclaimed.
+    ///
+    /// A marked delegation stops being delegated to the peer once the peer, having claimed some of
+    /// it, announces without claiming any of it, so that a cooperative peer can move.
+    ReclaimDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: DelegationOpts,
+    },
+
     /// Rename an existing peer.
     RenamePeer {
         interface: Interface,
@@ -226,6 +237,13 @@ async fn run(opts: Opts) -> Result<(), anyhow::Error> {
             let admin = AdminClient::new(&interface, &conf)?;
             let rest_client = admin.rest_client()?;
             admin::withdraw_delegation(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::ReclaimDelegation { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::reclaim_delegation(&rest_client, args)
                 .await
                 .map_err(|e| admin.explain(e))?
         },

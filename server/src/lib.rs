@@ -9,6 +9,7 @@ use innernet_node::{
     events::{EventSource, TunnelEvent, TunnelEvents},
     realize::{DnsService, TunnelBackend as _, WireGuard},
     runtime::{self, Node, StoreChanged, Triggers},
+    snapshot::SnapshotConfig,
     Store,
 };
 use innernet_shared::{
@@ -348,6 +349,9 @@ pub async fn serve(
             exclude_nat_candidates: vec![],
             no_nat_candidates: false,
         },
+        snapshot_config: SnapshotConfig {
+            route_primary_ip: true,
+        },
         tunnel: Box::new(tunnel),
     };
     let mut dns = DnsService::new(interface, hosts_opts.host_suffix.clone());
@@ -382,6 +386,7 @@ pub async fn serve(
             network_name: interface,
             address: config.address,
             quic_port,
+            network: config.network(),
         },
         &config.private_key,
         db,

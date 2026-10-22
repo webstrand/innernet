@@ -555,8 +555,8 @@ pub struct DelegationOpts {
     #[clap(long)]
     pub name: Option<Hostname>,
 
-    /// The prefix to delegate or withdraw (eg. '10.42.5.16/28', or '10.42.5.9/32' for a single
-    /// address)
+    /// The prefix to delegate, withdraw or mark (eg. '10.42.5.16/28', or '10.42.5.9/32' for a
+    /// single address)
     #[clap(long)]
     pub prefix: Option<Prefix>,
 
@@ -926,7 +926,8 @@ impl Display for PeerContents {
 
 /// A peer and its tag: the body of `GET /admin/peers/{key}` in TLS sessions. A change to the peer
 /// carries the tag, and the server refuses the change if the peer has changed since. The tag
-/// leaves out the peer's endpoint and candidates, which the peer reports on its own.
+/// leaves out the peer's endpoint and candidates and its announcement, which the peer reports on
+/// its own.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeer {
     pub peer: PeerContents,
@@ -958,32 +959,27 @@ impl PeerUpdate {
     }
 }
 
-/// The endpoint and candidates stored for a peer, as the peer or an admin set them, without the
-/// endpoint that the server observes.
+/// The endpoints at which other peers reach a peer, as they take effect, in the order in which
+/// peers try them, the preferred first: the body of `GET /admin/peers/{key}/endpoints` in TLS
+/// sessions. Only the peer sets them, so they carry no tag.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerEndpoints {
-    pub endpoint: Option<Endpoint>,
     #[serde(default)]
-    pub candidates: Vec<Endpoint>,
+    pub endpoints: Vec<Endpoint>,
 }
 
-/// A peer's endpoints and their tag: the body of `GET` and `PUT /admin/peers/{key}/endpoints` in
-/// TLS sessions. The endpoints are tagged apart from the rest of the peer. A `PUT` carries the
-/// tag of the endpoints as the admin read them, and the server refuses it if they have changed
-/// since.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TaggedPeerEndpoints {
-    pub endpoints: PeerEndpoints,
-    pub tag: Tag,
-}
-
-/// A peer's delegations and their tag: the body of `GET` and `PUT /admin/peers/{key}/delegations`
-/// in TLS sessions. A `PUT` replaces the delegations of the peer with `delegations` as a whole,
-/// and carries the tag of the delegations as the admin read them; the server refuses it if they
-/// have changed since. The delegations are tagged apart from the rest of the peer.
+/// A peer's delegations, the ranges that the server assigns it, and their tag: the body of `GET`
+/// and `PUT /admin/peers/{key}/delegations` in TLS sessions. A `PUT` replaces the delegations of
+/// the peer with `delegations` as a whole, and those marked to be reclaimed with `reclaim`, and
+/// carries the tag of the delegations as the admin read them; the server refuses it if they have
+/// changed since. The delegations are tagged apart from the rest of the peer.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeerDelegations {
     pub delegations: Vec<Prefix>,
+    /// The delegations that stop being assigned to the peer once it, having claimed some of one,
+    /// announces without claiming any of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaim: Vec<Prefix>,
     pub tag: Tag,
 }
 
@@ -1452,9 +1448,12 @@ impl From<LegacyState> for State {
     }
 }
 
-/// This model is sent as a response to the /capabilities endpoint.
+/// The answer to `GET /v1/user/capabilities` of the API of plain-HTTP sessions, as clients that
+/// predate TLS read it, and as a client upgraded from one reads the QUIC port of the TLS API.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct ServerCapabilities {
+pub struct LegacyCapabilities {
+    /// Whether the server fills in the host at which it observes the peer when `PUT
+    /// /v1/user/endpoint` sets an endpoint whose host is unspecified, such as `0.0.0.0:51820`.
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
 
@@ -1462,6 +1461,40 @@ pub struct ServerCapabilities {
     /// server that predates TLS states none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_port: Option<u16>,
+}
+
+/// The answer to `GET /user/capabilities` of the TLS API. It leaves out
+/// `unspecified_ip_in_override_endpoint` of [`LegacyCapabilities`]: a peer that speaks TLS sets
+/// no endpoint on its own, and completes an endpoint whose host is unspecified itself, with the
+/// endpoint at which the server observes it.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct ServerCapabilities {
+    /// The UDP port of the TLS API, as [`LegacyCapabilities`] states it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
+
+    /// The types of claims that the server checks in announcements, which it accepts at `PUT
+    /// /user/announcement` of the TLS API in place of the endpoint and candidates that a peer
+    /// sets on their own, and relays. A client announces only claims of these types, and accepts
+    /// of the announcements that the server relays only the claims of these types; it states its
+    /// statements whatever the types. A server that predates announcements states none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub announcement_claims: Vec<String>,
+}
+
+impl ServerCapabilities {
+    /// Whether the server checks claims of the type `claim` in announcements.
+    pub fn checks_claim(&self, claim: &str) -> bool {
+        self.announcement_claims
+            .iter()
+            .any(|checked| checked == claim)
+    }
+
+    /// Whether the server accepts announcements, which then carry this client's endpoint and
+    /// candidates, as statements: whether it checks claims of any type.
+    pub fn accepts_announcements(&self) -> bool {
+        !self.announcement_claims.is_empty()
+    }
 }
 
 /// The answer to `GET /server` of the TLS API, a public route: the server's public key, in
@@ -1497,6 +1530,11 @@ pub struct Whoami {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PublicCapabilities {
     pub quic_port: Option<u16>,
+    /// The types of claims that the server checks in announcements, as [`ServerCapabilities`]
+    /// states them.
+    #[serde(default)]
+    pub announcement_claims: Vec<String>,
+
     /// The version of innernet-server.
     pub version: String,
 }

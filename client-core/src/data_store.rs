@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use innernet_node::{
     accept::{self, Accepted, Received, Refusal},
     db::{self, Scope},
-    snapshot::{self, Snapshot},
+    snapshot::{self, Snapshot, SnapshotConfig},
     store::{self as node_store, key_to_bytes, EndpointKind},
     Store,
 };
@@ -356,7 +356,12 @@ impl DataStore {
     /// What this client configures, as the node core makes it of the data store: the peers as
     /// they take effect, in the order of [`Self::peers`].
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        Ok(snapshot::of_store(&self.store)?)
+        self.snapshot_as(&SnapshotConfig::default())
+    }
+
+    /// The snapshot of the data store, as `config` configures it.
+    pub fn snapshot_as(&self, config: &SnapshotConfig) -> Result<Snapshot, Error> {
+        Ok(snapshot::of_store(&self.store, config)?)
     }
 
     pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
@@ -621,7 +626,7 @@ fn write_peer(tx: &Connection, peer: &PeerContents) -> Result<(), Error> {
         tx.execute(
             "INSERT INTO delegations (address, prefix_len, last, public_key) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (address) DO UPDATE SET prefix_len = excluded.prefix_len,
-               last = excluded.last, public_key = excluded.public_key",
+               last = excluded.last, public_key = excluded.public_key, reclaim = 0",
             params![
                 node_store::ip_to_bytes(delegation.first()),
                 delegation.prefix_len(),

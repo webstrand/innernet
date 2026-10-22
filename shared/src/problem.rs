@@ -128,8 +128,67 @@ pub const CLIENT_KEY_REQUIRED: ProblemType = ProblemType {
     status: 403,
 };
 
+/// The announcement isn't newer than the last one that the server accepted from the peer.
+pub const ANNOUNCEMENT_STALE: ProblemType = ProblemType {
+    uri: "urn:uuid:184dd242-7e47-4968-a2c8-4605eec19515",
+    title: "The announcement is not newer than the last one",
+    status: 409,
+};
+
+/// The announcement isn't signed by the peer, or isn't an announcement.
+pub const ANNOUNCEMENT_INVALID: ProblemType = ProblemType {
+    uri: "urn:uuid:5bb9d47d-e151-47f1-aedc-225820aa445e",
+    title: "The announcement is not valid",
+    status: 422,
+};
+
+/// The payload of the announcement is longer than the server reads. The problem states the limit,
+/// in bytes, in the extension member `limit`.
+pub const ANNOUNCEMENT_TOO_LARGE: ProblemType = ProblemType {
+    uri: "urn:uuid:50a223ec-dfc1-4bad-bd50-b99701a36cfb",
+    title: "The announcement is too large",
+    status: 413,
+};
+
+/// The timestamp of the announcement is too far ahead of the server's clock.
+pub const ANNOUNCEMENT_TOO_FAR_AHEAD: ProblemType = ProblemType {
+    uri: "urn:uuid:98823c67-f627-4ee4-b7b0-cc1abe809d8a",
+    title: "The announcement is dated too far ahead",
+    status: 422,
+};
+
+/// The announcement makes a claim of a type that the server doesn't check.
+pub const ANNOUNCEMENT_CLAIM_UNKNOWN: ProblemType = ProblemType {
+    uri: "urn:uuid:4bc5b0e3-98e6-4b38-9736-1fc748472756",
+    title: "The announcement makes a claim of a type that the server does not check",
+    status: 422,
+};
+
+/// The announcement claims what the server doesn't assign the peer, or states a primary IP outside
+/// the delegation that it claims, or none.
+pub const ANNOUNCEMENT_UNASSIGNED: ProblemType = ProblemType {
+    uri: "urn:uuid:a2d674a8-8a8e-400d-9cb2-480c4e95771b",
+    title: "The announcement claims what the peer is not assigned",
+    status: 422,
+};
+
+/// The announcement claims what the last announcement accepted from another peer claims.
+pub const ANNOUNCEMENT_CLAIMED: ProblemType = ProblemType {
+    uri: "urn:uuid:1f1c3586-4cf0-4a12-92e7-e8a3bcc1c723",
+    title: "The announcement claims what another peer claims",
+    status: 409,
+};
+
+/// A change of the delegations of a peer that would take back part of the delegation that the
+/// peer claims in its announcement.
+pub const DELEGATION_CLAIMED: ProblemType = ProblemType {
+    uri: "urn:uuid:48c289c0-b350-4f97-8c92-9205c546c852",
+    title: "The peer claims what the change would withdraw",
+    status: 409,
+};
+
 /// Every type of problem of innernet's own.
-pub const PROBLEM_TYPES: [ProblemType; 10] = [
+pub const PROBLEM_TYPES: [ProblemType; 18] = [
     TLS_REQUIRED,
     PROMOTION_REQUIRES_TLS,
     PEER_CHANGED,
@@ -140,6 +199,14 @@ pub const PROBLEM_TYPES: [ProblemType; 10] = [
     NO_SUCH_ASSOCIATION,
     DELEGATION_REFUSED,
     CLIENT_KEY_REQUIRED,
+    ANNOUNCEMENT_STALE,
+    ANNOUNCEMENT_INVALID,
+    ANNOUNCEMENT_TOO_LARGE,
+    ANNOUNCEMENT_TOO_FAR_AHEAD,
+    ANNOUNCEMENT_CLAIM_UNKNOWN,
+    ANNOUNCEMENT_UNASSIGNED,
+    ANNOUNCEMENT_CLAIMED,
+    DELEGATION_CLAIMED,
 ];
 
 /// A problem detail. Members that a problem lacks are left out, and members that a recipient
@@ -172,6 +239,9 @@ pub struct Problem {
         deserialize_with = "deserialize_optional_public_key"
     )]
     pub holder: Option<String>,
+    /// Of [`ANNOUNCEMENT_TOO_LARGE`]: the longest payload, in bytes, that the server reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
 }
 
 fn about_blank() -> String {
@@ -191,6 +261,7 @@ impl Problem {
             prefix: None,
             held: None,
             holder: None,
+            limit: None,
         }
     }
 

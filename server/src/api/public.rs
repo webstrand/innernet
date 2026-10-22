@@ -10,7 +10,9 @@ use crate::{
     Context, ServerError, VERSION,
 };
 use hyper::{Body, Response};
-use innernet_shared::{media_type::Representation, PublicCapabilities, ServerDescription, Whoami};
+use innernet_shared::{
+    announcement, media_type::Representation, PublicCapabilities, ServerDescription, Whoami,
+};
 use wireguard_control::Key;
 
 /// `GET /server`: the server's public key, the name of the network and its CIDR, the root CIDR.
@@ -74,6 +76,7 @@ pub fn capabilities(
 ) -> Result<Response<Body>, ServerError> {
     let capabilities = PublicCapabilities {
         quic_port: Some(context.quic_port),
+        announcement_claims: announcement::CLAIM_TYPES.map(String::from).to_vec(),
         version: VERSION.to_string(),
     };
     represented_response(representation, capabilities)
@@ -83,7 +86,9 @@ pub fn capabilities(
 mod tests {
     use crate::test;
     use hyper::{header, StatusCode};
-    use innernet_shared::{problem, Error, Prefix, PublicCapabilities, ServerDescription, Whoami};
+    use innernet_shared::{
+        announcement, problem, Error, Prefix, PublicCapabilities, ServerDescription, Whoami,
+    };
     use serde::de::IgnoredAny;
     use std::collections::BTreeMap;
     use wireguard_control::KeyPair;
@@ -106,6 +111,7 @@ mod tests {
         );
         let capabilities: PublicCapabilities = test::cbor_body(get("/capabilities").await).await?;
         assert_eq!(capabilities.quic_port, Some(54322));
+        assert_eq!(capabilities.announcement_claims, announcement::CLAIM_TYPES);
         assert_eq!(capabilities.version, crate::VERSION);
         let members: BTreeMap<String, IgnoredAny> =
             test::cbor_body(get("/capabilities").await).await?;

@@ -1,14 +1,16 @@
 //! The coordinator of a network, as a service of the node that it runs beside: it serves the API,
-//! in TLS over QUIC and, for clients that predate TLS, in plain HTTP, and keeps what it assigns the
-//! peers in its annex to the node's database. It runs on what it is handed: its key, the database
-//! that it shares with its node, its config, sockets that the host has bound, and the hooks through
-//! which it tells the node of a change and learns where the node's tunnel observes the peers.
+//! in TLS over QUIC and, for clients that predate TLS, in plain HTTP, and keeps what it assigns
+//! and offers the peers in its annex to the node's database. It runs on what it is handed: its
+//! key, the database that it shares with its node, its config, sockets that the host has bound,
+//! and the hooks through which it tells the node of a change and learns where the node's tunnel
+//! observes the peers.
 
 use crate::{api, db::DatabasePeer, quic, util, ServerError};
 use anyhow::Error;
 use hyper::{http, service::service_fn, Body, Request, Response};
 use innernet_node::{runtime::StoreChanged, Store};
 use innernet_shared::{media_type::Representation, tls, INNERNET_PUBKEY_HEADER};
+use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, VecDeque},
@@ -29,6 +31,8 @@ pub struct CoordinatorConfig {
     pub address: IpAddr,
     /// The UDP port of the TLS API, at `address`.
     pub quic_port: u16,
+    /// The prefix of the network.
+    pub network: IpNet,
 }
 
 /// The sockets at which the coordinator serves its API, which the host binds.
@@ -70,6 +74,7 @@ impl Coordinator {
             public_key,
             internal_address: config.address,
             quic_port: config.quic_port,
+            network: config.network,
             changed: hooks.changed.clone(),
             invitations: Arc::default(),
         };
@@ -163,6 +168,8 @@ pub struct Context {
     pub internal_address: IpAddr,
     /// The UDP port of the TLS API, at `internal_address`.
     pub quic_port: u16,
+    /// The prefix of the network, outside which the coordinator's node accepts no claim.
+    pub network: IpNet,
     /// Tells the coordinator's node that the coordinator changed what the node holds.
     pub changed: StoreChanged,
     /// Tells the sweeper of invitations that one was created or redeemed, so that it sleeps until

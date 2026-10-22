@@ -5,7 +5,16 @@
 //! The node makes it of what it accepted alone, and never reads what the operating system holds
 //! back as truth.
 
-use innernet_shared::{announcement::Announcement, PeerContents};
+use innernet_shared::{announcement::Announcement, PeerContents, Prefix};
+
+/// How a node configures what it accepted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SnapshotConfig {
+    /// Whether the node routes the primary IP of each peer to it besides the allowed IPs that the
+    /// peer states, as the coordinator does, so that it reaches every peer at the address at
+    /// which its name resolves, whatever the peer states.
+    pub route_primary_ip: bool,
+}
 
 /// What a node configures: its desired state, which the output adapters realize.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -24,38 +33,70 @@ pub fn effective(record: &PeerContents, announcement: Option<&Announcement>) -> 
     record.effective_with(Some(announcement.unwrap_or(&none)))
 }
 
+/// `peer`, as it takes effect, with its primary IP routed to it besides its allowed IPs, as the
+/// coordinator routes it.
+pub fn with_primary_ip(peer: &PeerContents) -> PeerContents {
+    let mut allowed_ips = peer.allowed_ips.clone().unwrap_or(peer.delegations.clone());
+    if let Some(primary_ip) = peer.primary_ip {
+        if !allowed_ips
+            .iter()
+            .any(|prefix| prefix.contains_addr(&primary_ip))
+        {
+            allowed_ips.push(Prefix::host(primary_ip));
+            allowed_ips.sort();
+        }
+    }
+    PeerContents {
+        allowed_ips: Some(allowed_ips),
+        ..peer.clone()
+    }
+}
+
 /// The snapshot of the store of `conn`: of every peer that it records, with the last announcement
 /// of it that the node accepted, as [`snapshot`] makes it.
-pub fn of_store(conn: &rusqlite::Connection) -> Result<Snapshot, rusqlite::Error> {
+pub fn of_store(
+    conn: &rusqlite::Connection,
+    config: &SnapshotConfig,
+) -> Result<Snapshot, rusqlite::Error> {
     let peers = crate::store::load_peers(conn)?;
     let announcements = crate::store::load_announcements(conn, None)?;
-    Ok(snapshot(peers.iter().map(|peer| {
-        (
-            peer,
-            announcements
-                .get(&peer.public_key)
-                .map(|stored| &stored.announcement),
-        )
-    })))
+    Ok(snapshot(
+        config,
+        peers.iter().map(|peer| {
+            (
+                peer,
+                announcements
+                    .get(&peer.public_key)
+                    .map(|stored| &stored.announcement),
+            )
+        }),
+    ))
 }
 
 /// The snapshot of `peers`, each the node's record of a peer with the last announcement of it
-/// that the node accepted, if any. Each peer takes effect as [`effective`] makes it.
+/// that the node accepted, if any, as `config` configures them. Each peer takes effect as
+/// [`effective`] makes it.
 pub fn snapshot<'a>(
+    config: &SnapshotConfig,
     peers: impl IntoIterator<Item = (&'a PeerContents, Option<&'a Announcement>)>,
 ) -> Snapshot {
-    Snapshot {
-        peers: peers
-            .into_iter()
-            .map(|(record, announcement)| effective(record, announcement))
-            .collect(),
+    let mut snapshot = Snapshot::default();
+    for (record, announcement) in peers {
+        let peer = effective(record, announcement);
+        let peer = if config.route_primary_ip {
+            with_primary_ip(&peer)
+        } else {
+            peer
+        };
+        snapshot.peers.push(peer);
     }
+    snapshot
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innernet_shared::{announcement::Claims, Prefix};
+    use innernet_shared::announcement::Claims;
 
     fn record(name: &str, ip: &str) -> PeerContents {
         PeerContents {
@@ -94,7 +135,7 @@ mod tests {
         let plain_announced = announcement(Some("plain"), "10.0.0.0/30", "10.0.0.2");
         let silent = record("silent", "10.0.0.3");
         let peers = [(&plain, Some(&plain_announced)), (&silent, None)];
-        let snapshot = super::snapshot(peers);
+        let snapshot = super::snapshot(&SnapshotConfig::default(), peers);
 
         // Each peer takes effect as it announced: one without an accepted announcement is routed
         // nothing, and has no name.
@@ -105,5 +146,25 @@ mod tests {
         );
         assert!(!snapshot.peers[1].is_routed());
         assert_eq!(snapshot.peers[1].name, None);
+    }
+
+    #[test]
+    fn test_route_primary_ip() {
+        // The coordinator routes the primary IP of a peer to it, whatever allowed IPs it states.
+        let peer = record("peer", "10.0.0.2");
+        let announced = Announcement {
+            allowed_ips: vec![],
+            ..announcement(Some("peer"), "10.0.0.0/30", "10.0.0.2")
+        };
+        let config = SnapshotConfig {
+            route_primary_ip: true,
+        };
+        let snapshot = snapshot(&config, [(&peer, Some(&announced))]);
+        assert_eq!(
+            snapshot.peers[0].allowed_ips,
+            Some(vec![Prefix::host("10.0.0.2".parse().unwrap())])
+        );
+        let snapshot = super::snapshot(&SnapshotConfig::default(), [(&peer, Some(&announced))]);
+        assert_eq!(snapshot.peers[0].allowed_ips, Some(vec![]));
     }
 }

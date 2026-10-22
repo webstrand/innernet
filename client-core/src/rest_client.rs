@@ -6,8 +6,8 @@ use innernet_shared::{
     media_type, parent_cidr,
     problem::{self, Problem},
     smallest_cidr_holding, tls, wg, Association, Cidr, CidrDeletion, LegacyAssociation,
-    LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
-    LegacyState, PeerContents, PeerUpdate, Prefix, ServerCapabilities, State, TaggedCidr,
+    LegacyAssociationContents, LegacyCapabilities, LegacyCidr, LegacyCidrContents, LegacyPeer,
+    LegacyPeerContents, LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr,
     TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
 use quinn::crypto::rustls::QuicClientConfig;
@@ -496,16 +496,18 @@ impl<'a> RestClient<'a> {
     }
 
     /// Replaces the delegations of the peer `listed`, as it was listed, with `delegations` as a
-    /// whole, in the API of TLS sessions. Delegations that have changed since the peer was listed
-    /// are refused as [`RestError::PeerChanged`]: the client refuses them when it reads them with
-    /// their tag, and the server refuses them if they change between the read and the change. A
-    /// peer that the server does not find by its key is refused as [`RestError::NoSuchPeer`]. A
-    /// server that predates TLS has no delegations, and is refused as
+    /// whole, in the API of TLS sessions, and marks `reclaim`, if any, to be reclaimed beside those
+    /// of `delegations` that are marked already. Delegations that have changed since the peer was
+    /// listed are refused as [`RestError::PeerChanged`]: the client refuses them when it reads
+    /// them with their tag, and the server refuses them if they change between the read and the
+    /// change. A peer that the server does not find by its key is refused as
+    /// [`RestError::NoSuchPeer`]. A server that predates TLS has no delegations, and is refused as
     /// [`RestError::DelegationsUnsupported`] without a request.
     pub async fn set_delegations(
         &self,
         listed: &PeerContents,
         delegations: Vec<Prefix>,
+        reclaim: Option<Prefix>,
     ) -> Result<(), RestError> {
         if self.admin_api().await? == AdminApi::Legacy {
             return Err(RestError::DelegationsUnsupported);
@@ -513,6 +515,7 @@ impl<'a> RestClient<'a> {
         let path = format!("/admin/peers/{}/delegations", listed.api_path_segment());
         let TaggedPeerDelegations {
             delegations: current,
+            reclaim: marked,
             tag,
         } = self.http("GET", &path).await?;
         let mut listed_delegations = listed.delegations.clone();
@@ -520,8 +523,21 @@ impl<'a> RestClient<'a> {
         if current != listed_delegations {
             return Err(RestError::PeerChanged);
         }
-        self.http_form("PUT", &path, TaggedPeerDelegations { delegations, tag })
-            .await
+        let reclaim = marked
+            .into_iter()
+            .chain(reclaim)
+            .filter(|range| delegations.contains(range))
+            .collect();
+        self.http_form(
+            "PUT",
+            &path,
+            TaggedPeerDelegations {
+                delegations,
+                reclaim,
+                tag,
+            },
+        )
+        .await
     }
 
     /// Perform a `verb` HTTP request at the given `endpoint`.
@@ -635,7 +651,7 @@ impl<'a> RestClient<'a> {
             .plain_request::<()>("GET", "/user/capabilities", None)
             .await
         {
-            Ok(body) => decode::<Option<ServerCapabilities>>(Transport::Plain, &body)?
+            Ok(body) => decode::<Option<LegacyCapabilities>>(Transport::Plain, &body)?
                 .and_then(|capabilities| capabilities.quic_port),
             Err(e) if e.has_status_of(404) => None,
             Err(e) => return Err(e),
@@ -919,13 +935,16 @@ fn check_length(body: &[u8]) -> Result<(), RestError> {
 }
 
 /// Whether the peers `a` and `b` are the same, but for what the server's tag of a peer leaves
-/// out: their endpoints and candidates, which a peer reports on its own, and their delegations,
-/// which an admin changes apart from the rest of the peer.
+/// out: their endpoints and candidates and their announcements, which a peer reports on its own,
+/// and their delegations, which an admin changes apart from the rest of the peer.
 fn same_but_untagged(a: &PeerContents, b: &PeerContents) -> bool {
     let tagged = |peer: &PeerContents| PeerContents {
         delegations: vec![],
         endpoint: None,
         candidates: vec![],
+        announcement: None,
+        allowed_ips: None,
+        primary_ip: None,
         ..peer.clone()
     };
     tagged(a) == tagged(b)
@@ -1949,6 +1968,7 @@ mod tests {
         let tagged = |delegations: &[Prefix]| {
             let body = TaggedPeerDelegations {
                 delegations: delegations.to_vec(),
+                reclaim: delegations.to_vec(),
                 tag: test_tag("ab"),
             };
             cbor_response("200 OK", &body)
@@ -1969,8 +1989,12 @@ mod tests {
         let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
 
-        // The client reads the delegations with their tag, and replaces them with the tag.
-        client.set_delegations(&peer, wider.clone()).await.unwrap();
+        // The client reads the delegations with their tag, and replaces them with the tag, keeping
+        // those that are marked to be reclaimed, and marking the one that it asks to.
+        client
+            .set_delegations(&peer, wider.clone(), Some(wider[1]))
+            .await
+            .unwrap();
         let path = format!("/admin/peers/{}/delegations", peer.api_path_segment());
         assert!(requests
             .recv()
@@ -1983,11 +2007,15 @@ mod tests {
             body,
             TaggedPeerDelegations {
                 delegations: wider.clone(),
+                reclaim: wider.clone(),
                 tag: test_tag("ab")
             }
         );
 
-        let error = client.set_delegations(&peer, vec![]).await.unwrap_err();
+        let error = client
+            .set_delegations(&peer, vec![], None)
+            .await
+            .unwrap_err();
         assert!(matches!(error, RestError::PeerChanged), "{error:?}");
     }
 
@@ -2223,7 +2251,7 @@ mod tests {
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
         let error = client
-            .set_delegations(&listed_peer(), vec![])
+            .set_delegations(&listed_peer(), vec![], None)
             .await
             .unwrap_err();
         assert!(

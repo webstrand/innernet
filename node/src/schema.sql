@@ -49,12 +49,15 @@ CREATE UNIQUE INDEX names_pinned_once ON peers (name);
 -- its delegation in its announcements. A lone address is a /32 or /128 range. `address` is the
 -- first address of the prefix, whose host bits are zero, and `last` its last address, so that the
 -- range of an address, and ranges that overlap, are found by comparing addresses of the same
--- length. A client records the ranges that the coordinator reports.
+-- length. A coordinator marks a range `reclaim` when it stops being assigned once the peer, having
+-- claimed some of it, announces without claiming any of it. A client records the ranges that the
+-- coordinator reports.
 CREATE TABLE delegations (
   address    BLOB PRIMARY KEY CHECK (length(address) IN (4, 16)),
   prefix_len INTEGER NOT NULL CHECK (prefix_len BETWEEN 0 AND length(address) * 8),
   last       BLOB NOT NULL CHECK (length(last) = length(address) AND last >= address),
-  public_key BLOB NOT NULL REFERENCES peers ON UPDATE CASCADE ON DELETE CASCADE
+  public_key BLOB NOT NULL REFERENCES peers ON UPDATE CASCADE ON DELETE CASCADE,
+  reclaim    INTEGER NOT NULL DEFAULT 0 CHECK (reclaim IN (0, 1))
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX delegations_by_key ON delegations (public_key);

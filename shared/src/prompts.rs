@@ -562,8 +562,13 @@ fn select_delegated_peer<'a>(
 }
 
 /// The warning printed when `delegations` would move the hosts fallback address of `peer`, at
-/// which its name resolves and clients that predate TLS reach it, or `None` if it stays.
+/// which the name of a peer that has never announced resolves, and at which clients that predate
+/// TLS reach it, or `None` if it stays. A peer that announces is named at the primary IP that it
+/// states instead.
 pub fn hosts_fallback_notice(peer: &PeerContents, delegations: &[Prefix]) -> Option<String> {
+    if peer.announcement.is_some() {
+        return None;
+    }
     let new = hosts_fallback(delegations);
     let old = peer.hosts_fallback();
     if new == old {
@@ -693,13 +698,41 @@ pub fn withdraw_delegation<'a>(
     Ok(
         if args.yes
             || confirm(&format!(
-                "Withdraw {} from peer {}? Every node that has seen the peer keeps the prefix \
-                 pinned to its key.",
+                "Withdraw {} from peer {}? The server refuses if the peer claims any of it.",
                 prefix.to_string().yellow(),
                 peer.display_name().yellow()
             ))?
         {
             Some((peer, delegations))
+        } else {
+            None
+        },
+    )
+}
+
+/// Bring up a prompt to mark a delegation of a peer of `peers` to be reclaimed: it stops being
+/// delegated to the peer once the peer, having claimed some of it, announces without claiming any
+/// of it, so that a cooperative peer can move. Returns the peer and the delegation to mark.
+pub fn reclaim_delegation<'a>(
+    peers: &'a [PeerContents],
+    args: &DelegationOpts,
+) -> Result<Option<(&'a PeerContents, Prefix)>, Error> {
+    let peer = select_delegated_peer(
+        peers,
+        args,
+        |peer| !peer.delegations.is_empty(),
+        "Peer whose delegation to mark",
+    )?;
+    let prefix = select_delegation(peer, args, "Delegation to mark")?;
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Mark {} of peer {} to be reclaimed once the peer stops claiming it?",
+                prefix.to_string().yellow(),
+                peer.display_name().yellow()
+            ))?
+        {
+            Some((peer, prefix))
         } else {
             None
         },
@@ -1098,5 +1131,13 @@ mod tests {
             .unwrap();
         assert!(delegations.is_empty());
         assert!(withdraw_delegation(&peers, &opts("peer1", "10.0.0.2/32")).is_err());
+
+        // Only a delegation of the peer is marked to be reclaimed.
+        let (peer, prefix) = reclaim_delegation(&peers, &opts("peer1", "10.0.0.9/32"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.public_key, peers[0].public_key);
+        assert_eq!(prefix, "10.0.0.9/32".parse().unwrap());
+        assert!(reclaim_delegation(&peers, &opts("peer1", "10.0.0.2/32")).is_err());
     }
 }

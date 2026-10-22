@@ -1,7 +1,9 @@
 use std::convert::TryFrom;
 
 use hyper::{header, http, Body, Response, StatusCode};
+use innernet_node::accept::Refusal;
 use innernet_shared::{
+    announcement::{self, AnnouncementError},
     cbor, media_type,
     problem::{self, Problem, ProblemType},
     Prefix,
@@ -83,6 +85,41 @@ pub enum ServerError {
         holder: String,
     },
 
+    /// An announcement whose payload is longer than the server reads.
+    #[error("{0}")]
+    AnnouncementTooLarge(AnnouncementError),
+
+    /// An announcement that isn't newer than the last one that the server accepted.
+    #[error("{0}")]
+    AnnouncementStale(AnnouncementError),
+
+    /// An announcement that the peer didn't sign, or that isn't one.
+    #[error("{0}")]
+    AnnouncementInvalid(AnnouncementError),
+
+    /// An announcement dated too far ahead of the server's clock.
+    #[error("{0}")]
+    AnnouncementTooFarAhead(AnnouncementError),
+
+    /// An announcement that makes a claim of a type that the server doesn't check.
+    #[error("{0}")]
+    AnnouncementClaimUnknown(AnnouncementError),
+
+    /// An announcement that claims what the server doesn't assign the peer, or that states a
+    /// primary IP outside its claimed delegation, or none, with the explanation.
+    #[error("{0}")]
+    AnnouncementUnassigned(String),
+
+    /// An announcement that claims what the last announcement accepted from another peer claims,
+    /// with the explanation.
+    #[error("{0}")]
+    AnnouncementClaimed(String),
+
+    /// A change of the delegations of a peer that would withdraw part of the delegation that the
+    /// peer claims, with the explanation.
+    #[error("{0}")]
+    DelegationClaimed(String),
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -147,6 +184,14 @@ impl ServerError {
             NoSuchAssociation => &problem::NO_SUCH_ASSOCIATION,
             ClientKeyRequired => &problem::CLIENT_KEY_REQUIRED,
             Delegation(_) | DelegationTaken { .. } => &problem::DELEGATION_REFUSED,
+            AnnouncementStale(_) => &problem::ANNOUNCEMENT_STALE,
+            AnnouncementInvalid(_) => &problem::ANNOUNCEMENT_INVALID,
+            AnnouncementTooLarge(_) => &problem::ANNOUNCEMENT_TOO_LARGE,
+            AnnouncementTooFarAhead(_) => &problem::ANNOUNCEMENT_TOO_FAR_AHEAD,
+            AnnouncementClaimUnknown(_) => &problem::ANNOUNCEMENT_CLAIM_UNKNOWN,
+            AnnouncementUnassigned(_) => &problem::ANNOUNCEMENT_UNASSIGNED,
+            AnnouncementClaimed(_) => &problem::ANNOUNCEMENT_CLAIMED,
+            DelegationClaimed(_) => &problem::DELEGATION_CLAIMED,
             Unauthorized | NotFound | InvalidQuery | Gone | Database(_) | WireGuard | Io(_)
             | Json(_) | Cbor(_) | UnsupportedMediaType | NotAcceptable | EmptyBody | Http(_)
             | Hyper(_) => return None,
@@ -162,16 +207,21 @@ impl ServerError {
             return Problem::about_blank(status.as_u16(), status.canonical_reason());
         };
         let mut problem = problem_type.problem(self.to_string());
-        if let ServerError::DelegationTaken {
-            prefix,
-            held,
-            holder,
-            ..
-        } = self
-        {
-            problem.prefix = Some(*prefix);
-            problem.held = Some(*held);
-            problem.holder = Some(holder.clone());
+        match self {
+            ServerError::DelegationTaken {
+                prefix,
+                held,
+                holder,
+                ..
+            } => {
+                problem.prefix = Some(*prefix);
+                problem.held = Some(*held);
+                problem.holder = Some(holder.clone());
+            },
+            ServerError::AnnouncementTooLarge(_) => {
+                problem.limit = Some(announcement::MAX_PAYLOAD_LEN as u64);
+            },
+            _ => {},
         }
         problem
     }
@@ -194,18 +244,62 @@ impl ServerError {
     }
 }
 
+impl From<AnnouncementError> for ServerError {
+    fn from(error: AnnouncementError) -> Self {
+        match error {
+            AnnouncementError::TooLarge => ServerError::AnnouncementTooLarge(error),
+            AnnouncementError::BadSignature | AnnouncementError::Malformed(_) => {
+                ServerError::AnnouncementInvalid(error)
+            },
+            AnnouncementError::Stale { .. } => ServerError::AnnouncementStale(error),
+            AnnouncementError::TooFarAhead => ServerError::AnnouncementTooFarAhead(error),
+            AnnouncementError::UnknownClaim(_) => ServerError::AnnouncementClaimUnknown(error),
+        }
+    }
+}
+
+/// Each reason for which the node core refuses an announcement that a peer sends the server, as
+/// the problem that the server answers with.
+impl From<Refusal> for ServerError {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::InvalidKey => ServerError::InvalidQuery,
+            // A peer must sign what it sends.
+            Refusal::Unsigned => ServerError::AnnouncementInvalid(AnnouncementError::BadSignature),
+            Refusal::Unreadable(error) => error.into(),
+            refusal @ Refusal::OutsideNetwork { .. } => {
+                ServerError::AnnouncementUnassigned(refusal.to_string())
+            },
+            Refusal::Stale { timestamp, last } => {
+                AnnouncementError::Stale { timestamp, last }.into()
+            },
+            Refusal::TooFarAhead => AnnouncementError::TooFarAhead.into(),
+            Refusal::Pinned(conflict) => ServerError::AnnouncementClaimed(conflict.to_string()),
+        }
+    }
+}
+
 impl From<&ServerError> for StatusCode {
     fn from(error: &ServerError) -> StatusCode {
         use ServerError::*;
         match error {
             Unauthorized | TlsRequired => StatusCode::UNAUTHORIZED,
             ClientKeyRequired => StatusCode::FORBIDDEN,
-            PromotionRequiresTls | Delegation(_) | DelegationTaken { .. } => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            },
+            PromotionRequiresTls
+            | Delegation(_)
+            | DelegationTaken { .. }
+            | AnnouncementInvalid(_)
+            | AnnouncementTooFarAhead(_)
+            | AnnouncementClaimUnknown(_)
+            | AnnouncementUnassigned(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            AnnouncementTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             NotFound | NoSuchPeer | NoSuchCidr | NoSuchAssociation => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
-            PeerChanged | CidrChanged => StatusCode::CONFLICT,
+            PeerChanged
+            | CidrChanged
+            | AnnouncementStale(_)
+            | AnnouncementClaimed(_)
+            | DelegationClaimed(_) => StatusCode::CONFLICT,
             InvalidQuery | TagMissing | Json(_) | Cbor(_) => StatusCode::BAD_REQUEST,
             UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             NotAcceptable => StatusCode::NOT_ACCEPTABLE,
@@ -236,7 +330,8 @@ impl TryFrom<ServerError> for Response<Body> {
             | ServerError::PeerChanged
             | ServerError::CidrChanged
             | ServerError::Delegation(_)
-            | ServerError::DelegationTaken { .. } => e.to_string().into(),
+            | ServerError::DelegationTaken { .. }
+            | ServerError::DelegationClaimed(_) => e.to_string().into(),
             _ => Body::empty(),
         };
         Response::builder().status(StatusCode::from(&e)).body(body)
@@ -262,6 +357,17 @@ mod tests {
             ServerError::NoSuchAssociation,
             ServerError::ClientKeyRequired,
             ServerError::Delegation("no".into()),
+            ServerError::AnnouncementStale(AnnouncementError::Stale {
+                timestamp: 1,
+                last: 2,
+            }),
+            ServerError::AnnouncementInvalid(AnnouncementError::BadSignature),
+            ServerError::AnnouncementTooLarge(AnnouncementError::TooLarge),
+            ServerError::AnnouncementTooFarAhead(AnnouncementError::TooFarAhead),
+            ServerError::AnnouncementClaimUnknown(AnnouncementError::UnknownClaim("relay".into())),
+            ServerError::AnnouncementUnassigned("no".into()),
+            ServerError::AnnouncementClaimed("no".into()),
+            ServerError::DelegationClaimed("no".into()),
             ServerError::DelegationTaken {
                 reason: "taken".into(),
                 prefix,
@@ -277,6 +383,10 @@ mod tests {
             assert_eq!(problem.status, Some(problem_type.status));
             assert_eq!(StatusCode::from(&error).as_u16(), problem_type.status);
         }
+
+        // An announcement that is too large states the limit.
+        let too_large = ServerError::AnnouncementTooLarge(AnnouncementError::TooLarge).problem();
+        assert_eq!(too_large.limit, Some(announcement::MAX_PAYLOAD_LEN as u64));
 
         // Other errors are of the type about:blank, and say nothing but their status.
         for error in [

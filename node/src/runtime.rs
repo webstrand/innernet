@@ -16,7 +16,7 @@ use crate::{
     events::{TunnelEvent, TunnelEvents},
     nat::{NatTraverse, STEP_INTERVAL},
     realize::{Realized, TunnelBackend},
-    snapshot::Snapshot,
+    snapshot::{Snapshot, SnapshotConfig},
 };
 use anyhow::Error;
 use innernet_shared::{get_local_addrs, Endpoint, NatOpts};
@@ -48,8 +48,8 @@ pub trait Link {
     /// Brings the node's store up to date with the coordinator.
     async fn sync(&mut self) -> Result<(), Error>;
 
-    /// The snapshot of the node's store.
-    fn snapshot(&self) -> Result<Snapshot, Error>;
+    /// The snapshot of the node's store, as `config` configures it.
+    fn snapshot(&self, config: &SnapshotConfig) -> Result<Snapshot, Error>;
 
     /// Reports `candidates`, the endpoints at which other peers try the node during NAT
     /// traversal, to the coordinator.
@@ -64,6 +64,7 @@ pub struct Node {
     pub listen_port: u16,
     /// Which addresses of the host are no candidates, and whether the node traverses NATs.
     pub nat: NatOpts,
+    pub snapshot_config: SnapshotConfig,
     pub tunnel: Box<dyn TunnelBackend + Send>,
 }
 
@@ -83,7 +84,7 @@ impl Node {
     /// keeps what it has configured.
     pub async fn round(&mut self, link: &mut impl Link) -> Result<Round, Error> {
         link.sync().await?;
-        let snapshot = link.snapshot()?;
+        let snapshot = link.snapshot(&self.snapshot_config)?;
         let events = self.tunnel.events();
         let realized = self.tunnel.realize(&snapshot)?;
         let candidates = self.candidates()?;

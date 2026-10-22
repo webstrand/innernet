@@ -4,7 +4,7 @@ use crate::{coordinator::Db, db::DatabasePeer};
 use anyhow::Error;
 use innernet_node::{
     runtime::Link,
-    snapshot::{self, Snapshot},
+    snapshot::{self, Snapshot, SnapshotConfig},
 };
 use innernet_shared::Endpoint;
 use wireguard_control::Key;
@@ -23,8 +23,8 @@ impl Link for LocalLink {
         Ok(())
     }
 
-    fn snapshot(&self) -> Result<Snapshot, Error> {
-        Ok(snapshot::of_store(&self.db.lock())?)
+    fn snapshot(&self, config: &SnapshotConfig) -> Result<Snapshot, Error> {
+        Ok(snapshot::of_store(&self.db.lock(), config)?)
     }
 
     async fn report_candidates(&mut self, candidates: Vec<Endpoint>) -> Result<(), Error> {

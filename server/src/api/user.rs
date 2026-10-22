@@ -1,15 +1,16 @@
 use std::collections::VecDeque;
 
 use crate::{
-    api::inject_endpoints,
+    api::{inject_endpoints, observed_endpoint},
     db::{DatabaseCidr, DatabasePeer},
     util::{form_body, form_response, status_response},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Endpoint, EndpointContents, LegacyState, RedeemContents, ServerCapabilities, State,
-    REDEEM_TRANSITION_WAIT,
+    announcement::{self, Announcement, SignedAnnouncement},
+    Endpoint, EndpointContents, LegacyCapabilities, LegacyState, RedeemContents,
+    ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 
 pub async fn routes(
@@ -46,6 +47,13 @@ pub async fn routes(
             let form = form_body(req, &session).await?;
             handlers::candidates(form, session).await
         },
+        (&Method::PUT, Some("announcement")) if session.over_tls => {
+            if !session.user_capable() {
+                return Err(ServerError::Unauthorized);
+            }
+            let form = form_body(req, &session).await?;
+            handlers::announcement(form, session).await
+        },
         _ => Err(ServerError::NotFound),
     }
 }
@@ -59,32 +67,52 @@ mod handlers {
     /// This endpoint returns the visible CIDRs and Peers, providing all the necessary
     /// information for the peer to create connections to all of them.
     ///
-    /// A TLS session gets the peers and the CIDRs without IDs. A plain-HTTP session, that of a
-    /// client that predates TLS, gets each peer with an ID, as [`DatabasePeer::plain_http_ids`]
-    /// numbers them, and the ID of its CIDR, without the peers that have no name, which such
-    /// clients can't read, and each CIDR with an ID and the ID of its parent, as
-    /// [`DatabaseCidr::id_of`] numbers them. Such a client takes a peer that it no longer sees for
-    /// disabled.
+    /// A TLS session gets the peers and the CIDRs without IDs, each peer with its announcement,
+    /// and the endpoint at which the server observes the peer of the session, which that peer may
+    /// state in its announcements. For a peer that has never announced, the server makes an
+    /// unsigned announcement of what it records of the peer, as [`Announcement::synthetic`] makes
+    /// it, so that every peer comes with one. A plain-HTTP session gets them with the IDs that
+    /// [`DatabasePeer::plain_http_ids`] and [`DatabaseCidr::id_of`] number them by, as clients that
+    /// predate TLS use them, each peer with the ID of its CIDR and each CIDR with that of its
+    /// parent, each peer as its announcement makes it, since such clients can't check
+    /// announcements, and without the peers that have no name, which such clients can't read. Such
+    /// a client takes a peer that it no longer sees for disabled.
     pub async fn state(session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let selected_peer = session.peer.reload(&conn)?;
+        let store = session.context.db.lock();
+        let selected_peer = session.peer.reload(&store)?;
 
-        let cidrs = DatabaseCidr::list(&conn)?;
+        let cidrs = DatabaseCidr::list(&store)?;
 
-        let mut peers = selected_peer.get_all_allowed_peers(&conn, &session.context.public_key)?;
+        let mut peers = selected_peer.get_all_allowed_peers(&store, &session.context.public_key)?;
         inject_endpoints(&session, peers.iter_mut().map(|peer| &mut peer.inner));
         if session.over_tls {
             form_response(
                 &session,
                 State {
-                    peers: peers.into_iter().map(|peer| peer.inner).collect(),
+                    peers: peers
+                        .into_iter()
+                        .map(|peer| {
+                            let mut peer = peer.inner;
+                            if peer.announcement.is_none() {
+                                let synthetic = Announcement::synthetic(&peer);
+                                match SignedAnnouncement::unsigned(&synthetic) {
+                                    Ok(unsigned) => peer.announcement = Some(unsigned),
+                                    Err(e) => log::warn!(
+                                        "relaying peer {} without an announcement: {e}",
+                                        peer.public_key
+                                    ),
+                                }
+                            }
+                            peer
+                        })
+                        .collect(),
                     cidrs: cidrs.iter().map(DatabaseCidr::contents).collect(),
-                    observed_endpoint: None,
+                    observed_endpoint: observed_endpoint(&session, &selected_peer.public_key),
                     invalid_peer_keys: vec![],
                 },
             )
         } else {
-            let ids = DatabasePeer::plain_http_ids(&conn)?;
+            let ids = DatabasePeer::plain_http_ids(&store)?;
             form_response(
                 &session,
                 LegacyState {
@@ -101,11 +129,21 @@ mod handlers {
 
     /// What the server supports, and the QUIC port of its TLS API, which a client upgraded from
     /// v2.0.0 asks for in plain HTTP, even once the server requires TLS of it, and which clients
-    /// that predate TLS ignore.
+    /// that predate TLS ignore. A plain-HTTP session is told, as such clients read it, that the
+    /// server fills in an unspecified host at `PUT /v1/user/endpoint`; a TLS session is told the
+    /// types of claims that the server checks in announcements instead.
     pub async fn capabilities(session: Session) -> Result<Response<Body>, ServerError> {
+        let quic_port = Some(session.context.quic_port);
+        if !session.over_tls {
+            let capabilities = LegacyCapabilities {
+                unspecified_ip_in_override_endpoint: true,
+                quic_port,
+            };
+            return form_response(&session, capabilities);
+        }
         let capabilities = ServerCapabilities {
-            unspecified_ip_in_override_endpoint: true,
-            quic_port: Some(session.context.quic_port),
+            quic_port,
+            announcement_claims: announcement::CLAIM_TYPES.map(String::from).to_vec(),
         };
 
         form_response(&session, capabilities)
@@ -123,10 +161,10 @@ mod handlers {
         form: RedeemContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let mut selected_peer = session.peer.reload(&conn)?;
+        let store = session.context.db.lock();
+        let mut selected_peer = session.peer.reload(&store)?;
 
-        selected_peer.redeem(&conn, &form.public_key)?;
+        selected_peer.redeem(&store, &form.public_key)?;
 
         session.context.invitations.notify_one();
         // If the node were to change the WireGuard interface at once, the HTTP response wouldn't
@@ -146,6 +184,22 @@ mod handlers {
         status_response(StatusCode::NO_CONTENT)
     }
 
+    /// Accepts an announcement of the peer, which states its endpoints, and claims what it
+    /// accepts of the resources that the server assigns it, as [`DatabasePeer::announce`]
+    /// checks it. The node is told, since the delegations routed to the peer may have changed.
+    pub async fn announcement(
+        signed: SignedAnnouncement,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        let store = session.context.db.lock();
+        let mut selected_peer = session.peer.reload(&store)?;
+        selected_peer.announce(&store, signed, announcement::timestamp_now())?;
+        log::info!("{} announced.", *selected_peer);
+        session.context.changed.notify();
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
     /// Report any other endpoint candidates that can be tried by peers to connect.
     /// Currently limited to 10 candidates max.
     pub async fn candidates(
@@ -155,9 +209,9 @@ mod handlers {
         if contents.len() > 10 {
             return status_response(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        let conn = session.context.db.lock();
-        let mut selected_peer = session.peer.reload(&conn)?;
-        selected_peer.set_candidates(&conn, contents)?;
+        let store = session.context.db.lock();
+        let mut selected_peer = session.peer.reload(&store)?;
+        selected_peer.set_candidates(&store, contents)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -167,9 +221,9 @@ mod handlers {
         contents: EndpointContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let mut selected_peer = session.peer.reload(&conn)?;
-        selected_peer.set_endpoint(&conn, contents.into())?;
+        let store = session.context.db.lock();
+        let mut selected_peer = session.peer.reload(&store)?;
+        selected_peer.set_endpoint(&store, contents.into())?;
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -182,8 +236,9 @@ mod tests {
     use super::*;
     use crate::{db::DatabaseAssociation, test};
     use innernet_shared::{
+        announcement::{Announcement, Claims},
         media_type, Association, Endpoint, EndpointContents, Error, LegacyPeer, LegacyState,
-        PeerContents,
+        PeerContents, Prefix,
     };
 
     #[tokio::test]
@@ -429,10 +484,15 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-        // Over TLS, the capabilities state it too.
+        // Over TLS, the capabilities state it too, but not that the server fills in an
+        // unspecified host, which only a peer that sets its own endpoint needs.
         let res = server.request(ip, "GET", "/user/capabilities").await;
         let capabilities: ServerCapabilities = test::cbor_body(res).await?;
         assert_eq!(capabilities.quic_port, Some(54322));
+        let res = server.request(ip, "GET", "/user/capabilities").await;
+        let members: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
+            test::cbor_body(res).await?;
+        assert!(!members.contains_key("unspecified_ip_in_override_endpoint"));
         Ok(())
     }
 
@@ -867,6 +927,19 @@ mod tests {
         Ok(())
     }
 
+    /// The peer with the public key `public_key` in the state that developer2 gets over TLS.
+    async fn seen_by_developer2(server: &test::Server, public_key: &str) -> PeerContents {
+        let res = server
+            .request(test::DEVELOPER2_PEER_IP, "GET", "/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let State { peers, .. } = test::cbor_body(res).await.unwrap();
+        peers
+            .into_iter()
+            .find(|peer| peer.public_key == public_key)
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_endpoint_in_candidates() -> Result<(), Error> {
         // We want to verify that the current wireguard endpoint always shows up
@@ -951,6 +1024,673 @@ mod tests {
         assert!(developer_1.candidates.contains(&nat_candidate_1));
         assert!(developer_1.candidates.contains(&nat_candidate_2));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peers_that_never_announced_are_relayed_unsigned() -> Result<(), Error> {
+        // The server makes an unsigned announcement of what it records of a peer that has never
+        // announced, so that every peer comes with an announcement.
+        let server = test::Server::new()?;
+        let mut peer = test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID);
+        let candidate: Endpoint = "192.0.2.1:51820".parse().unwrap();
+        peer.set_candidates(&server.db().lock(), vec![candidate.clone()])?;
+        let seen = seen_by_developer2(&server, &peer.public_key).await;
+        let relayed = seen.announcement.clone().unwrap();
+        assert!(!relayed.is_signed());
+        let announcement = relayed.decode()?;
+        assert_eq!(announcement.timestamp, 0);
+        assert_eq!(
+            announcement.claims.delegation,
+            [Prefix::host(developer1_ip())]
+        );
+        assert_eq!(announcement.claims.name, peer.name);
+        assert_eq!(announcement.allowed_ips, [Prefix::host(developer1_ip())]);
+        assert_eq!(announcement.primary_ip, Some(developer1_ip()));
+        // It lists the endpoint, here the one at which the server observes the peer, before the
+        // candidates that the peer set.
+        assert_eq!(
+            announcement.endpoints,
+            [test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap(), candidate]
+        );
+
+        Ok(())
+    }
+
+    /// The address of developer1, which the server assigns it as a range of its own.
+    fn developer1_ip() -> std::net::IpAddr {
+        test::DEVELOPER1_PEER_IP.parse().unwrap()
+    }
+
+    /// An announcement of developer1, dated now, that claims the name and the range that the
+    /// server assigns it, accepts traffic for all of it, and states its address as its primary
+    /// IP.
+    fn developer1_announcement() -> Announcement {
+        let delegation = vec![Prefix::host(developer1_ip())];
+        Announcement {
+            timestamp: announcement::timestamp_now(),
+            claims: Claims {
+                delegation: delegation.clone(),
+                name: Some("developer1".parse().unwrap()),
+            },
+            allowed_ips: delegation,
+            primary_ip: Some(developer1_ip()),
+            endpoints: vec![
+                "198.51.100.1:51820".parse().unwrap(),
+                "192.0.2.1:51820".parse().unwrap(),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_announcement_is_relayed_as_signed() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = test::DEVELOPER1_PEER_IP;
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let public_key = keypair.public.to_base64();
+        {
+            // When the server accepts the first announcement of a peer whose client was upgraded
+            // from plain HTTP, it deletes the endpoint that the peer had set over plain HTTP.
+            let store = server.db.lock();
+            let mut peer = DatabasePeer::get_from_public_key(&store, &keypair.public)?;
+            peer.set_endpoint(&store, Some("1.2.3.4:51820".parse().unwrap()))?;
+        }
+
+        let signed = server.sign(&keypair, &developer1_announcement());
+        let res = server
+            .form_request(ip, "PUT", "/user/announcement", &signed)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let stored = DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public)?;
+        assert_eq!(stored.announcement.as_ref(), Some(&signed));
+        assert_eq!(stored.endpoint, None);
+
+        // Other peers get the announcement as it was signed, and nothing of the endpoint that the
+        // server observes, which only the peer itself can state.
+        let seen = seen_by_developer2(&server, &public_key).await;
+        assert_eq!(seen.announcement.as_ref(), Some(&signed));
+        assert_eq!(
+            (seen.endpoint.clone(), seen.candidates.clone()),
+            (None, vec![])
+        );
+        let effective = seen.effective();
+        assert_eq!(
+            effective.endpoint.as_ref(),
+            developer1_announcement().endpoints.first()
+        );
+        assert_eq!(
+            effective.candidates,
+            developer1_announcement().endpoints[1..]
+        );
+        assert_eq!(effective.delegations, [Prefix::host(developer1_ip())]);
+        assert_eq!(effective.hosts_fallback(), Some(developer1_ip()));
+
+        // The peer itself is told the endpoint at which the server observes it, and other peers
+        // only their own.
+        let res = server.request(ip, "GET", "/user/state").await;
+        let state: State = test::cbor_body(res).await?;
+        assert_eq!(
+            state.observed_endpoint,
+            Some(test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap())
+        );
+        let res = server
+            .request(test::DEVELOPER2_PEER_IP, "GET", "/user/state")
+            .await;
+        let state: State = test::cbor_body(res).await?;
+        assert_ne!(
+            state.observed_endpoint,
+            Some(test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap())
+        );
+
+        // A client that predates TLS can't check the announcement, so it gets the peer as the
+        // announcement makes it, at its primary IP.
+        server.predate_tls(test::USER1_PEER_ID);
+        DatabaseAssociation::create(
+            &server.db().lock(),
+            test::USER_CIDR.parse()?,
+            test::DEVELOPER_CIDR.parse()?,
+        )?;
+        let res = server
+            .plain_request(test::USER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let state: serde_json::Value = test::json_body(res).await?;
+        let peers: Vec<LegacyPeer> = serde_json::from_value(state["peers"].clone())?;
+        let legacy = peers
+            .iter()
+            .find(|peer| peer.public_key == public_key)
+            .unwrap();
+        assert_eq!(legacy.ip, developer1_ip());
+        assert_eq!(legacy.endpoint, effective.endpoint);
+        assert_eq!(legacy.candidates, effective.candidates);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_refusals() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = test::DEVELOPER1_PEER_IP;
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let announce = |signed: SignedAnnouncement| {
+            server.form_request(ip, "PUT", "/user/announcement", signed)
+        };
+        let accepted = developer1_announcement();
+        let res = announce(server.sign(&keypair, &accepted)).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // An announcement that is not newer than the last one is refused, even the same again.
+        let res = announce(server.sign(&keypair, &accepted)).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_STALE).await?;
+        let older = Announcement {
+            timestamp: accepted.timestamp - 1,
+            ..developer1_announcement()
+        };
+        let res = announce(server.sign(&keypair, &older)).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_STALE).await?;
+
+        // So is one that another key signed.
+        let other = wireguard_control::KeyPair::generate();
+        let res = announce(server.sign(&other, &developer1_announcement())).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_INVALID).await?;
+
+        // And one dated too far ahead.
+        let ahead = Announcement {
+            timestamp: announcement::timestamp_now() + 3_600_000_000_000,
+            ..developer1_announcement()
+        };
+        let res = announce(server.sign(&keypair, &ahead)).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_TOO_FAR_AHEAD).await?;
+
+        // And one without a signature: only the server makes unsigned announcements.
+        let res = announce(SignedAnnouncement::unsigned(&developer1_announcement())?).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_INVALID).await?;
+
+        // And one that claims what the server doesn't assign the peer, another name or a
+        // delegation beyond its ranges, or that states no primary IP, or one outside the
+        // delegation that it claims. The server can't narrow what the peer signed.
+        let user_ip = test::USER1_PEER_IP.parse().unwrap();
+        for unassigned in [
+            Announcement {
+                claims: Claims {
+                    name: Some("developer2".parse().unwrap()),
+                    ..developer1_announcement().claims
+                },
+                ..developer1_announcement()
+            },
+            Announcement {
+                claims: Claims {
+                    delegation: vec![test::DEVELOPER_CIDR.parse().unwrap()],
+                    ..developer1_announcement().claims
+                },
+                ..developer1_announcement()
+            },
+            Announcement {
+                primary_ip: None,
+                ..developer1_announcement()
+            },
+            Announcement {
+                primary_ip: Some(user_ip),
+                ..developer1_announcement()
+            },
+        ] {
+            let res = announce(server.sign(&keypair, &unassigned)).await;
+            test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_UNASSIGNED).await?;
+        }
+        // The coordinator judges what an announcement claims before its node applies the rules of
+        // the store, so one that is both stale and unassigned is refused as unassigned.
+        let stale_unassigned = Announcement {
+            timestamp: accepted.timestamp - 1,
+            claims: Claims {
+                name: Some("developer2".parse().unwrap()),
+                ..developer1_announcement().claims
+            },
+            ..developer1_announcement()
+        };
+        let res = announce(server.sign(&keypair, &stale_unassigned)).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_UNASSIGNED).await?;
+
+        // Allowed IPs beyond the delegation are no reason to refuse it: every peer shrinks them.
+        let wider = Announcement {
+            allowed_ips: vec![test::DEVELOPER_CIDR.parse().unwrap()],
+            ..developer1_announcement()
+        };
+        let res = announce(server.sign(&keypair, &wider)).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let accepted = wider;
+
+        // And one that makes a claim of a type that the server doesn't check, while a statement,
+        // which isn't a claim, is ignored.
+        #[derive(serde::Serialize)]
+        struct LaterClaims {
+            #[serde(flatten)]
+            claims: Claims,
+            relay: bool,
+        }
+        #[derive(serde::Serialize)]
+        struct Later<C> {
+            timestamp: u64,
+            claims: C,
+            #[serde(rename = "primaryIp")]
+            primary_ip: String,
+            note: &'static str,
+        }
+        let private_key =
+            innernet_shared::xeddsa::PrivateKey::from_base64(&keypair.private.to_base64())?;
+        let sign = |payload| SignedAnnouncement::sign(payload, &private_key).unwrap();
+        let later = Later {
+            timestamp: announcement::timestamp_now(),
+            claims: LaterClaims {
+                claims: developer1_announcement().claims,
+                relay: true,
+            },
+            primary_ip: test::DEVELOPER1_PEER_IP.into(),
+            note: "not a claim",
+        };
+        let res = announce(sign(innernet_shared::cbor::to_vec(&later)?)).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_CLAIM_UNKNOWN).await?;
+
+        // And one longer than the server reads.
+        let signed = server.sign(&keypair, &developer1_announcement());
+        let too_long = SignedAnnouncement {
+            payload: vec![0; announcement::MAX_PAYLOAD_LEN + 1],
+            ..signed
+        };
+        let res = announce(too_long).await;
+        let problem = test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_TOO_LARGE).await?;
+        assert_eq!(problem.limit, Some(announcement::MAX_PAYLOAD_LEN as u64));
+
+        // The last accepted announcement stays, as the server relays it and as its node core
+        // stored it: nothing of a refused one is stored.
+        let stored = DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public)?;
+        assert_eq!(
+            stored.announcement.as_ref().unwrap().decode().unwrap(),
+            accepted
+        );
+        assert_eq!(stored.announced, Some(accepted));
+
+        // A peer whose client predates TLS has no announcements to send.
+        server.predate_tls(test::DEVELOPER2_PEER_ID);
+        let res = server
+            .plain_form_request(
+                test::DEVELOPER2_PEER_IP,
+                "PUT",
+                "/v1/user/announcement",
+                &developer1_announcement(),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_claimed_by_another() -> Result<(), Error> {
+        // A name that another peer's last announcement claims stays that peer's, even once the
+        // server gives it to another: the other peer can't claim it until the first stops.
+        let server = test::Server::new()?;
+        let developer1 = server.keypair(test::DEVELOPER1_PEER_ID);
+        let developer2 = server.keypair(test::DEVELOPER2_PEER_ID);
+        let developer2_ip: std::net::IpAddr = test::DEVELOPER2_PEER_IP.parse()?;
+        let developer2_announcement = |name: &str| Announcement {
+            timestamp: announcement::timestamp_now(),
+            claims: Claims {
+                delegation: vec![Prefix::host(developer2_ip)],
+                name: Some(name.parse().unwrap()),
+            },
+            primary_ip: Some(developer2_ip),
+            ..Default::default()
+        };
+        let announce = |ip, keypair, announcement: &Announcement| {
+            server.form_request(
+                ip,
+                "PUT",
+                "/user/announcement",
+                server.sign(keypair, announcement),
+            )
+        };
+        let res = announce(
+            test::DEVELOPER2_PEER_IP,
+            &developer2,
+            &developer2_announcement("developer2"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let rename = |key: &wireguard_control::Key, name: &str| -> Result<(), Error> {
+            let db = server.db();
+            let store = db.lock();
+            let mut peer = DatabasePeer::get_from_public_key(&store, key)?;
+            let contents = PeerContents {
+                name: Some(name.parse().unwrap()),
+                ..peer.inner.clone()
+            };
+            peer.update(&store, contents)?;
+            Ok(())
+        };
+        rename(&developer2.public, "developer3")?;
+        rename(&developer1.public, "developer2")?;
+        let claiming = Announcement {
+            claims: Claims {
+                name: Some("developer2".parse().unwrap()),
+                ..developer1_announcement().claims
+            },
+            ..developer1_announcement()
+        };
+        let res = announce(test::DEVELOPER1_PEER_IP, &developer1, &claiming).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_CLAIMED).await?;
+
+        // Once developer2 claims its new name, the old one is free.
+        let res = announce(
+            test::DEVELOPER2_PEER_IP,
+            &developer2,
+            &developer2_announcement("developer3"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let claiming = Announcement {
+            timestamp: announcement::timestamp_now(),
+            ..claiming
+        };
+        let res = announce(test::DEVELOPER1_PEER_IP, &developer1, &claiming).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_offering_a_claimed_name() -> Result<(), Error> {
+        // The server's node core takes a peer that has never announced as the unsigned
+        // announcement that the server makes of it, which pins its name to its key, as on every
+        // client. Offering that name to another peer is harmless: the announcements of the other
+        // peer that claim it, unsigned or signed, are refused, and the other peer keeps its last
+        // accepted announcement, so it neither takes the name nor vanishes.
+        let server = test::Server::new()?;
+        let db = server.db();
+        let user1 = server.keypair(test::USER1_PEER_ID);
+        let user2 = server.keypair(test::USER2_PEER_ID);
+        let effective = |keypair: &wireguard_control::KeyPair| -> Result<PeerContents, Error> {
+            Ok(DatabasePeer::get_from_public_key(&db.lock(), &keypair.public)?.effective())
+        };
+        let name =
+            |name: &str| -> Option<innernet_shared::Hostname> { Some(name.parse().unwrap()) };
+        {
+            let store = db.lock();
+            for (id, offered) in [
+                (test::USER1_PEER_ID, "renamed"),
+                (test::USER2_PEER_ID, "user1"),
+            ] {
+                let mut peer = test::peer(&store, id);
+                let contents = PeerContents {
+                    name: name(offered),
+                    ..peer.inner.clone()
+                };
+                peer.update(&store, contents)?;
+            }
+        }
+        assert_eq!(effective(&user1)?.name, name("user1"));
+        let user2_before = effective(&user2)?;
+        assert_eq!(user2_before.name, name("user2"));
+        assert!(user2_before.is_routed());
+
+        // Even signed, user2 can't claim the name while user1 holds it.
+        let user2_ip: std::net::IpAddr = test::USER2_PEER_IP.parse()?;
+        let user2_claims = |name: &str| Announcement {
+            timestamp: announcement::timestamp_now(),
+            claims: Claims {
+                delegation: vec![Prefix::host(user2_ip)],
+                name: Some(name.parse().unwrap()),
+            },
+            allowed_ips: vec![Prefix::host(user2_ip)],
+            primary_ip: Some(user2_ip),
+            ..Default::default()
+        };
+        let res = server
+            .form_request(
+                test::USER2_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&user2, &user2_claims("user1")),
+            )
+            .await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_CLAIMED).await?;
+        assert_eq!(effective(&user2)?, user2_before);
+
+        // Once user1 signs the name that it is now offered, the name is released. The unsigned
+        // announcement of user2 releases no name, so user2 keeps its own until it signs one that
+        // claims the name that it is offered, which it then can.
+        let user1_ip: std::net::IpAddr = test::USER1_PEER_IP.parse()?;
+        let renamed = Announcement {
+            timestamp: announcement::timestamp_now(),
+            claims: Claims {
+                delegation: vec![Prefix::host(user1_ip)],
+                name: name("renamed"),
+            },
+            allowed_ips: vec![Prefix::host(user1_ip)],
+            primary_ip: Some(user1_ip),
+            ..Default::default()
+        };
+        let res = server
+            .form_request(
+                test::USER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&user1, &renamed),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(effective(&user1)?.name, name("renamed"));
+        assert_eq!(effective(&user2)?.name, name("user2"));
+        let res = server
+            .form_request(
+                test::USER2_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&user2, &user2_claims("user1")),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(effective(&user2)?.name, name("user1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_announcement_claims_part_of_the_ranges() -> Result<(), Error> {
+        // A peer that claims part of its ranges, and accepts traffic for part of that, is routed
+        // that part, and the server routes it its primary IP besides. The server never withdraws
+        // a range that holds part of the claimed delegation.
+        let server = test::Server::new()?;
+        let wider = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:1:0/112"
+        } else {
+            "10.80.64.16/28"
+        };
+        server.delegate(test::DEVELOPER1_PEER_ID, wider);
+        let wider: Prefix = wider.parse()?;
+        let part = Prefix::new(ipnet::IpNet::new(wider.first(), wider.prefix_len() + 1)?)?;
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let stored = || DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public);
+        assert_eq!(stored()?.effective().delegations.len(), 2);
+
+        let host = Prefix::host(developer1_ip());
+        let narrowed = Announcement {
+            claims: Claims {
+                delegation: vec![host, part],
+                ..developer1_announcement().claims
+            },
+            allowed_ips: vec![part],
+            ..developer1_announcement()
+        };
+        let res = server
+            .form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&keypair, &narrowed),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let effective = stored()?.effective();
+        assert_eq!(effective.delegations, [host, part]);
+        assert_eq!(effective.allowed_ips(), [part.allowed_ip()]);
+        assert_eq!(
+            innernet_node::snapshot::with_primary_ip(&effective).allowed_ips(),
+            [host.allowed_ip(), part.allowed_ip()]
+        );
+
+        // The ranges must hold the claimed delegation, so the range of `part` stays, but the
+        // rest of the ranges may change.
+        let internal_address = test::SERVER_CIDR.parse::<Prefix>()?.first();
+        let set = |delegations: Vec<Prefix>, reclaim: Vec<Prefix>| {
+            let db = server.db();
+            let store = db.lock();
+            let mut peer = DatabasePeer::get_from_public_key(&store, &keypair.public)?;
+            peer.set_delegations(
+                &store,
+                delegations,
+                reclaim,
+                server.public_key(),
+                internal_address,
+            )
+        };
+        assert!(matches!(
+            set(vec![host], vec![]),
+            Err(ServerError::DelegationClaimed(_))
+        ));
+        assert!(matches!(
+            set(vec![wider], vec![]),
+            Err(ServerError::DelegationClaimed(_))
+        ));
+        assert!(set(vec![host, wider], vec![part]).is_err());
+        set(vec![host, wider], vec![wider])?;
+        assert_eq!(stored()?.reclaim, [wider]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reclaimed_ranges() -> Result<(), Error> {
+        // A range marked to be reclaimed stops being assigned once the peer, having claimed some
+        // of it, announces without claiming any of it; an unmarked one stays, and so does a
+        // marked one that the peer never claimed.
+        let server = test::Server::new()?;
+        let [marked, unmarked, unclaimed] = if cfg!(feature = "v6-test") {
+            [
+                "fd00:1337::2:0:1:0/112",
+                "fd00:1337::2:0:2:0/112",
+                "fd00:1337::2:0:3:0/112",
+            ]
+        } else {
+            ["10.80.64.16/28", "10.80.64.32/28", "10.80.64.48/28"]
+        };
+        for range in [marked, unmarked, unclaimed] {
+            server.delegate(test::DEVELOPER1_PEER_ID, range);
+        }
+        let [marked, unmarked, unclaimed]: [Prefix; 3] =
+            [marked.parse()?, unmarked.parse()?, unclaimed.parse()?];
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let host = Prefix::host(developer1_ip());
+        {
+            let db = server.db();
+            let store = db.lock();
+            let mut peer = DatabasePeer::get_from_public_key(&store, &keypair.public)?;
+            let ranges = peer.delegations.clone();
+            peer.set_delegations(
+                &store,
+                ranges,
+                vec![marked, unclaimed],
+                server.public_key(),
+                test::SERVER_CIDR.parse::<Prefix>()?.first(),
+            )?;
+        }
+        let announce = |delegation: Vec<Prefix>| {
+            let announcement = Announcement {
+                timestamp: announcement::timestamp_now(),
+                claims: Claims {
+                    delegation,
+                    ..developer1_announcement().claims
+                },
+                ..developer1_announcement()
+            };
+            server.form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&keypair, &announcement),
+            )
+        };
+        let ranges = || {
+            DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public)
+                .unwrap()
+                .delegations
+                .clone()
+        };
+        let res = announce(vec![host, marked, unmarked]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(ranges(), [host, marked, unmarked, unclaimed]);
+        let res = announce(vec![host]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(ranges(), [host, unmarked, unclaimed]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_relayed_bytes_affect_only_relaying() -> Result<(), Error> {
+        // The server takes what a peer announces from the announcement as it stored it decoded, and
+        // keeps the bytes only to relay them, so bytes that are damaged change nothing of what the
+        // peer is: the peer stays routed, and a newer announcement replaces them.
+        let server = test::Server::new()?;
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let announce = |announcement: &Announcement| {
+            server.form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&keypair, announcement),
+            )
+        };
+        let first = developer1_announcement();
+        assert_eq!(announce(&first).await.status(), StatusCode::NO_CONTENT);
+        let key = keypair.public.as_bytes().to_vec();
+        let stored = || DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public);
+        let effective = stored()?.effective();
+        server.db().lock().execute(
+            "UPDATE relayed_announcements SET payload = x'ff' WHERE public_key = ?1",
+            [&key],
+        )?;
+        assert_eq!(stored()?.effective().allowed_ips, effective.allowed_ips);
+        assert_eq!(stored()?.effective().endpoint, effective.endpoint);
+        assert!(stored()?.effective().is_routed());
+
+        let res = announce(&first).await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_STALE).await?;
+        let newer = Announcement {
+            timestamp: first.timestamp + 1,
+            ..developer1_announcement()
+        };
+        let signed = server.sign(&keypair, &newer);
+        let res = server
+            .form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                &signed,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(stored()?.announced.unwrap().timestamp, newer.timestamp);
+        assert_eq!(stored()?.announcement, Some(signed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_capabilities_state_announcements() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/capabilities")
+            .await;
+        let capabilities: ServerCapabilities = test::cbor_body(res).await?;
+        assert_eq!(capabilities.announcement_claims, announcement::CLAIM_TYPES);
+        for claim in announcement::CLAIM_TYPES {
+            assert!(capabilities.checks_claim(claim));
+        }
+        assert!(!capabilities.checks_claim("relay"));
+        assert!(capabilities.accepts_announcements());
         Ok(())
     }
 }

@@ -7,7 +7,18 @@ pub mod admin;
 pub mod public;
 pub mod user;
 
-/// Implements NAT traversal strategies.
+/// The endpoint at which WireGuard last saw the peer with `public_key`, if it has seen it.
+pub fn observed_endpoint(session: &Session, public_key: &str) -> Option<Endpoint> {
+    let endpoints = session.context.endpoints.read();
+    endpoints.get(public_key).map(|e| e.to_owned().into())
+}
+
+/// Implements NAT traversal strategies, with the endpoint at which WireGuard last saw each peer.
+/// A peer that has announced states its endpoints in its announcement, which the server can't
+/// change, so nothing is put into it; the server reports the endpoint at which it observes a peer
+/// to that peer alone, as [`innernet_shared::State::observed_endpoint`], and the peer may state
+/// it. For a peer that has never announced, whose unsigned announcement lists its endpoint first
+/// and then its candidates:
 /// (1) Unspecified endpoint IP: a peer may configure an override endpoint with an unspecified IP.
 ///     This can be useful if the peer uses a port forwarding with a fixed port but does not have a
 ///     fixed global IP and it needs help from the innernet server to resolve it. Replace the
@@ -23,6 +34,9 @@ pub fn inject_endpoints<'a>(
     for peer in peers {
         let endpoints = session.context.endpoints.read();
         let wg_endpoint = endpoints.get(&peer.public_key);
+        if peer.announcement.is_some() {
+            continue;
+        }
 
         match &mut peer.endpoint {
             None => {

@@ -23,7 +23,7 @@ use innernet_shared::{
     wg::PeerInfoExt,
     AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DelegationOpts, DeleteCidrOpts,
     EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
-    IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
+    IoErrorContext, LegacyCapabilities, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
     OverridePeerEndpointOpts, PeerContents, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
     WrappedIoError,
 };
@@ -249,6 +249,18 @@ enum Command {
     /// peer's key, and refuses it to another peer. A peer left without a delegation is in effect
     /// disabled.
     WithdrawDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DelegationOpts,
+    },
+
+    /// Mark a delegation of a peer to be reclaimed
+    ///
+    /// The server must speak TLS. A marked delegation stops being delegated to the peer once the
+    /// peer, having claimed some of it, announces without claiming any of it, so that a
+    /// cooperative peer can move.
+    ReclaimDelegation {
         interface: Interface,
 
         #[clap(flatten)]
@@ -635,12 +647,12 @@ async fn override_endpoint(
     let endpoint_contents = if sub_opts.unset {
         prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
     } else {
-        let server_capabilities = get_server_capabilities(&config, opts, interface).await?;
+        let unspecified_ip_supported = unspecified_ip_supported(&config, opts, interface).await?;
         let port = match config.interface.listen_port {
             Some(port) => port,
             None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
         };
-        let endpoint = prompt_override_endpoint(&server_capabilities, &sub_opts, port)?;
+        let endpoint = prompt_override_endpoint(unspecified_ip_supported, &sub_opts, port)?;
         endpoint.map(EndpointContents::Set)
     };
 
@@ -713,12 +725,10 @@ fn override_peer_endpoint(
 }
 
 fn prompt_override_endpoint(
-    server_capabilities: &ServerCapabilities,
+    unspecified_ip_supported: bool,
     args: &OverrideEndpointOpts,
     listen_port: u16,
 ) -> Result<Option<Endpoint>, Error> {
-    let unspecified_ip_supported = server_capabilities.unspecified_ip_in_override_endpoint;
-
     let endpoint = match &args.endpoint {
         Some(endpoint) => endpoint.clone(),
         None => {
@@ -751,14 +761,27 @@ fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, E
         || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
 }
 
-async fn get_server_capabilities(
+/// Whether the server fills in the host at which it observes this client when `override-endpoint`
+/// sets an endpoint whose host is unspecified. A server in plain HTTP states it in its
+/// capabilities; one that speaks TLS does for a peer that has never announced, which this client
+/// is.
+async fn unspecified_ip_supported(
     config: &InterfaceConfig,
     opts: &Opts,
     interface: &InterfaceName,
-) -> Result<ServerCapabilities, Error> {
+) -> Result<bool, Error> {
     let rest_client = RestClient::for_interface(config, &opts.data_dir, interface)?;
-    let maybe_info: Result<ServerCapabilities, RestError> =
-        rest_client.http("GET", "/user/capabilities").await;
+    let maybe_info: Result<bool, RestError> = if rest_client.speaks_tls() {
+        rest_client
+            .http::<ServerCapabilities>("GET", "/user/capabilities")
+            .await
+            .map(|_| true)
+    } else {
+        rest_client
+            .http::<LegacyCapabilities>("GET", "/user/capabilities")
+            .await
+            .map(|legacy| legacy.unspecified_ip_in_override_endpoint)
+    };
     match maybe_info {
         Ok(info) => Ok(info),
         Err(e) => {
@@ -1153,6 +1176,13 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         } => {
             admin_client!(interface, _config, rest_client);
             admin::withdraw_delegation(&rest_client, sub_opts).await?
+        },
+        Command::ReclaimDelegation {
+            interface,
+            sub_opts,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::reclaim_delegation(&rest_client, sub_opts).await?
         },
         Command::AddAssociation {
             interface,

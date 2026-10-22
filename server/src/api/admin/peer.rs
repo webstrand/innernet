@@ -11,8 +11,8 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Hostname, PeerContents, PeerEndpoints, PeerUpdate, Tag, TaggedPeer, TaggedPeerDelegations,
-    TaggedPeerEndpoints,
+    announcement, Hostname, PeerContents, PeerEndpoints, PeerUpdate, Tag, TaggedPeer,
+    TaggedPeerDelegations,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -52,12 +52,6 @@ pub async fn routes(
         (&Method::GET, Some(key), Some("endpoints")) => handlers::endpoints(key, session)
             .await
             .map_err(no_such_peer),
-        (&Method::PUT, Some(key), Some("endpoints")) => {
-            let form = tagged_form_body(req, &session).await?;
-            handlers::set_endpoints(key, form, session)
-                .await
-                .map_err(no_such_peer)
-        },
         (&Method::GET, Some(key), Some("delegations")) => handlers::delegations(key, session)
             .await
             .map_err(no_such_peer),
@@ -116,34 +110,28 @@ pub(super) fn tag<T: Serialize>(kind: &str, value: &T) -> Result<Tag, ServerErro
 }
 
 /// The tag of a peer: that of everything an admin reads of the peer, its public key included, but
-/// its endpoint and candidates, which the peer reports on its own, and its delegations, which an
-/// admin changes apart from the rest of the peer.
+/// its endpoint and candidates and its announcement, which the peer reports on its own, and its
+/// delegations, which an admin changes apart from the rest of the peer.
 fn peer_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
     let peer = PeerContents {
         delegations: vec![],
         endpoint: None,
         candidates: vec![],
+        announcement: None,
+        allowed_ips: None,
+        primary_ip: None,
         ..peer.clone()
     };
     tag("peer", &peer)
 }
 
-/// The endpoint and candidates stored for a peer.
-fn peer_endpoints(peer: &PeerContents) -> PeerEndpoints {
-    PeerEndpoints {
-        endpoint: peer.endpoint.clone(),
-        candidates: peer.candidates.clone(),
-    }
-}
-
-/// The tag of a peer's endpoints: that of its public key, endpoint and candidates.
-fn endpoints_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
-    tag("endpoints", &(&peer.public_key, peer_endpoints(peer)))
-}
-
-/// The tag of a peer's delegations: that of its public key and delegations.
-fn delegations_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
-    tag("delegations", &(&peer.public_key, &peer.delegations))
+/// The tag of a peer's delegations: that of its public key, its delegations, and those of them
+/// that are marked to be reclaimed.
+fn delegations_tag(peer: &DatabasePeer) -> Result<Tag, ServerError> {
+    tag(
+        "delegations",
+        &(&peer.public_key, &peer.delegations, &peer.reclaim),
+    )
 }
 
 /// The peer with the public key `key`, if `tag_of` the peer is still `tag`. A peer that has
@@ -154,7 +142,7 @@ fn get_unchanged(
     store: &Store,
     key: &Key,
     tag: &Tag,
-    tag_of: impl Fn(&PeerContents) -> Result<Tag, ServerError>,
+    tag_of: impl Fn(&DatabasePeer) -> Result<Tag, ServerError>,
 ) -> Result<DatabasePeer, ServerError> {
     match DatabasePeer::get_from_public_key(store, key) {
         Ok(peer) if tag_of(&peer)? == *tag => Ok(peer),
@@ -201,7 +189,7 @@ mod handlers {
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let store = session.context.db.lock();
-        let mut peer = get_unchanged(&store, &key, &form.tag, peer_tag)?;
+        let mut peer = get_unchanged(&store, &key, &form.tag, |peer| peer_tag(peer))?;
         let contents = PeerContents {
             name: form.name,
             is_admin: form.is_admin,
@@ -215,42 +203,26 @@ mod handlers {
         status_response(StatusCode::NO_CONTENT)
     }
 
-    /// The endpoint and candidates stored for the peer with the public key `key`, without the
-    /// endpoint that the server observes, so that they can be written back as they are read, and
-    /// their tag.
+    /// The endpoints at which other peers reach the peer with the public key `key`, as the server
+    /// relays them, in the order in which peers try them: those that its announcement states, or,
+    /// for a peer that has never announced, the endpoint that it set and then its candidates, with
+    /// the endpoint at which the server observes it, as the unsigned announcement that the server
+    /// relays of it orders them. Only the peer sets them, so they carry no tag.
     pub async fn endpoints(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
         let store = session.context.db.lock();
-        let peer = DatabasePeer::get_from_public_key(&store, &key)?;
-        form_response(
-            &session,
-            TaggedPeerEndpoints {
-                endpoints: peer_endpoints(&peer),
-                tag: endpoints_tag(&peer)?,
-            },
-        )
-    }
-
-    /// Sets the endpoint and candidates of the peer with the public key `key` on its behalf, if
-    /// they haven't changed since the admin read them with the tag that the request carries.
-    pub async fn set_endpoints(
-        key: Key,
-        form: TaggedPeerEndpoints,
-        session: Session,
-    ) -> Result<Response<Body>, ServerError> {
-        let PeerEndpoints {
+        let mut peer = DatabasePeer::get_from_public_key(&store, &key)?;
+        inject_endpoints(&session, [&mut peer.inner]);
+        let PeerContents {
             endpoint,
             candidates,
-        } = form.endpoints;
-        if candidates.len() > 10 {
-            return status_response(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        let store = session.context.db.lock();
-        let mut peer = get_unchanged(&store, &key, &form.tag, endpoints_tag)?;
-        peer.set_endpoints(&store, endpoint, candidates)?;
-        log::info!("set the endpoints of peer {}", *peer);
-        session.context.changed.notify();
-
-        status_response(StatusCode::NO_CONTENT)
+            ..
+        } = if peer.has_announced() {
+            peer.effective()
+        } else {
+            peer.inner.effective_with(None)
+        };
+        let endpoints = announcement::legacy_endpoints(endpoint.as_ref(), &candidates);
+        form_response(&session, PeerEndpoints { endpoints })
     }
 
     /// The delegations of the peer with the public key `key`, and their tag.
@@ -261,13 +233,15 @@ mod handlers {
             &session,
             TaggedPeerDelegations {
                 delegations: peer.delegations.clone(),
+                reclaim: peer.reclaim.clone(),
                 tag: delegations_tag(&peer)?,
             },
         )
     }
 
-    /// Replaces the delegations of the peer with the public key `key` as a whole, if they
-    /// haven't changed since the admin read them with the tag that the request carries.
+    /// Replaces the delegations of the peer with the public key `key` as a whole, and those of
+    /// them marked to be reclaimed, if they haven't changed since the admin read them with the tag
+    /// that the request carries.
     pub async fn set_delegations(
         key: Key,
         form: TaggedPeerDelegations,
@@ -278,6 +252,7 @@ mod handlers {
         peer.set_delegations(
             &store,
             form.delegations,
+            form.reclaim,
             &session.context.public_key,
             session.context.internal_address,
         )?;
@@ -636,6 +611,17 @@ mod tests {
         };
         assert_ne!(peer_tag(&renamed)?, tag);
 
+        // What the peer reports on its own leaves the tag unchanged.
+        let reported = PeerContents {
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            announcement: Some(innernet_shared::announcement::SignedAnnouncement {
+                payload: vec![0xa0],
+                signature: Some(vec![0; 64]),
+            }),
+            ..peer.clone()
+        };
+        assert_eq!(peer_tag(&reported)?, tag);
+
         // The delegations, which an admin changes apart from the rest of the peer, leave the
         // tag unchanged.
         let delegated = PeerContents {
@@ -929,6 +915,7 @@ mod tests {
                 &path,
                 TaggedPeerDelegations {
                     delegations: vec![],
+                    reclaim: vec![],
                     tag: tag.clone(),
                 },
             )
@@ -960,6 +947,7 @@ mod tests {
                 &path,
                 TaggedPeerDelegations {
                     delegations: vec![],
+                    reclaim: vec![],
                     tag: seen.tag,
                 },
             )
@@ -981,78 +969,61 @@ mod tests {
         let get = || async {
             let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
             assert_eq!(res.status(), StatusCode::OK);
-            test::cbor_body::<TaggedPeerEndpoints>(res).await.unwrap()
-        };
-        let put = |endpoints: &TaggedPeerEndpoints| {
-            server.form_request(test::ADMIN_PEER_IP, "PUT", &path, endpoints.clone())
+            test::cbor_body::<PeerEndpoints>(res).await.unwrap()
         };
 
-        // The server observes an endpoint for the peer, which isn't stored.
-        let seen = get().await;
-        assert_eq!(seen.endpoints, PeerEndpoints::default());
-        let peer_tag = get_tagged(&server, &peer_path).await.tag;
+        // A peer that has never announced is reached at the endpoint that the server observes.
+        let observed: innernet_shared::Endpoint = test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap();
+        assert_eq!(
+            get().await,
+            PeerEndpoints {
+                endpoints: vec![observed.clone()]
+            }
+        );
 
-        let endpoints = PeerEndpoints {
-            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
-            candidates: vec!["198.51.100.2:51820".parse().unwrap()],
+        // One that has announced is reached where it announces, which only it states.
+        let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
+        let path = format!("{}/endpoints", key_path(&server, test::DEVELOPER1_PEER_ID));
+        let ip: std::net::IpAddr = test::DEVELOPER1_PEER_IP.parse()?;
+        let announcement = innernet_shared::announcement::Announcement {
+            timestamp: innernet_shared::announcement::timestamp_now(),
+            claims: innernet_shared::announcement::Claims {
+                delegation: vec![Prefix::host(ip)],
+                ..Default::default()
+            },
+            primary_ip: Some(ip),
+            endpoints: vec![
+                "198.51.100.2:51820".parse().unwrap(),
+                "198.51.100.1:51820".parse().unwrap(),
+            ],
+            ..Default::default()
         };
-        let change = TaggedPeerEndpoints {
-            endpoints: endpoints.clone(),
-            tag: seen.tag.clone(),
-        };
-        assert_eq!(put(&change).await.status(), StatusCode::NO_CONTENT);
-        let stored = peer(&server, test::DEVELOPER1_PEER_ID);
-        assert_eq!(stored.endpoint, endpoints.endpoint);
-        assert_eq!(stored.candidates, endpoints.candidates);
-        let current = get().await;
-        assert_eq!(current.endpoints, endpoints);
-        assert_ne!(current.tag, seen.tag);
-
-        // The endpoints are tagged apart from the rest of the peer.
-        assert_eq!(get_tagged(&server, &peer_path).await.tag, peer_tag);
-        let mut rename = unchanged(&server, &peer_path).await;
-        rename.name = Some("renamed".parse().unwrap());
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "PUT", &peer_path, &rename)
+            .form_request(
+                test::DEVELOPER1_PEER_IP,
+                "PUT",
+                "/user/announcement",
+                server.sign(&keypair, &announcement),
+            )
             .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        assert_eq!(get().await.tag, current.tag);
+        let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+        let endpoints: PeerEndpoints = test::cbor_body(res).await?;
+        assert_eq!(endpoints.endpoints, announcement.endpoints);
 
-        // A change based on endpoints read before the peer reported others is refused.
-        let report = TaggedPeerEndpoints {
-            endpoints: PeerEndpoints::default(),
-            tag: current.tag.clone(),
-        };
-        {
-            let store = server.db.lock();
-            let mut peer = test::peer(&store, test::DEVELOPER1_PEER_ID);
-            peer.set_candidates(&store, vec![])?;
+        // An admin can't set them, nor can a non-admin read them.
+        for method in ["PUT", "DELETE"] {
+            let res = server
+                .form_request(test::ADMIN_PEER_IP, method, &path, &endpoints)
+                .await;
+            test::blank_problem(res, StatusCode::NOT_FOUND).await?;
         }
-        assert_eq!(put(&report).await.status(), StatusCode::CONFLICT);
-
-        // Non-admins can't, too many candidates are refused, and a tag is required.
-        let current = get().await;
-        let res = server
-            .form_request(test::DEVELOPER1_PEER_IP, "PUT", &path, &current)
-            .await;
+        let res = server.request(test::DEVELOPER2_PEER_IP, "GET", &path).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let too_many = TaggedPeerEndpoints {
-            endpoints: PeerEndpoints {
-                endpoint: None,
-                candidates: vec!["198.51.100.2:51820".parse().unwrap(); 11],
-            },
-            tag: current.tag.clone(),
-        };
-        assert_eq!(put(&too_many).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let untagged = serde_json::json!({ "endpoints": { "endpoint": null, "candidates": [] } });
-        let res = server
-            .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
-            .await;
-        test::problem(res, &problem::TAG_MISSING).await?;
-        assert_eq!(get().await, current);
 
         // Any other path under a peer is not found, rather than routed to the peer itself, and
         // the endpoints are not reached by ID.
+        let peer_path = key_path(&server, test::DEVELOPER1_PEER_ID);
         let id_path = format!("/admin/peers/{}/endpoints", test::DEVELOPER1_PEER_ID);
         for path in [
             format!("{peer_path}/other"),
@@ -1061,20 +1032,11 @@ mod tests {
         ] {
             for method in ["GET", "PUT", "DELETE"] {
                 let res = server
-                    .form_request(test::ADMIN_PEER_IP, method, &path, &current)
+                    .form_request(test::ADMIN_PEER_IP, method, &path, &endpoints)
                     .await;
                 test::blank_problem(res, StatusCode::NOT_FOUND).await?;
             }
         }
-        server.predate_tls(test::ADMIN_PEER_ID);
-        let res = server
-            .plain_request(test::ADMIN_PEER_IP, "GET", &path)
-            .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            peer(&server, test::DEVELOPER1_PEER_ID).endpoint,
-            current.endpoints.endpoint
-        );
         assert!(!peer(&server, test::DEVELOPER1_PEER_ID).is_disabled);
 
         Ok(())

@@ -3,7 +3,7 @@ use super::{
 };
 use crate::ServerError;
 use innernet_node::{
-    accept::{self, Received},
+    accept::{self, Received, Refusal},
     store::{self as node_store, row_key, write_endpoints, EndpointKind},
     Store,
 };
@@ -42,11 +42,17 @@ pub struct DatabasePeer {
     pub requires_tls: bool,
     /// The last announcement of the peer that the server's node core accepted, as it stored it
     /// decoded: the last that the peer signed, or, for a peer that has never announced, the last
-    /// unsigned one that the server made of it, or `None` if the node core has accepted none.
+    /// unsigned one that the server made of it, or `None` if the node core has accepted none. The
+    /// bytes that the server relays of a signed one are the record's `announcement`, which the
+    /// server never decodes again.
     pub announced: Option<Announcement>,
     /// Whether the peer has signed an announcement that the server accepted, after which only its
     /// signed announcements are accepted.
     pub announces: bool,
+    /// The ranges of the peer's delegations, its assigned ranges, that are marked to be
+    /// reclaimed: each stops being assigned once the peer, having claimed some of it, announces
+    /// without claiming any of it.
+    pub reclaim: Vec<Prefix>,
 }
 
 impl Deref for DatabasePeer {
@@ -91,6 +97,16 @@ impl DatabasePeer {
             .zip(1..)
             .map(|(peer, id)| (peer.inner.public_key, id))
             .collect())
+    }
+
+    /// Whether the peer has ever signed an announcement.
+    pub fn has_announced(&self) -> bool {
+        self.announces
+    }
+
+    /// The last announcement that the peer signed and the server accepted, if any.
+    pub fn signed_announcement(&self) -> Option<&Announcement> {
+        self.announced.as_ref().filter(|_| self.announces)
     }
 
     /// The peer as it takes effect, as [`innernet_node::snapshot::effective`] makes it of the last
@@ -173,6 +189,7 @@ impl DatabasePeer {
             requires_tls,
             announced: None,
             announces: false,
+            reclaim: vec![],
         };
         peer.reload_announced(store)?;
         Ok(peer)
@@ -224,25 +241,40 @@ impl DatabasePeer {
     }
 
     /// Replaces the delegations of the peer, the ranges assigned to it, with `delegations` as a
-    /// whole: withdraws those that `delegations` leaves out and adds the others, together or not
-    /// at all. The delegations must follow the rules of [`check_delegations`], with the
-    /// delegations of the other peers. A peer with delegations keeps its CIDR: the new
-    /// delegations, if any, must lie in the CIDR of the current ones, so that a change never moves
-    /// the peer to another CIDR, and so changes what it sees. The peer may be left without a
-    /// delegation, which leaves it in effect disabled and without a CIDR, except the server's own
-    /// peer, the one with the public key `server_key`, which must keep the delegation that holds
-    /// `internal_address`, the address that the server serves its API on.
+    /// whole: withdraws those that `delegations` leaves out and adds the others, and marks those
+    /// of `reclaim` to be reclaimed, together or not at all. The delegations must follow the rules
+    /// of [`check_delegations`], with the delegations of the other peers, and every range of
+    /// `reclaim` must be one of them. A peer with delegations keeps its CIDR: the new delegations,
+    /// if any, must lie in the CIDR of the current ones, so that a change never moves the peer to
+    /// another CIDR, and so changes what it sees. The peer may be left without a delegation, which
+    /// leaves it in effect disabled and without a CIDR, except the server's own peer, the one with
+    /// the public key `server_key`, which must keep the delegation that holds `internal_address`,
+    /// the address that the server serves its API on.
     ///
-    /// The unsigned announcement that the server makes of the peer claims every range, and
-    /// doesn't hold them: what it pinned stays pinned to the peer's key, as on every node.
+    /// The ranges must still hold every prefix of the delegation that the peer claims in the last
+    /// announcement that it signed and the server accepted, since the server never takes back what
+    /// a peer claims; a change that would is refused as [`ServerError::DelegationClaimed`]. The
+    /// unsigned announcement that the server makes of a peer that has never announced claims every
+    /// range, and doesn't hold them: what it pinned stays pinned to the peer's key, as on every
+    /// client.
     pub fn set_delegations(
         &mut self,
         store: &Store,
         mut delegations: Vec<Prefix>,
+        mut reclaim: Vec<Prefix>,
         server_key: &Key,
         internal_address: IpAddr,
     ) -> Result<(), ServerError> {
         delegations.sort();
+        reclaim.sort();
+        reclaim.dedup();
+        if let Some(range) = reclaim.iter().find(|range| !delegations.contains(range)) {
+            return Err(ServerError::Delegation(format!(
+                "{range} is marked to be reclaimed, but is not one of the delegations"
+            )));
+        }
+        // The more specific reason comes first: the server's own peer claims its delegations, but
+        // keeps the one that holds the internal address because the API runs there.
         let key = self.key()?;
         if key == server_key.0
             && !delegations
@@ -252,6 +284,18 @@ impl DatabasePeer {
             return Err(ServerError::Delegation(format!(
                 "the server's own peer must keep a delegation that holds {internal_address}, the \
                  internal address of the server"
+            )));
+        }
+        if let Some(claimed) = self.signed_announcement().and_then(|announcement| {
+            announcement
+                .claims
+                .delegation
+                .iter()
+                .find(|claimed| !delegations.iter().any(|range| range.contains(claimed)))
+        }) {
+            return Err(ServerError::DelegationClaimed(format!(
+                "the peer claims {claimed} in its announcement, so it must stay within one of its \
+                 delegations"
             )));
         }
         let new_cidr = check_new_delegations(store, &delegations, Some(&key))?;
@@ -284,9 +328,20 @@ impl DatabasePeer {
             {
                 insert_delegation(store, &key, added)?;
             }
+            for range in &delegations {
+                store.execute(
+                    "UPDATE delegations SET reclaim = ?3 WHERE address = ?1 AND prefix_len = ?2",
+                    params![
+                        ip_to_bytes(range.first()),
+                        range.prefix_len(),
+                        reclaim.contains(range)
+                    ],
+                )?;
+            }
             Self::admit_synthesized(store)
         })?;
         self.inner.delegations = delegations;
+        self.reclaim = reclaim;
         self.reload_announced(store)
     }
 
@@ -320,23 +375,103 @@ impl DatabasePeer {
         self.reload_announced(store)
     }
 
-    /// Sets the endpoint and candidates of the peer together, on its behalf, so that a failure
-    /// can't leave the endpoint changed and the candidates stale.
-    pub fn set_endpoints(
+    /// Accepts `signed`, an announcement of the peer, at the time `now`, as
+    /// [`announcement::timestamp_now`] reads it. The coordinator's rules come first: the peer
+    /// itself must sign it, make only claims of the types of [`announcement::CLAIM_TYPES`], and
+    /// claim only what it is assigned, with a primary IP within its claimed delegation, as
+    /// [`Announcement::check_assigned`] tells. The node core then accepts it as every node accepts
+    /// what its coordinator vouches for, within the network of `node`: signed by the peer, newer
+    /// than the last one accepted from it, not too far ahead of `now`, and claiming nothing pinned
+    /// to another key. The server can't narrow what the peer signed, so it accepts the
+    /// announcement whole or refuses it, each refusal as its [`ServerError`], and nothing of a
+    /// refused one is stored.
+    ///
+    /// A range of the peer marked to be reclaimed, some of which the last signed announcement
+    /// claimed and none of which this one claims, stops being assigned to the peer, so that a
+    /// cooperative peer can move from it.
+    ///
+    /// The first announcement of a peer whose client was upgraded from plain HTTP replaces the
+    /// endpoint and candidates that the peer had set over plain HTTP.
+    pub fn announce(
         &mut self,
         store: &Store,
-        endpoint: Option<Endpoint>,
-        candidates: Vec<Endpoint>,
+        signed: SignedAnnouncement,
+        now: u64,
     ) -> Result<(), ServerError> {
         let key = self.key()?;
-        atomically(store, || {
-            write_endpoints(store, &key, EndpointKind::Endpoint, &endpoint)?;
-            write_endpoints(store, &key, EndpointKind::Candidate, &candidates)?;
-            Self::admit_synthesized(store)
+        if !signed.is_signed() {
+            return Err(Refusal::Unsigned.into());
+        }
+        let opened = signed.open(&Key(key))?;
+        signed.check_claim_types(&announcement::CLAIM_TYPES)?;
+        opened
+            .check_assigned(&self.inner.delegations, self.inner.name.as_ref())
+            .map_err(|unassigned| ServerError::AnnouncementUnassigned(unassigned.to_string()))?;
+        let all_types = accept::all_claim_types();
+        let received = Received {
+            public_key: &self.inner.public_key,
+            announcement: &signed,
+            checked_types: &all_types,
+            repeats: false,
+        };
+        let previous = self
+            .signed_announcement()
+            .map(|previous| previous.claims.delegation.clone())
+            .unwrap_or_default();
+        let (accepted, reclaimed) = atomically(store, || {
+            let accepted = store.accept_one(&received, now)??;
+            let claims = |claimed: &[Prefix], range: &Prefix| {
+                claimed.iter().any(|prefix| prefix.overlaps(range))
+            };
+            let reclaimed: Vec<Prefix> = self
+                .reclaim
+                .iter()
+                .filter(|range| {
+                    claims(&previous, range)
+                        && !claims(&accepted.announcement.claims.delegation, range)
+                })
+                .copied()
+                .collect();
+            store.execute(
+                "DELETE FROM endpoints WHERE public_key = ?1 AND kind IN (?2, ?3)",
+                params![
+                    key,
+                    EndpointKind::Endpoint as i64,
+                    EndpointKind::Candidate as i64
+                ],
+            )?;
+            store.execute(
+                "INSERT INTO relayed_announcements (public_key, payload, signature)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (public_key) DO UPDATE SET
+                   payload = excluded.payload, signature = excluded.signature",
+                params![key, signed.payload, signed.signature],
+            )?;
+            for range in &reclaimed {
+                store.execute(
+                    "DELETE FROM delegations WHERE address = ?1 AND prefix_len = ?2
+                       AND public_key = ?3",
+                    params![ip_to_bytes(range.first()), range.prefix_len(), key],
+                )?;
+            }
+            // What the announcement released may be what a peer that has never announced waits
+            // for.
+            Self::admit_synthesized(store)?;
+            Ok((accepted, reclaimed))
         })?;
-        self.inner.endpoint = endpoint;
-        self.inner.candidates = candidates;
-        self.reload_announced(store)
+        for range in &reclaimed {
+            log::info!("reclaimed {range} from {}.", **self);
+        }
+        self.inner.announcement = Some(signed);
+        self.announced = Some(accepted.announcement);
+        self.announces = true;
+        self.inner.endpoint = None;
+        self.inner.candidates = vec![];
+        self.inner
+            .delegations
+            .retain(|range| !reclaimed.contains(range));
+        self.reclaim.retain(|range| !reclaimed.contains(range));
+        Ok(())
     }
 
     /// Hands the server's node core the unsigned announcement that the server makes of each peer
@@ -347,8 +482,9 @@ impl DatabasePeer {
     /// accepts from now on, so a name that the server offers a peer while another key claims it
     /// takes no effect.
     ///
-    /// The server calls it whenever what it records of such a peer changes, and when it opens
-    /// the database.
+    /// The server calls it whenever what it records of such a peer changes, when it accepts a
+    /// signed announcement, which may release what such a peer claims, and when it opens the
+    /// database.
     pub fn admit_synthesized(store: &Store) -> Result<(), ServerError> {
         let peers: Vec<Self> = Self::list(store)?
             .into_iter()
@@ -483,6 +619,7 @@ impl DatabasePeer {
             requires_tls,
             announced: None,
             announces,
+            reclaim: vec![],
         })
     }
 
@@ -762,7 +899,8 @@ fn index(peers: &mut [DatabasePeer]) -> Result<Index<'_>, rusqlite::Error> {
 }
 
 /// Fills in each of `peers` from the database: the name offered to it, its delegations, its
-/// endpoint and candidates, and its last accepted announcement, decoded.
+/// endpoint and candidates, and its last accepted announcement, decoded, and as the bytes that
+/// the server relays.
 fn load(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
     if peers.is_empty() {
         return Ok(());
@@ -770,7 +908,8 @@ fn load(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error
     load_offered_names(store, peers)?;
     load_delegations(store, peers)?;
     load_announcements(store, peers)?;
-    load_endpoints(store, peers)
+    load_endpoints(store, peers)?;
+    load_relayed(store, peers)
 }
 
 /// Fills in the name offered to each of `peers` from the database.
@@ -803,6 +942,26 @@ fn load_announcements(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), r
     Ok(())
 }
 
+/// Fills in the bytes of the last announcement accepted from each of `peers`, which the server
+/// relays.
+fn load_relayed(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
+    let (mut by_key, only_key) = index(peers)?;
+    let mut stmt = store.prepare_cached(
+        "SELECT public_key, payload, signature FROM relayed_announcements
+         WHERE ?1 IS NULL OR public_key = ?1",
+    )?;
+    let mut rows = stmt.query(params![only_key])?;
+    while let Some(row) = rows.next()? {
+        if let Some(peer) = by_key.get_mut(&row_key(row, 0)?) {
+            peer.inner.announcement = Some(SignedAnnouncement {
+                payload: row.get(1)?,
+                signature: Some(row.get(2)?),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Offers `name` to the peer with the public key `key`, in place of any name offered to it, or no
 /// name if `name` is `None`.
 fn offer_name(store: &Store, key: &[u8; 32], name: Option<&str>) -> Result<(), ServerError> {
@@ -823,16 +982,18 @@ fn offer_name(store: &Store, key: &[u8; 32], name: Option<&str>) -> Result<(), S
 fn load_delegations(store: &Store, peers: &mut [DatabasePeer]) -> Result<(), rusqlite::Error> {
     let (mut by_key, only_key) = index(peers)?;
     let mut stmt = store.prepare_cached(
-        "SELECT public_key, address, prefix_len FROM delegations
+        "SELECT public_key, address, prefix_len, reclaim FROM delegations
          WHERE ?1 IS NULL OR public_key = ?1
          ORDER BY length(address), address",
     )?;
     let mut rows = stmt.query(params![only_key])?;
     while let Some(row) = rows.next()? {
         if let Some(peer) = by_key.get_mut(&row_key(row, 0)?) {
-            peer.inner
-                .delegations
-                .push(prefix_from_row(row.get(1)?, row.get(2)?)?);
+            let range = prefix_from_row(row.get(1)?, row.get(2)?)?;
+            peer.inner.delegations.push(range);
+            if row.get(3)? {
+                peer.reclaim.push(range);
+            }
         }
     }
     Ok(())
