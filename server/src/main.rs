@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use innernet_shared::{
-    AddCidrOpts, AddPeerOpts, DeleteCidrOpts, EnableDisablePeerOpts, HostsOpts, NetworkOpts,
-    RenameCidrOpts, RenamePeerOpts,
+    AddCidrOpts, AddPeerOpts, DelegationOpts, DeleteCidrOpts, EnableDisablePeerOpts, HostsOpts,
+    NetworkOpts, RenameCidrOpts, RenamePeerOpts,
 };
 use std::{env, path::PathBuf};
 
@@ -87,6 +87,29 @@ enum Command {
 
         #[clap(flatten)]
         args: EnableDisablePeerOpts,
+    },
+
+    /// Delegate a prefix of a peer's CIDR to the peer.
+    ///
+    /// The prefix must be aligned, lie within the peer's CIDR, hold neither the network nor the
+    /// broadcast address of the CIDR, and share no address with another delegation.
+    AddDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: DelegationOpts,
+    },
+
+    /// Withdraw a delegation from a peer.
+    ///
+    /// Every node that has seen the peer keeps the prefix pinned to the peer's key, and refuses it
+    /// to another peer. A peer left without a delegation is in effect disabled. The server's own
+    /// peer keeps the delegation that holds the server's internal address.
+    WithdrawDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        args: DelegationOpts,
     },
 
     /// Rename an existing peer.
@@ -189,6 +212,20 @@ async fn run(opts: Opts) -> Result<(), anyhow::Error> {
             let admin = AdminClient::new(&interface, &conf)?;
             let rest_client = admin.rest_client()?;
             admin::enable_or_disable_peer(&rest_client, args, true)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::AddDelegation { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::add_delegation(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::WithdrawDelegation { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::withdraw_delegation(&rest_client, args)
                 .await
                 .map_err(|e| admin.explain(e))?
         },

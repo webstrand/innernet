@@ -3,7 +3,7 @@ use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Respon
 use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo},
     tls, Cidr, CidrContents, LegacyPeer, LegacyPeerContents, LegacyState, PeerContents, PeerUpdate,
-    State, TaggedPeer, INNERNET_PUBKEY_HEADER,
+    Prefix, State, TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -235,6 +235,39 @@ impl<'a> RestClient<'a> {
                     .await
             },
         }
+    }
+
+    /// Replaces the delegations of the peer `listed`, as it was listed, with `delegations` as a
+    /// whole, in the API of TLS sessions. Delegations that have changed since the peer was listed
+    /// are refused as [`RestError::PeerChanged`]: the client refuses them when it reads them with
+    /// their tag, and the server refuses them if they change between the read and the change. A
+    /// peer that the server does not find by its key is refused as [`RestError::NoSuchPeer`]. A
+    /// server that predates TLS has no delegations, and is refused as
+    /// [`RestError::DelegationsUnsupported`] without a request.
+    pub async fn set_delegations(
+        &self,
+        listed: &PeerContents,
+        delegations: Vec<Prefix>,
+    ) -> Result<(), RestError> {
+        if self.admin_api().await? == AdminApi::Legacy {
+            return Err(RestError::DelegationsUnsupported);
+        }
+        let path = format!("/admin/peers/{}/delegations", listed.api_path_segment());
+        let TaggedPeerDelegations {
+            delegations: current,
+            tag,
+        } = self
+            .http("GET", &path)
+            .await
+            .map_err(RestError::peer_refusal)?;
+        let mut listed_delegations = listed.delegations.clone();
+        listed_delegations.sort();
+        if current != listed_delegations {
+            return Err(RestError::PeerChanged);
+        }
+        self.http_form("PUT", &path, TaggedPeerDelegations { delegations, tag })
+            .await
+            .map_err(RestError::peer_refusal)
     }
 
     /// Perform a `verb` HTTP request at the given `endpoint`.
@@ -990,6 +1023,77 @@ mod tests {
                 "GET /v1/user/state HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sets_delegations_by_key_over_tls() {
+        let server_key = KeyPair::generate();
+        let peer = listed_peer();
+        let tagged = |delegations: &[Prefix]| {
+            let body = TaggedPeerDelegations {
+                delegations: delegations.to_vec(),
+                tag: "ab".into(),
+            };
+            json_response("200 OK", &serde_json::to_string(&body).unwrap())
+        };
+        let wider: Vec<Prefix> = vec![
+            "10.0.0.7/32".parse().unwrap(),
+            "10.0.0.16/28".parse().unwrap(),
+        ];
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                tagged(&peer.delegations),
+                NO_CONTENT.into(),
+                // The delegations changed between the listing and the read.
+                tagged(&wider),
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+
+        // The client reads the delegations with their tag, and replaces them with the tag.
+        client.set_delegations(&peer, wider.clone()).await.unwrap();
+        let path = format!("/v1/admin/peers/{}/delegations", peer.api_path_segment());
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with(&format!("GET {path} ")));
+        let put = requests.recv().unwrap();
+        assert!(put.starts_with(&format!("PUT {path} ")), "{put}");
+        let body: TaggedPeerDelegations =
+            serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            TaggedPeerDelegations {
+                delegations: wider.clone(),
+                tag: "ab".into()
+            }
+        );
+
+        let error = client.set_delegations(&peer, vec![]).await.unwrap_err();
+        assert!(matches!(error, RestError::PeerChanged), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_no_delegations_in_plain_http() {
+        // A server that predates TLS has no delegations, so nothing is sent to it.
+        let server_key = KeyPair::generate();
+        let (addr, server) = plain_http_server_recording(2, NO_CONTENT_CLOSE);
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+        let error = client
+            .set_delegations(&listed_peer(), vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RestError::DelegationsUnsupported),
+            "{error:?}"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            [TLS_HANDSHAKE, "GET /v1/user/capabilities HTTP/1.1"]
         );
     }
 

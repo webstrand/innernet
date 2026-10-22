@@ -21,7 +21,7 @@ use innernet_shared::{
     interface_config::{InterfaceConfig, Invitation},
     prompts, wg,
     wg::PeerInfoExt,
-    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
+    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DelegationOpts, DeleteCidrOpts,
     EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
     IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
     OverridePeerEndpointOpts, PeerContents, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
@@ -229,6 +229,30 @@ enum Command {
 
         #[clap(flatten)]
         sub_opts: EnableDisablePeerOpts,
+    },
+
+    /// Delegate a prefix of a peer's CIDR to the peer
+    ///
+    /// The server must speak TLS. The prefix must be aligned, lie within the peer's CIDR, hold
+    /// neither the network nor the broadcast address of the CIDR, and share no address with
+    /// another delegation.
+    AddDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DelegationOpts,
+    },
+
+    /// Withdraw a delegation from a peer
+    ///
+    /// The server must speak TLS. Every node that has seen the peer keeps the prefix pinned to the
+    /// peer's key, and refuses it to another peer. A peer left without a delegation is in effect
+    /// disabled.
+    WithdrawDelegation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DelegationOpts,
     },
 
     /// Add an association between CIDRs
@@ -1112,6 +1136,20 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         } => {
             admin_client!(interface, _config, rest_client);
             admin::enable_or_disable_peer(&rest_client, sub_opts, true).await?
+        },
+        Command::AddDelegation {
+            interface,
+            sub_opts,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::add_delegation(&rest_client, sub_opts).await?
+        },
+        Command::WithdrawDelegation {
+            interface,
+            sub_opts,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::withdraw_delegation(&rest_client, sub_opts).await?
         },
         Command::AddAssociation {
             interface,

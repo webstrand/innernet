@@ -1,8 +1,8 @@
 use crate::{
-    interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
-    AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
-    Endpoint, Error, Hostname, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, PeerContents,
-    Prefix, RenameCidrOpts, RenamePeerOpts,
+    check_delegations, hosts_fallback, interface_config::InterfaceInfo, peer::NewPeerInfo,
+    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, Association, Cidr, CidrContents, CidrTree,
+    DelegationOpts, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt,
+    ListenPortOpts, OverridePeerEndpointOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -479,6 +479,187 @@ pub fn enable_or_disable_peer(
     )
 }
 
+/// Selects the peer of `peers` whose delegations change: the one named by `args`, or one that the
+/// operator selects among `peers` that `eligible` accepts.
+fn select_delegated_peer<'a>(
+    peers: &'a [PeerContents],
+    args: &DelegationOpts,
+    eligible: impl Fn(&PeerContents) -> bool,
+    prompt: &str,
+) -> Result<&'a PeerContents, Error> {
+    if let Some(name) = &args.name {
+        return peers
+            .iter()
+            .find(|peer| peer.name.as_ref() == Some(name))
+            .ok_or_else(|| anyhow!("Peer '{name}' does not exist"));
+    }
+    let eligible: Vec<_> = peers.iter().filter(|peer| eligible(peer)).collect();
+    if eligible.is_empty() {
+        bail!("No peer is eligible.");
+    }
+    let selection: Vec<_> = eligible
+        .iter()
+        .map(|peer| {
+            format!(
+                "{} ({}) {}",
+                peer.display_name(),
+                peer.display_delegations(),
+                peer.public_key
+            )
+        })
+        .collect();
+    let (index, _) = select(prompt, &selection)?;
+    Ok(eligible[index])
+}
+
+/// The warning printed when `delegations` would move the hosts fallback address of `peer`, at
+/// which its name resolves and clients that predate TLS reach it, or `None` if it stays.
+pub fn hosts_fallback_notice(peer: &PeerContents, delegations: &[Prefix]) -> Option<String> {
+    let new = hosts_fallback(delegations);
+    let old = peer.hosts_fallback();
+    if new == old {
+        return None;
+    }
+    let display = |ip: Option<IpAddr>| ip.map_or("[none]".to_string(), |ip| ip.to_string());
+    Some(format!(
+        "This moves the hosts fallback address of peer {}, the lowest address of its \
+         delegations, at which its name resolves and clients that predate TLS reach it, from {} \
+         to {}.",
+        peer.display_name(),
+        display(old),
+        display(new),
+    ))
+}
+
+/// Bring up a prompt to delegate a prefix to a peer of `peers`, whose CIDRs are `cidrs`. Returns
+/// the peer and its delegations with the prefix added. The prefix is checked as the server checks
+/// it, against the peer's CIDR and the delegations of the other peers, so that a refusal is
+/// explained before the server is asked.
+pub fn add_delegation<'a>(
+    peers: &'a [PeerContents],
+    cidrs: &[Cidr],
+    args: &DelegationOpts,
+) -> Result<Option<(&'a PeerContents, Vec<Prefix>)>, Error> {
+    let peer = select_delegated_peer(peers, args, |_| true, "Peer to delegate a prefix to")?;
+    let prefix: Prefix = match args.prefix {
+        Some(prefix) => prefix,
+        None => input("Prefix to delegate", Prefill::None)?,
+    };
+    if peer.delegations.contains(&prefix) {
+        bail!(
+            "{prefix} is delegated to peer {} already",
+            peer.display_name()
+        );
+    }
+    let cidr = cidrs
+        .iter()
+        .find(|cidr| cidr.id == peer.cidr_id)
+        .ok_or_else(|| anyhow!("The CIDR of peer {} is unknown", peer.display_name()))?;
+    let others: Vec<(Prefix, String)> = peers
+        .iter()
+        .filter(|other| other.public_key != peer.public_key)
+        .flat_map(|other| {
+            other
+                .delegations
+                .iter()
+                .map(move |delegation| (*delegation, format!("peer {}", other.display_name())))
+        })
+        .collect();
+    let mut delegations = peer.delegations.clone();
+    delegations.push(prefix);
+    delegations.sort();
+    check_delegations(
+        &delegations,
+        &cidr.cidr,
+        others
+            .iter()
+            .map(|(prefix, holder)| (prefix, holder.as_str())),
+    )?;
+
+    if let Some(notice) = hosts_fallback_notice(peer, &delegations) {
+        log::warn!("{notice}");
+    }
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Delegate {} to peer {}?",
+                prefix.to_string().yellow(),
+                peer.display_name().yellow()
+            ))?
+        {
+            Some((peer, delegations))
+        } else {
+            None
+        },
+    )
+}
+
+/// Selects the delegation of `peer` that `args` names, or one that the operator selects, with
+/// `prompt`.
+fn select_delegation(
+    peer: &PeerContents,
+    args: &DelegationOpts,
+    prompt: &str,
+) -> Result<Prefix, Error> {
+    match args.prefix {
+        Some(prefix) => {
+            if !peer.delegations.contains(&prefix) {
+                bail!(
+                    "{prefix} is not a delegation of peer {}, whose delegations are {}",
+                    peer.display_name(),
+                    peer.display_delegations()
+                );
+            }
+            Ok(prefix)
+        },
+        None => {
+            if peer.delegations.is_empty() {
+                bail!("Peer {} has no delegation.", peer.display_name());
+            }
+            Ok(*select(prompt, &peer.delegations)?.1)
+        },
+    }
+}
+
+/// Bring up a prompt to withdraw a delegation from a peer of `peers`. Returns the peer and its
+/// delegations without the withdrawn one.
+pub fn withdraw_delegation<'a>(
+    peers: &'a [PeerContents],
+    args: &DelegationOpts,
+) -> Result<Option<(&'a PeerContents, Vec<Prefix>)>, Error> {
+    let peer = select_delegated_peer(
+        peers,
+        args,
+        |peer| !peer.delegations.is_empty(),
+        "Peer to withdraw a delegation from",
+    )?;
+    let prefix = select_delegation(peer, args, "Delegation to withdraw")?;
+    let delegations: Vec<Prefix> = peer
+        .delegations
+        .iter()
+        .filter(|delegation| **delegation != prefix)
+        .copied()
+        .collect();
+
+    if let Some(notice) = hosts_fallback_notice(peer, &delegations) {
+        log::warn!("{notice}");
+    }
+    Ok(
+        if args.yes
+            || confirm(&format!(
+                "Withdraw {} from peer {}? Every node that has seen the peer keeps the prefix \
+                 pinned to its key.",
+                prefix.to_string().yellow(),
+                peer.display_name().yellow()
+            ))?
+        {
+            Some((peer, delegations))
+        } else {
+            None
+        },
+    )
+}
+
 pub fn set_listen_port(
     interface: &InterfaceInfo,
     args: ListenPortOpts,
@@ -647,4 +828,91 @@ pub fn override_peer_endpoint_prompt(
     } else {
         None
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(name: &str, public_key: &str, delegations: &[&str]) -> PeerContents {
+        PeerContents {
+            name: Some(name.parse().unwrap()),
+            delegations: delegations.iter().map(|d| d.parse().unwrap()).collect(),
+            cidr_id: 1,
+            public_key: public_key.to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        }
+    }
+
+    fn opts(name: &str, prefix: &str) -> DelegationOpts {
+        DelegationOpts {
+            name: Some(name.parse().unwrap()),
+            prefix: Some(prefix.parse().unwrap()),
+            yes: true,
+        }
+    }
+
+    #[test]
+    fn test_change_delegations() {
+        let peers = [
+            peer(
+                "peer1",
+                "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=",
+                &["10.0.0.9/32"],
+            ),
+            peer(
+                "peer2",
+                "GBfQ6Xqdrw2WsNsW8ZsANpyDLeffy6XqwOYpAyyZ3AQ=",
+                &["10.0.0.2/32"],
+            ),
+        ];
+        let cidrs = [Cidr {
+            id: 1,
+            contents: CidrContents {
+                name: "cidr".into(),
+                cidr: "10.0.0.0/24".parse().unwrap(),
+                parent: None,
+            },
+        }];
+
+        // An addition is checked as the server checks it, and returns the whole set.
+        let (_, delegations) = add_delegation(&peers, &cidrs, &opts("peer1", "10.0.0.16/28"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delegations,
+            ["10.0.0.9/32", "10.0.0.16/28"].map(|d| d.parse::<Prefix>().unwrap())
+        );
+        assert!(add_delegation(&peers, &cidrs, &opts("peer1", "10.0.0.9/32")).is_err());
+        let error = add_delegation(&peers, &cidrs, &opts("peer1", "10.0.0.0/30"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("network or broadcast"), "{error}");
+        let error = add_delegation(&peers, &cidrs, &opts("peer1", "10.0.0.2/31"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("delegated to peer peer2"), "{error}");
+
+        // An addition below the lowest address moves the hosts fallback address.
+        let lower: Vec<Prefix> = vec![
+            "10.0.0.4/32".parse().unwrap(),
+            "10.0.0.9/32".parse().unwrap(),
+        ];
+        let notice = hosts_fallback_notice(&peers[0], &lower).unwrap();
+        assert!(notice.contains("from 10.0.0.9 to 10.0.0.4"), "{notice}");
+        assert!(hosts_fallback_notice(&peers[0], &delegations).is_none());
+
+        // Only a delegation of the peer is withdrawn.
+        let (_, delegations) = withdraw_delegation(&peers, &opts("peer1", "10.0.0.9/32"))
+            .unwrap()
+            .unwrap();
+        assert!(delegations.is_empty());
+        assert!(withdraw_delegation(&peers, &opts("peer1", "10.0.0.2/32")).is_err());
+    }
 }

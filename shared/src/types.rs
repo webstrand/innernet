@@ -412,6 +412,22 @@ pub struct EnableDisablePeerOpts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct DelegationOpts {
+    /// Name of the peer whose delegations change
+    #[clap(long)]
+    pub name: Option<Hostname>,
+
+    /// The prefix to delegate or withdraw (eg. '10.42.5.16/28', or '10.42.5.9/32' for a single
+    /// address)
+    #[clap(long)]
+    pub prefix: Option<Prefix>,
+
+    /// Bypass confirmation
+    #[clap(long, requires_all = ["name", "prefix"])]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct AddCidrOpts {
     /// The CIDR name (eg. 'engineers')
     #[clap(long)]

@@ -2,14 +2,17 @@
 //! as an admin peer of a network, and `innernet-server` as the coordinator's own peer. Each takes
 //! the client of the API and what its prompt needs, and prompts for what its options leave out.
 
-use crate::{peer::invite, rest_client::RestClient};
+use crate::{
+    peer::invite,
+    rest_client::{AdminApi, RestClient, RestError},
+};
 use anyhow::{anyhow, Error};
 use colored::*;
 use indoc::eprintdoc;
 use innernet_shared::{
     interface_config::ServerInfo, prompts, AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts,
-    Association, AssociationContents, Cidr, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
-    PeerContents, RenameCidrOpts, RenamePeerOpts,
+    Association, AssociationContents, Cidr, CidrTree, DelegationOpts, DeleteCidrOpts,
+    EnableDisablePeerOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
 };
 use wireguard_control::InterfaceName;
 
@@ -160,6 +163,61 @@ pub async fn enable_or_disable_peer(
     }
 
     Ok(())
+}
+
+/// Sets the delegations of a peer as `prompt` selects them among the peers and CIDRs of the
+/// network, through a coordinator that speaks TLS.
+async fn change_delegations(
+    rest_client: &RestClient<'_>,
+    prompt: impl FnOnce(&[PeerContents], &[Cidr]) -> Result<Option<(PeerContents, Vec<Prefix>)>, Error>,
+) -> Result<(), Error> {
+    if rest_client.admin_api().await? == AdminApi::Legacy {
+        return Err(RestError::DelegationsUnsupported.into());
+    }
+
+    log::info!("Fetching CIDRs and peers.");
+    let cidrs = rest_client.get_cidrs().await?;
+    let peers = rest_client.get_peers().await?;
+    if let Some((peer, delegations)) = prompt(&peers, &cidrs)? {
+        rest_client
+            .set_delegations(&peer, delegations.clone())
+            .await?;
+        let changed = PeerContents {
+            delegations,
+            ..peer
+        };
+        println!(
+            "The delegations of peer {} are now {}.",
+            changed.display_name(),
+            changed.display_delegations()
+        );
+    } else {
+        log::info!("exiting without changing delegations.");
+    }
+
+    Ok(())
+}
+
+pub async fn add_delegation(
+    rest_client: &RestClient<'_>,
+    sub_opts: DelegationOpts,
+) -> Result<(), Error> {
+    change_delegations(rest_client, |peers, cidrs| {
+        Ok(prompts::add_delegation(peers, cidrs, &sub_opts)?
+            .map(|(peer, delegations)| (peer.clone(), delegations)))
+    })
+    .await
+}
+
+pub async fn withdraw_delegation(
+    rest_client: &RestClient<'_>,
+    sub_opts: DelegationOpts,
+) -> Result<(), Error> {
+    change_delegations(rest_client, |peers, _| {
+        Ok(prompts::withdraw_delegation(peers, &sub_opts)?
+            .map(|(peer, delegations)| (peer.clone(), delegations)))
+    })
+    .await
 }
 
 pub async fn add_association(
