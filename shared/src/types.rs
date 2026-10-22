@@ -635,6 +635,46 @@ pub struct PeerContents {
     pub candidates: Vec<Endpoint>,
 }
 
+impl PeerContents {
+    /// The public key of the peer in the URL-safe base64 alphabet, padding included, by which a
+    /// path of the admin API names the peer in TLS sessions.
+    pub fn api_path_segment(&self) -> String {
+        self.public_key.replace('+', "-").replace('/', "_")
+    }
+}
+
+/// A peer and its tag: the body of `GET /admin/peers/{key}` in TLS sessions. A change to the peer
+/// carries the tag, and the server refuses the change if the peer has changed since. The tag
+/// leaves out the peer's endpoint and candidates, which the peer reports on its own.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TaggedPeer {
+    pub peer: Peer,
+    pub tag: String,
+}
+
+/// The changes that an admin may make to a peer: the body of `PUT /admin/peers/{key}` in TLS
+/// sessions. `tag` is that of the peer as the admin read it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PeerUpdate {
+    pub tag: String,
+    pub name: Hostname,
+    pub is_admin: bool,
+    pub is_disabled: bool,
+}
+
+impl PeerUpdate {
+    /// The changes that set the peer with the tag `tag` to the name, admin role and disabled
+    /// state of `contents`.
+    pub fn new(tag: String, contents: &PeerContents) -> Self {
+        Self {
+            tag,
+            name: contents.name.clone(),
+            is_admin: contents.is_admin,
+            is_disabled: contents.is_disabled,
+        }
+    }
+}
+
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
 /// canonical base64 encoding, so that public keys can be compared as strings.
 fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {

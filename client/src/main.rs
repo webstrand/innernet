@@ -22,8 +22,8 @@ use innernet_shared::{
     AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
     DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
     Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
-    WrappedIoError,
+    OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
+    ServerCapabilities, WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -695,21 +695,17 @@ async fn rename_peer(
     let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching peers");
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
+    let peers = rest_client.get_peers().await?;
 
     if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
         log::info!("Renaming peer...");
 
-        let id = peers
+        let listed = peers
             .iter()
-            .filter(|p| p.name == old_name)
-            .map(|p| p.id)
-            .next()
+            .find(|p| p.name == old_name)
             .ok_or_else(|| anyhow!("Peer not found."))?;
 
-        rest_client
-            .http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), peer_request)
-            .await?;
+        rest_client.update_peer(listed, &peer_request).await?;
         log::info!("Peer renamed.");
     } else {
         log::info!("exited without renaming peer.");
@@ -728,14 +724,14 @@ async fn enable_or_disable_peer(
     let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
 
     log::info!("Fetching peers.");
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
+    let peers = rest_client.get_peers().await?;
 
     if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
-        let Peer { id, mut contents } = peer;
-        contents.is_disabled = !enable;
-        rest_client
-            .http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)
-            .await?;
+        let contents = PeerContents {
+            is_disabled: !enable,
+            ..peer.contents.clone()
+        };
+        rest_client.update_peer(&peer, &contents).await?;
     } else {
         log::info!("exiting without enabling or disabling peer.");
     }

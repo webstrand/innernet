@@ -182,15 +182,6 @@ impl DatabasePeer {
         Ok(())
     }
 
-    pub fn disable(conn: &Connection, id: i64) -> Result<(), ServerError> {
-        let key = Self::get(conn, id)?.key()?;
-        conn.execute(
-            "UPDATE peers SET is_disabled = 1 WHERE public_key = ?1",
-            params![key],
-        )?;
-        Ok(())
-    }
-
     /// Redeems the invitation with the key `pubkey`, the invitee's own. The node never moves a pin
     /// to another key, so the invitation, which nothing but the server has seen, is deleted with
     /// what is pinned to its key, and the redeemed peer recorded in its place, latched to TLS if the

@@ -15,7 +15,7 @@ pub mod user;
 ///     endpoint or (b) add it to the list of NAT candidates, if an override endpoint is specified.
 ///     Note that NAT traversal does not always work e.g. if the peer is behind double NAT or
 ///     address/port restricted cone NAT.
-pub fn inject_endpoints(session: &Session, peers: &mut Vec<Peer>) {
+pub fn inject_endpoints<'a>(session: &Session, peers: impl IntoIterator<Item = &'a mut Peer>) {
     for peer in peers {
         let endpoints = session.context.endpoints.read();
         let wg_endpoint = endpoints.get(&peer.public_key);

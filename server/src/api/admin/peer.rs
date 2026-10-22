@@ -7,29 +7,95 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::PeerContents;
+use innernet_shared::{PeerContents, PeerUpdate, TaggedPeer};
+use rusqlite::Connection;
+use serde::Serialize;
+use sha2::{Digest, Sha512};
+use wireguard_control::Key;
 
+/// Serves `/admin/peers`, in which a path names a peer by its public key only, as
+/// [`PeerContents::api_path_segment`] encodes it. Any other path under a peer is not found.
 pub async fn routes(
     req: Request<Body>,
     mut components: VecDeque<String>,
     session: Session,
 ) -> Result<Response<Body>, ServerError> {
-    match (req.method(), components.pop_front().as_deref()) {
+    let peer = components.pop_front();
+    if !components.is_empty() {
+        return Err(ServerError::NotFound);
+    }
+    let key = peer.as_deref().map(parse_path_key).transpose()?;
+    match (req.method(), key) {
         (&Method::GET, None) => handlers::list(session).await,
         (&Method::POST, None) => {
             let form = form_body(req).await?;
             handlers::create(form, session).await
         },
-        (&Method::PUT, Some(id)) => {
-            let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
+        (&Method::GET, Some(key)) => handlers::get_by_key(key, session).await,
+        (&Method::PUT, Some(key)) => {
             let form = form_body(req).await?;
-            handlers::update(id, form, session).await
-        },
-        (&Method::DELETE, Some(id)) => {
-            let id: i64 = id.parse().map_err(|_| ServerError::NotFound)?;
-            handlers::delete(id, session).await
+            handlers::update_by_key(key, form, session).await
         },
         _ => Err(ServerError::NotFound),
+    }
+}
+
+/// Parses a path segment that names a peer by its public key in the URL-safe base64 alphabet,
+/// padding included. Any other encoding of a key is not found.
+fn parse_path_key(segment: &str) -> Result<Key, ServerError> {
+    if segment.contains(['+', '/']) {
+        return Err(ServerError::NotFound);
+    }
+    let base64 = segment.replace('-', "+").replace('_', "/");
+    match Key::from_base64(&base64) {
+        Ok(key) if key.to_base64() == base64 => Ok(key),
+        _ => Err(ServerError::NotFound),
+    }
+}
+
+/// The tag of `value`, a resource of a peer of the kind `kind`: a hash of the kind and the value,
+/// and of nothing else, so that a tag depends only on the state that it was computed for. Clients
+/// treat tags as opaque. The hash is SHA-512, which XEdDSA uses already, cut to 128 bits: a tag
+/// only tells states apart, and needs no more resistance to collisions.
+fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
+    let mut hasher = Sha512::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(value)?);
+    let hash = hasher.finalize();
+    Ok(hash[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// The tag of a peer: that of everything an admin reads of the peer, its public key included, but
+/// its ID, which only the API of plain-HTTP sessions uses, and its endpoint and candidates, which
+/// the peer reports on its own.
+fn peer_tag(peer: &PeerContents) -> Result<String, ServerError> {
+    let peer = PeerContents {
+        endpoint: None,
+        candidates: vec![],
+        ..peer.clone()
+    };
+    tag("peer", &peer)
+}
+
+/// The peer with the public key `key`, if `tag_of` the peer is still `tag`. A peer that has
+/// changed since it was tagged is refused as [`ServerError::PeerChanged`]. A peer whose key has
+/// changed since, as a redeemed invitation's does, is not found, like a peer that never existed:
+/// a tag doesn't identify the peer it was computed for.
+fn get_unchanged(
+    conn: &Connection,
+    key: &Key,
+    tag: &str,
+    tag_of: impl Fn(&PeerContents) -> Result<String, ServerError>,
+) -> Result<DatabasePeer, ServerError> {
+    match DatabasePeer::get_from_public_key(conn, key) {
+        Ok(peer) if tag_of(&peer.contents)? == tag => Ok(peer),
+        Ok(_) => Err(ServerError::PeerChanged),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(ServerError::NotFound),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -53,14 +119,31 @@ mod handlers {
         json_status_response(&*peer, StatusCode::CREATED)
     }
 
-    pub async fn update(
-        id: i64,
-        form: PeerContents,
+    /// The peer with the public key `key` as the listing reports it, with its tag.
+    pub async fn get_by_key(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let mut peer = DatabasePeer::get_from_public_key(&conn, &key)?.inner;
+        let tag = peer_tag(&peer.contents)?;
+        inject_endpoints(&session, [&mut peer]);
+        json_response(TaggedPeer { peer, tag })
+    }
+
+    /// Applies an admin's changes to the peer with the public key `key`, if the peer hasn't
+    /// changed since the admin read it with the tag that the changes carry.
+    pub async fn update_by_key(
+        key: Key,
+        form: PeerUpdate,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut peer = DatabasePeer::get(&conn, id)?;
-        peer.update(&conn, form)?;
+        let mut peer = get_unchanged(&conn, &key, &form.tag, peer_tag)?;
+        let contents = PeerContents {
+            name: form.name,
+            is_admin: form.is_admin,
+            is_disabled: form.is_disabled,
+            ..peer.contents.clone()
+        };
+        peer.update(&conn, contents)?;
         // The update may have enabled or disabled the peer.
         session.context.changed.notify();
 
@@ -77,14 +160,6 @@ mod handlers {
         inject_endpoints(&session, &mut peers);
         json_response(&peers)
     }
-
-    pub async fn delete(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        DatabasePeer::disable(&conn, id)?;
-        session.context.changed.notify();
-
-        status_response(StatusCode::NO_CONTENT)
-    }
 }
 
 #[cfg(test)]
@@ -93,7 +168,7 @@ mod tests {
     use crate::test;
     use bytes::Buf;
     use innernet_shared::{Endpoint, Error, Peer};
-    use wireguard_control::Key;
+    use wireguard_control::KeyPair;
 
     #[tokio::test]
     async fn test_add_peer() -> Result<(), Error> {
@@ -250,30 +325,174 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_update_peer_from_admin() -> Result<(), Error> {
-        let server = test::Server::new()?;
-        let old_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+    fn peer(server: &test::Server, id: i64) -> DatabasePeer {
+        DatabasePeer::get(&server.db.lock(), id).unwrap()
+    }
 
-        let change = PeerContents {
-            name: "new-peer-name".parse().unwrap(),
-            ..old_peer.contents.clone()
+    /// The path of the peer `id` in the API of TLS sessions.
+    fn key_path(server: &test::Server, id: i64) -> String {
+        format!("/v1/admin/peers/{}", peer(server, id).api_path_segment())
+    }
+
+    #[test]
+    fn test_parse_path_key() {
+        // A key whose standard base64 holds both '+' and '/'.
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_mut(3) {
+            chunk.copy_from_slice(&[0xfb, 0xff, 0xbf][..chunk.len()]);
+        }
+        let key = Key(bytes);
+        let contents = PeerContents {
+            public_key: key.to_base64(),
+            ..test::developer_peer_contents("peer", "10.80.64.9").unwrap()
         };
+        let segment = contents.api_path_segment();
+        assert!(contents.public_key.contains('+') && contents.public_key.contains('/'));
+        assert!(!segment.contains(['+', '/']));
+        assert_eq!(parse_path_key(&segment).unwrap(), key);
 
-        // Try to create a new developer peer from a user peer.
+        // IDs, the standard alphabet, a missing padding and other text are not keys.
+        for segment in [
+            "12",
+            &contents.public_key.replace('/', "_"),
+            segment.trim_end_matches('='),
+            "nonsense",
+            "",
+        ] {
+            assert!(parse_path_key(segment).is_err(), "{segment}");
+        }
+    }
+
+    /// Reads the peer at `path` with its tag, as the admin.
+    async fn get_tagged(server: &test::Server, path: &str) -> TaggedPeer {
+        let res = server.request(test::ADMIN_PEER_IP, "GET", path).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = hyper::body::aggregate(res).await.unwrap();
+        serde_json::from_reader(body.reader()).unwrap()
+    }
+
+    /// The changes that leave the peer at `path` as it is, with its current tag.
+    async fn unchanged(server: &test::Server, path: &str) -> PeerUpdate {
+        let TaggedPeer { peer, tag } = get_tagged(server, path).await;
+        PeerUpdate::new(tag, &peer.contents)
+    }
+
+    #[tokio::test]
+    async fn test_update_peer_by_key() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let mut change = unchanged(&server, &path).await;
+        change.name = "new-peer-name".parse().unwrap();
+        change.is_disabled = true;
+
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let new_peer = peer(&server, test::DEVELOPER1_PEER_ID);
+        assert_eq!(&*new_peer.name, "new-peer-name");
+        assert!(new_peer.is_disabled);
+
+        // A non-admin can't, and no other path under a peer is routed to it.
+        let res = server
+            .form_request(test::DEVELOPER2_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let res = server
             .form_request(
                 test::ADMIN_PEER_IP,
                 "PUT",
-                &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
+                &format!("{path}/other"),
                 &change,
             )
             .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
+        // An unknown key is not found, even with the tag of a peer that exists.
+        let unknown = PeerContents {
+            public_key: KeyPair::generate().public.to_base64(),
+            ..new_peer.contents.clone()
+        };
+        let path = format!("/v1/admin/peers/{}", unknown.api_path_segment());
+        let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tags_depend_only_on_state() -> Result<(), Error> {
+        // A tag is a hash of the peer's state, and that state includes the key.
+        let peer = test::developer_peer_contents("peer", "10.80.64.9")?;
+        let tag = peer_tag(&peer)?;
+        assert_eq!(tag.len(), 32);
+        assert_eq!(peer_tag(&peer.clone())?, tag);
+        let other_key = PeerContents {
+            public_key: KeyPair::generate().public.to_base64(),
+            ..peer.clone()
+        };
+        assert_ne!(peer_tag(&other_key)?, tag);
+        let renamed = PeerContents {
+            name: "renamed".parse().unwrap(),
+            ..peer.clone()
+        };
+        assert_ne!(peer_tag(&renamed)?, tag);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tags() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let seen = get_tagged(&server, &path).await;
+        assert_eq!(get_tagged(&server, &path).await.tag, seen.tag);
+        assert_eq!(
+            seen.peer.public_key,
+            peer(&server, test::DEVELOPER1_PEER_ID).public_key
+        );
+
+        // The endpoint and candidates that the peer reports leave its tag unchanged.
+        {
+            let store = server.db.lock();
+            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            peer.set_endpoint(&store, Some("198.51.100.1:51820".parse().unwrap()))?;
+            peer.set_candidates(&store, vec!["198.51.100.2:51820".parse().unwrap()])?;
+        }
+        assert_eq!(get_tagged(&server, &path).await.tag, seen.tag);
+
+        // A change by another admin turns away a change based on what was read before it.
+        let rename = |name: &str| PeerUpdate {
+            name: name.parse().unwrap(),
+            ..PeerUpdate::new(seen.tag.clone(), &seen.peer.contents)
+        };
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, rename("first"))
+            .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, rename("second"))
+            .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("changed"));
+        assert_eq!(&*peer(&server, test::DEVELOPER1_PEER_ID).name, "first");
+        assert_ne!(get_tagged(&server, &path).await.tag, seen.tag);
 
-        let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
-        assert_eq!(&*new_peer.name, "new-peer-name");
+        // A change must carry a tag.
+        let untagged = serde_json::json!({
+            "name": "third",
+            "is_admin": false,
+            "is_disabled": false,
+        });
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(&*peer(&server, test::DEVELOPER1_PEER_ID).name, "first");
         Ok(())
     }
 
@@ -283,32 +502,21 @@ mod tests {
         let endpoint: Endpoint = "1.1.1.1:51820".parse().unwrap();
         let candidate: Endpoint = "192.168.0.2:51820".parse().unwrap();
         {
-            let conn = server.db.lock();
-            let mut peer = DatabasePeer::get(&conn, test::DEVELOPER1_PEER_ID)?;
-            peer.set_endpoint(&conn, Some(endpoint.clone()))?;
-            peer.set_candidates(&conn, vec![candidate.clone()])?;
+            let store = server.db.lock();
+            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            peer.set_endpoint(&store, Some(endpoint.clone()))?;
+            peer.set_candidates(&store, vec![candidate.clone()])?;
         }
-        let old_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
 
-        // An admin client sends back the peer as it listed it, with the endpoint that the server
-        // observed in place of the one that the peer set.
-        let change = PeerContents {
-            name: "new-peer-name".parse().unwrap(),
-            endpoint: Some("2.2.2.2:51820".parse().unwrap()),
-            candidates: vec![],
-            ..old_peer.contents.clone()
-        };
+        let path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let mut change = unchanged(&server, &path).await;
+        change.name = "new-peer-name".parse().unwrap();
         let res = server
-            .form_request(
-                test::ADMIN_PEER_IP,
-                "PUT",
-                &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
-                &change,
-            )
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
             .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
-        let new_peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?;
+        let new_peer = peer(&server, test::DEVELOPER1_PEER_ID);
         assert_eq!(&*new_peer.name, "new-peer-name");
         assert_eq!(new_peer.endpoint, Some(endpoint));
         assert_eq!(new_peer.candidates, vec![candidate]);
@@ -316,28 +524,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_redeemed_peer_changed() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:9"
+        } else {
+            "10.80.64.9"
+        };
+        let contents = PeerContents {
+            is_redeemed: false,
+            ..test::developer_peer_contents("invitee", ip)?
+        };
+        let invitee = DatabasePeer::create(&server.db.lock(), contents)?;
+        let path = format!("/v1/admin/peers/{}", invitee.api_path_segment());
+        let mut change = unchanged(&server, &path).await;
+        change.name = "renamed".parse().unwrap();
+
+        // The invitation is redeemed, which changes the peer's key, after the admin read it. The
+        // change, which names the peer by its old key, finds no peer.
+        {
+            let store = server.db.lock();
+            let mut invitee = DatabasePeer::get_from_ip(&store, ip.parse()?)?;
+            invitee.redeem(&store, &KeyPair::generate().public.to_base64())?;
+        }
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let invitee = DatabasePeer::get_from_ip(&server.db.lock(), ip.parse()?)?;
+        assert_eq!(&*invitee.name, "invitee");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_sessions_refuse_ids() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let old_peer = peer(&server, test::DEVELOPER1_PEER_ID);
+        let id_path = format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID);
+
+        let change = PeerContents {
+            name: "new-peer-name".parse().unwrap(),
+            ..old_peer.contents.clone()
+        };
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &id_path, &change)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let mut update = unchanged(&server, &key_path(&server, test::DEVELOPER1_PEER_ID)).await;
+        update.name = change.name.clone();
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &id_path, &update)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        for method in ["GET", "DELETE"] {
+            let res = server.request(test::ADMIN_PEER_IP, method, &id_path).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
+
+        assert_eq!(
+            peer(&server, test::DEVELOPER1_PEER_ID).inner,
+            old_peer.inner
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_promotion_requires_tls() -> Result<(), Error> {
         let server = test::Server::new()?;
         server.predate_tls(test::DEVELOPER1_PEER_ID);
+        let path = key_path(&server, test::DEVELOPER1_PEER_ID);
         let promote = || async {
-            let peer = DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID).unwrap();
-            let change = PeerContents {
-                is_admin: true,
-                ..peer.contents.clone()
-            };
+            let mut change = unchanged(&server, &path).await;
+            change.is_admin = true;
             server
-                .form_request(
-                    test::ADMIN_PEER_IP,
-                    "PUT",
-                    &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
-                    &change,
-                )
+                .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
                 .await
         };
 
         // The peer predates TLS, and has only been seen in plain HTTP.
         assert_eq!(promote().await.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(!DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_admin);
+        assert!(!peer(&server, test::DEVELOPER1_PEER_ID).is_admin);
 
         // Once it has connected over TLS, it can be.
         let res = server
@@ -345,7 +611,7 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(promote().await.status(), StatusCode::NO_CONTENT);
-        assert!(DatabasePeer::get(&server.db.lock(), test::DEVELOPER1_PEER_ID)?.is_admin);
+        assert!(peer(&server, test::DEVELOPER1_PEER_ID).is_admin);
         Ok(())
     }
 
@@ -364,27 +630,6 @@ mod tests {
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_update_peer_from_non_admin() -> Result<(), Error> {
-        let server = test::Server::new()?;
-
-        let peer = test::developer_peer_contents("developer3", "10.80.64.4")?;
-
-        // Try to create a new developer peer from a user peer.
-        let res = server
-            .form_request(
-                test::USER1_PEER_IP,
-                "PUT",
-                &format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID),
-                &peer,
-            )
-            .await;
-
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
         Ok(())
     }
 
@@ -461,70 +706,6 @@ mod tests {
             peers(DatabasePeer::list(&server.db().lock())?),
             peers(old_peers)
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_delete() -> Result<(), Error> {
-        let server = test::Server::new()?;
-        let old_peers = DatabasePeer::list(&server.db().lock())?;
-
-        let res = server
-            .request(
-                test::ADMIN_PEER_IP,
-                "DELETE",
-                &format!("/v1/admin/peers/{}", test::USER1_PEER_ID),
-            )
-            .await;
-
-        assert!(res.status().is_success());
-
-        // The number of peer entries in the database decreased by 1.
-        let all_peers = DatabasePeer::list(&server.db().lock())?;
-        let new_peers = all_peers.iter().filter(|p| !p.is_disabled).count();
-        assert_eq!(old_peers.len() - 1, new_peers);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_delete_from_non_admin() -> Result<(), Error> {
-        let server = test::Server::new()?;
-
-        let old_peers = DatabasePeer::list(&server.db().lock())?;
-
-        let res = server
-            .request(
-                test::DEVELOPER1_PEER_IP,
-                "DELETE",
-                &format!("/v1/admin/peers/{}", test::USER1_PEER_ID),
-            )
-            .await;
-
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // The number of peer entries in the database hasn't changed.
-        let new_peers = DatabasePeer::list(&server.db().lock())?;
-        assert_eq!(old_peers.len(), new_peers.len());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_delete_unknown_id() -> Result<(), Error> {
-        let server = test::Server::new()?;
-
-        let res = server
-            .request(
-                test::ADMIN_PEER_IP,
-                "DELETE",
-                &format!("/v1/admin/peers/{}", test::USER1_PEER_ID + 100),
-            )
-            .await;
-
-        // Trying to delete a peer of non-existing ID will result in error.
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-
         Ok(())
     }
 }

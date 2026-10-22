@@ -2,7 +2,7 @@ use crate::data_store::DataStore;
 use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response, StatusCode};
 use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo},
-    tls, Cidr, CidrContents, Peer, PeerContents, INNERNET_PUBKEY_HEADER,
+    tls, Cidr, CidrContents, Peer, PeerContents, PeerUpdate, TaggedPeer, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -98,6 +98,69 @@ impl<'a> RestClient<'a> {
 
     pub async fn get_peers(&self) -> Result<Vec<Peer>, RestError> {
         self.http("GET", "/admin/peers").await
+    }
+
+    /// The admin API that the server offers this client. Unless an earlier request has settled
+    /// whether the client speaks TLS or plain HTTP to the server, a request to
+    /// `/user/capabilities` settles it.
+    pub async fn admin_api(&self) -> Result<AdminApi, RestError> {
+        if !self.speaks_tls.get() && !self.predates_tls.get() {
+            match self
+                .http::<serde::de::IgnoredAny>("GET", "/user/capabilities")
+                .await
+            {
+                Ok(_) | Err(RestError::Status(_) | RestError::Refused { .. }) => {},
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(if self.predates_tls.get() {
+            AdminApi::Legacy
+        } else {
+            AdminApi::ByKey
+        })
+    }
+
+    /// Reads the peer `listed` and its tag in the API of TLS sessions, as long as the peer is
+    /// still as it was listed, but for its endpoint and candidates, which the peer reports on its
+    /// own. A peer that has changed since it was listed is refused as
+    /// [`RestError::PeerChanged`]. A peer that the server does not find by its key, since it has
+    /// been deleted or its key has changed, as a redeemed invitation's does, is refused as
+    /// [`RestError::NoSuchPeer`].
+    pub async fn get_tagged_peer(&self, listed: &Peer) -> Result<TaggedPeer, RestError> {
+        let path = format!("/admin/peers/{}", listed.api_path_segment());
+        let tagged: TaggedPeer = self
+            .http("GET", &path)
+            .await
+            .map_err(RestError::peer_refusal)?;
+        if !same_but_endpoints(&tagged.peer, listed) {
+            return Err(RestError::PeerChanged);
+        }
+        Ok(tagged)
+    }
+
+    /// Applies an admin's changes to the peer `listed`, as it was listed: its name, its admin
+    /// role and whether it is disabled are set to those of `contents`. In the API of TLS
+    /// sessions, a peer that has changed since it was listed is refused as
+    /// [`RestError::PeerChanged`], and a peer that the server does not find by its key as
+    /// [`RestError::NoSuchPeer`]. A server in plain HTTP names the peer by the ID of the listing.
+    pub async fn update_peer(
+        &self,
+        listed: &Peer,
+        contents: &PeerContents,
+    ) -> Result<(), RestError> {
+        match self.admin_api().await? {
+            AdminApi::ByKey => {
+                let TaggedPeer { tag, .. } = self.get_tagged_peer(listed).await?;
+                let path = format!("/admin/peers/{}", listed.api_path_segment());
+                self.http_form("PUT", &path, PeerUpdate::new(tag, contents))
+                    .await
+                    .map_err(RestError::peer_refusal)
+            },
+            AdminApi::Legacy => {
+                self.http_form("PUT", &format!("/admin/peers/{}", listed.id), contents)
+                    .await
+            },
+        }
     }
 
     /// Perform a `verb` HTTP request at the given `endpoint`.
@@ -249,6 +312,27 @@ impl<'a> RestClient<'a> {
     }
 }
 
+/// Whether the peers `a` and `b` are the same, but for their endpoints and candidates, which the
+/// peer reports on its own, and for their IDs, which a server numbers anew in each response.
+fn same_but_endpoints(a: &Peer, b: &Peer) -> bool {
+    let without_endpoints = |peer: &Peer| PeerContents {
+        endpoint: None,
+        candidates: vec![],
+        ..peer.contents.clone()
+    };
+    without_endpoints(a) == without_endpoints(b)
+}
+
+/// The admin API that a server offers a client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminApi {
+    /// The API of TLS sessions, which addresses peers by public key only.
+    ByKey,
+    /// The API of plain-HTTP sessions with a server that predates TLS, which addresses peers by
+    /// ID.
+    Legacy,
+}
+
 /// Runs `exchange` for at most [`TIMEOUT`].
 async fn timed<T>(
     exchange: impl std::future::Future<Output = Result<T, RestError>>,
@@ -318,6 +402,17 @@ pub enum RestError {
     ServerDowngraded,
     #[error("Error reading the data store: {0:#}")]
     DataStore(anyhow::Error),
+    #[error(
+        "The peer has changed since it was listed, so the change was not made. Running the \
+         command again lists the peers anew."
+    )]
+    PeerChanged,
+    #[error(
+        "No peer has this public key (the invitation may have been redeemed under a new key, or \
+         have expired), so the change was not made. Running the command again lists the peers \
+         anew."
+    )]
+    NoSuchPeer,
     /// The request failed to reach the server, or the server failed to answer it.
     #[error("Error sending request: {0}")]
     RequestSend(Box<dyn std::error::Error + Send + Sync>),
@@ -347,6 +442,19 @@ impl RestError {
         }
     }
 
+    /// Turns the statuses with which the server refuses a request about a peer named by its key
+    /// into errors that say why: [`Self::PeerChanged`] for a peer that has changed since it was
+    /// read, and [`Self::NoSuchPeer`] for a key that no peer has.
+    fn peer_refusal(self) -> Self {
+        if self.has_status_of(409) {
+            RestError::PeerChanged
+        } else if self.has_status_of(404) {
+            RestError::NoSuchPeer
+        } else {
+            self
+        }
+    }
+
     /// Whether the request failed to reach the server, as when the server is down or
     /// unreachable. A failed TLS handshake, such as one in which the server presents another key
     /// than the pinned one, is not: something answered at the server's address.
@@ -363,7 +471,7 @@ mod tests {
         net::{SocketAddr, TcpListener},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            mpsc, Arc,
         },
         thread,
     };
@@ -393,22 +501,46 @@ mod tests {
     /// Answers each connection in plain HTTP, like a server that predates TLS, and returns the
     /// number of connections that opened with a TLS handshake.
     fn plain_http_server(connections: usize) -> (SocketAddr, thread::JoinHandle<usize>) {
+        let (addr, server) = plain_http_server_recording(
+            connections,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let handle = thread::spawn(move || {
+            let requests = server.join().unwrap();
+            requests.iter().filter(|r| *r == TLS_HANDSHAKE).count()
+        });
+        (addr, handle)
+    }
+
+    /// What [`plain_http_server_recording`] records of a connection that opens with a TLS
+    /// handshake.
+    const TLS_HANDSHAKE: &str = "TLS handshake";
+
+    /// Answers each connection in plain HTTP with `response`, like a server that predates TLS,
+    /// and returns the request line of each request, or [`TLS_HANDSHAKE`].
+    fn plain_http_server_recording(
+        connections: usize,
+        response: &'static str,
+    ) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            let mut handshakes = 0;
+            let mut requests = vec![];
             for stream in listener.incoming().take(connections) {
                 let mut stream = stream.unwrap();
                 let mut buffer = [0u8; 4096];
                 let read = stream.read(&mut buffer).unwrap();
-                if buffer[..read].first() == Some(&tls::TLS_HANDSHAKE_RECORD) {
-                    handshakes += 1;
-                }
-                let response =
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                requests.push(
+                    if buffer[..read].first() == Some(&tls::TLS_HANDSHAKE_RECORD) {
+                        TLS_HANDSHAKE.to_string()
+                    } else {
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+                        request.lines().next().unwrap_or_default().to_string()
+                    },
+                );
                 stream.write_all(response.as_bytes()).unwrap();
             }
-            handshakes
+            requests
         });
         (addr, handle)
     }
@@ -425,25 +557,214 @@ mod tests {
 
     /// Answers each connection over TLS, authenticated with `server`'s key, with `response`.
     fn tls_server_answering(server: &KeyPair, connections: usize, response: String) -> SocketAddr {
+        tls_server_recording(server, vec![response; connections]).0
+    }
+
+    /// Answers each connection over TLS, authenticated with `server`'s key, with the next of
+    /// `responses`, and sends each request, its head and its body, to the receiver.
+    fn tls_server_recording(
+        server: &KeyPair,
+        responses: Vec<String>,
+    ) -> (SocketAddr, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = tls::server_config(&server.private.to_base64()).unwrap();
+        let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            for stream in listener.incoming().take(connections) {
+            for (response, stream) in responses.into_iter().zip(listener.incoming()) {
                 let connection = rustls::ServerConnection::new(config.clone()).unwrap();
                 let mut stream = rustls::StreamOwned::new(connection, stream.unwrap());
                 let mut reader = BufReader::new(&mut stream);
-                let mut line = String::new();
+                let mut request = String::new();
                 // A client that refuses the handshake ends the connection.
-                while matches!(reader.read_line(&mut line), Ok(read) if read > 0)
-                    && !line.ends_with("\r\n\r\n")
+                while matches!(reader.read_line(&mut request), Ok(read) if read > 0)
+                    && !request.ends_with("\r\n\r\n")
                 {}
+                let content_length = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; content_length];
+                if reader.read_exact(&mut body).is_ok() {
+                    request.push_str(&String::from_utf8_lossy(&body));
+                }
+                let _ = sender.send(request);
                 let _ = stream.write_all(response.as_bytes());
                 stream.conn.send_close_notify();
                 let _ = stream.flush();
             }
         });
-        addr
+        (addr, receiver)
+    }
+
+    /// A response with the status `status` and the JSON body `body`.
+    fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+
+    /// A peer whose key, in standard base64, holds both '+' and '/'.
+    fn listed_peer() -> Peer {
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_mut(3) {
+            chunk.copy_from_slice(&[0xfb, 0xff, 0xbf][..chunk.len()]);
+        }
+        Peer {
+            id: 7,
+            contents: PeerContents {
+                name: "peer".parse().unwrap(),
+                ip: "10.0.0.7".parse().unwrap(),
+                cidr_id: 1,
+                public_key: wireguard_control::Key(bytes).to_base64(),
+                endpoint: None,
+                persistent_keepalive_interval: None,
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+            },
+        }
+    }
+
+    /// The server's answer to a read of `peer` with the tag `tag`.
+    fn tagged_response(peer: &Peer, tag: &str) -> String {
+        let tagged = TaggedPeer {
+            peer: peer.clone(),
+            tag: tag.into(),
+        };
+        json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_updates_peers_by_key_over_tls() {
+        let server_key = KeyPair::generate();
+        let peer = listed_peer();
+        // The server reports the endpoint that it observes, which the tag leaves out, and numbers
+        // the peers anew in each response.
+        let observed = Peer {
+            id: 8,
+            contents: PeerContents {
+                endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+                ..peer.contents.clone()
+            },
+        };
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                json_response("200 OK", "{}"),
+                tagged_response(&observed, "ab"),
+                NO_CONTENT.into(),
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+
+        // Unless a request has settled it, the client asks the server which API it offers.
+        assert_eq!(client.admin_api().await.unwrap(), AdminApi::ByKey);
+        let renamed = PeerContents {
+            name: "renamed".parse().unwrap(),
+            ..peer.contents.clone()
+        };
+        client.update_peer(&peer, &renamed).await.unwrap();
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /v1/user/capabilities "));
+
+        // The client reads the peer by key, and changes it with the tag it read.
+        let segment = peer.api_path_segment();
+        assert!(!segment.contains(['+', '/']));
+        let get = requests.recv().unwrap();
+        assert!(
+            get.starts_with(&format!("GET /v1/admin/peers/{segment} ")),
+            "{get}"
+        );
+        let put = requests.recv().unwrap();
+        assert!(
+            put.starts_with(&format!("PUT /v1/admin/peers/{segment} ")),
+            "{put}"
+        );
+        let body: PeerUpdate = serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, PeerUpdate::new("ab".into(), &renamed));
+    }
+
+    #[tokio::test]
+    async fn test_refuses_peers_changed_since_listed() {
+        let server_key = KeyPair::generate();
+        let peer = listed_peer();
+        let promoted = Peer {
+            contents: PeerContents {
+                is_admin: true,
+                ..peer.contents.clone()
+            },
+            ..peer.clone()
+        };
+        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".to_string();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                // The peer changed between the listing and the read.
+                tagged_response(&promoted, "ab"),
+                // The peer changed between the read and the change.
+                tagged_response(&peer, "ab"),
+                conflict,
+                // No peer has the key any more, as when an invitation is redeemed under a new
+                // key, before the read.
+                not_found.clone(),
+                // No peer has the key any more, between the read and the change.
+                tagged_response(&peer, "ab"),
+                not_found,
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        for _ in 0..2 {
+            let error = client.update_peer(&peer, &peer.contents).await.unwrap_err();
+            assert!(matches!(error, RestError::PeerChanged), "{error:?}");
+        }
+        for _ in 0..2 {
+            let error = client.update_peer(&peer, &peer.contents).await.unwrap_err();
+            assert!(matches!(error, RestError::NoSuchPeer), "{error:?}");
+        }
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request.split(' ').next().unwrap().to_string())
+            .collect();
+        assert_eq!(methods, ["GET", "GET", "PUT", "GET", "GET", "PUT"]);
+    }
+
+    #[tokio::test]
+    async fn test_updates_peers_by_id_in_plain_http() {
+        let server_key = KeyPair::generate();
+        let (addr, server) = plain_http_server_recording(
+            3,
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+
+        assert_eq!(client.admin_api().await.unwrap(), AdminApi::Legacy);
+        let peer = listed_peer();
+        client.update_peer(&peer, &peer.contents).await.unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                TLS_HANDSHAKE,
+                "GET /v1/user/capabilities HTTP/1.1",
+                "PUT /v1/admin/peers/7 HTTP/1.1",
+            ]
+        );
     }
 
     #[tokio::test]

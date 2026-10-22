@@ -29,6 +29,12 @@ pub enum ServerError {
     )]
     PromotionRequiresTls,
 
+    #[error(
+        "the peer has changed since it was read, so the change was not made; the admin client \
+         must read the peer again before it changes the peer"
+    )]
+    PeerChanged,
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -56,6 +62,7 @@ impl From<&ServerError> for StatusCode {
             PromotionRequiresTls => StatusCode::UNPROCESSABLE_ENTITY,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
+            PeerChanged => StatusCode::CONFLICT,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
             // Special-case the constraint violation situation.
             Database(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..))
@@ -75,10 +82,11 @@ impl TryFrom<ServerError> for Response<Body> {
     type Error = http::Error;
 
     fn try_from(e: ServerError) -> Result<Self, Self::Error> {
-        // The server explains the errors that a client that predates TLS can't make sense of on
-        // its own.
+        // The server explains the refusals that a client can't make sense of on its own.
         let body = match e {
-            ServerError::TlsRequired | ServerError::PromotionRequiresTls => e.to_string().into(),
+            ServerError::TlsRequired
+            | ServerError::PromotionRequiresTls
+            | ServerError::PeerChanged => e.to_string().into(),
             _ => Body::empty(),
         };
         Response::builder().status(StatusCode::from(&e)).body(body)
