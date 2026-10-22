@@ -51,16 +51,14 @@ impl DatabaseAssociation {
                 .and_then(|cidr| Prefix::new(cidr.cidr).ok())
                 .ok_or(ServerError::InvalidQuery)
         };
-        let (prefix_1, prefix_2) = (prefix_of(cidr_id_1)?, prefix_of(cidr_id_2)?);
-
-        let existing = Self::list(conn)?.into_iter().any(|association| {
-            let pair = (association.cidr_id_1, association.cidr_id_2);
-            pair == (*cidr_id_1, *cidr_id_2) || pair == (*cidr_id_2, *cidr_id_1)
-        });
-        if existing {
+        let (a, b) = (prefix_of(cidr_id_1)?, prefix_of(cidr_id_2)?);
+        let (prefix_1, prefix_2) = (a.min(b), a.max(b));
+        if prefix_1 == prefix_2 {
+            log::warn!("tried to associate the CIDR {prefix_1} with itself.");
             return Err(ServerError::InvalidQuery);
         }
 
+        // An existing association of the two refuses the new one.
         conn.execute(
             "INSERT INTO associations (address_1, prefix_len_1, address_2, prefix_len_2)
              VALUES (?1, ?2, ?3, ?4)",
@@ -74,8 +72,8 @@ impl DatabaseAssociation {
         let id = Self::list(conn)?
             .iter()
             .find(|association| {
-                association.cidr_id_1 == contents.cidr_id_1
-                    && association.cidr_id_2 == contents.cidr_id_2
+                let pair = (association.cidr_id_1, association.cidr_id_2);
+                pair == (*cidr_id_1, *cidr_id_2) || pair == (*cidr_id_2, *cidr_id_1)
             })
             .map(|association| association.id)
             .ok_or(ServerError::NotFound)?;
@@ -102,10 +100,12 @@ impl DatabaseAssociation {
         Ok(())
     }
 
-    /// The associations, each as its pair of prefixes, in the order of the table.
+    /// The associations, each as its pair of prefixes, ordered by its CIDRs.
     fn stored(conn: &Connection) -> Result<Vec<(Prefix, Prefix)>, ServerError> {
         let mut stmt = conn.prepare_cached(
-            "SELECT address_1, prefix_len_1, address_2, prefix_len_2 FROM associations",
+            "SELECT address_1, prefix_len_1, address_2, prefix_len_2 FROM associations
+             ORDER BY length(address_1), address_1, prefix_len_1,
+                      length(address_2), address_2, prefix_len_2",
         )?;
         let mut rows = stmt.query([])?;
         let mut stored = vec![];
@@ -118,7 +118,7 @@ impl DatabaseAssociation {
         Ok(stored)
     }
 
-    /// The associations, numbered from 1 in the order of the table, as the API of plain HTTP
+    /// The associations, numbered from 1 in the order of their CIDRs, as the API of plain HTTP
     /// names them, each with the CIDRs that it joins by their IDs.
     pub fn list(conn: &Connection) -> Result<Vec<Association>, ServerError> {
         let cidrs = DatabaseCidr::list(conn)?;

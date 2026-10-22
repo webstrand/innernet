@@ -7,7 +7,9 @@ use innernet_node::{
     store::{self, key_to_bytes, StoredCidr},
     Store,
 };
-use innernet_shared::{Endpoint, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use innernet_shared::{
+    parent_cidr, smallest_cidr_holding, Endpoint, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+};
 use ipnet::IpNet;
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::{
@@ -67,12 +69,21 @@ fn is_origin(conn: &Connection) -> Result<bool, Error> {
 ///
 /// Earlier versions can't read the rebuilt database, so it is first copied, as it is, to
 /// `<path>.v2.0.0`, or `.v2.0.0.N` with the first free `N`, so that an earlier copy is kept. If
-/// the copy fails, nothing is migrated. A record that the new tables can't hold, such as a public
-/// key that isn't base64 or a peer whose CIDR isn't the smallest that holds its IP, rolls the
-/// transaction back; an endpoint or candidates that the server couldn't read are dropped with a
-/// warning, as the server ignored them. Each peer is delegated its IP, as a host prefix. The IDs
+/// the copy fails, nothing is migrated. Each peer is delegated its IP, as a host prefix. The IDs
 /// of the peers, the CIDRs and the associations aren't kept: the API of plain HTTP numbers them by
 /// position. The invitations not yet redeemed are latched to TLS.
+///
+/// The parent of a CIDR and the CIDR of a peer aren't stored, but follow from prefixes: the parent
+/// of a CIDR is the smallest other CIDR that holds it, and the CIDR of a peer is that of its
+/// delegation. The rebuild keeps what each peer sees, so these roll the transaction back:
+/// - a CIDR whose stored parent isn't the one that the prefixes give;
+/// - a peer whose stored CIDR isn't the smallest that holds its IP;
+/// - the server's own peer outside the CIDR with the ID 2, which every peer sees;
+/// - a record that the new tables can't hold, such as a public key that isn't base64.
+///
+/// A CIDR whose address has host bits set becomes the prefix of its network. An association of a
+/// CIDR with itself and a second association of the same two CIDRs change nothing, and are dropped
+/// with a warning, as are an endpoint or candidates that the server couldn't read.
 fn rebuild(
     conn: &mut Connection,
     path: &Path,
@@ -106,9 +117,10 @@ fn rebuild(
     tx.execute_batch(innernet_node::SCHEMA)?;
     tx.execute_batch(ANNEX_SQL)?;
 
-    let mut cidrs = vec![];
+    let mut cidrs: Vec<(i64, Prefix, Option<i64>)> = vec![];
     {
-        let mut stmt = tx.prepare("SELECT id, name, ip, prefix FROM origin_cidrs ORDER BY id")?;
+        let mut stmt =
+            tx.prepare("SELECT id, name, ip, prefix, parent FROM origin_cidrs ORDER BY id")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
@@ -118,9 +130,11 @@ fn rebuild(
             let ip: IpAddr = ip
                 .parse()
                 .map_err(|_| anyhow!("CIDR {id} has an invalid IP {ip}"))?;
-            let prefix =
-                Prefix::new(IpNet::new(ip, prefix_len)?).map_err(|e| anyhow!("CIDR {id}: {e}"))?;
-            cidrs.push((id, prefix));
+            // A CIDR whose address has host bits set is the prefix of its network, as the server
+            // read it.
+            let prefix = Prefix::new(IpNet::new(ip, prefix_len)?.trunc())
+                .map_err(|e| anyhow!("CIDR {id}: {e}"))?;
+            cidrs.push((id, prefix, row.get(4)?));
             store::insert_cidr(
                 &tx,
                 &StoredCidr {
@@ -131,28 +145,60 @@ fn rebuild(
             )?;
         }
     }
+    let prefix_of = |id: i64| {
+        cidrs
+            .iter()
+            .find(|(cidr_id, ..)| *cidr_id == id)
+            .map(|(_, prefix, _)| *prefix)
+    };
+    let prefixes: Vec<Prefix> = cidrs.iter().map(|(_, prefix, _)| *prefix).collect();
+    for (id, prefix, parent) in &cidrs {
+        let stored = parent
+            .map(|parent| {
+                prefix_of(parent)
+                    .ok_or_else(|| anyhow!("CIDR {id} has the unknown parent {parent}"))
+            })
+            .transpose()?;
+        let given = parent_cidr(prefix, &prefixes);
+        ensure!(
+            stored == given,
+            "CIDR {id} ({prefix}) has the parent {}, but the smallest CIDR that holds it is {}; \
+             the rebuilt database finds a CIDR's parent by its prefix",
+            describe_cidr(stored),
+            describe_cidr(given),
+        );
+    }
     {
-        let prefix_of = |id: i64| {
-            cidrs
-                .iter()
-                .find(|(cidr_id, _)| *cidr_id == id)
-                .map(|(_, prefix)| *prefix)
-                .ok_or_else(|| anyhow!("an association names CIDR {id}, which doesn't exist"))
-        };
-        let mut stmt = tx.prepare("SELECT cidr_id_1, cidr_id_2 FROM origin_associations")?;
+        let mut stmt =
+            tx.prepare("SELECT id, cidr_id_1, cidr_id_2 FROM origin_associations ORDER BY id")?;
         let mut rows = stmt.query([])?;
+        let mut copied: Vec<(Prefix, Prefix)> = vec![];
         while let Some(row) = rows.next()? {
-            let (prefix_1, prefix_2) = (prefix_of(row.get(0)?)?, prefix_of(row.get(1)?)?);
+            let id: i64 = row.get(0)?;
+            let prefix = |cidr_id: i64| {
+                prefix_of(cidr_id).ok_or_else(|| {
+                    anyhow!("association {id} names CIDR {cidr_id}, which doesn't exist")
+                })
+            };
+            let (a, b) = (prefix(row.get(1)?)?, prefix(row.get(2)?)?);
+            let pair = (a.min(b), a.max(b));
+            if a == b || copied.contains(&pair) {
+                log::warn!(
+                    "dropping association {id} of the CIDRs {a} and {b}, which changes nothing."
+                );
+                continue;
+            }
             tx.execute(
                 "INSERT INTO associations (address_1, prefix_len_1, address_2, prefix_len_2)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    store::ip_to_bytes(prefix_1.first()),
-                    prefix_1.prefix_len(),
-                    store::ip_to_bytes(prefix_2.first()),
-                    prefix_2.prefix_len()
+                    store::ip_to_bytes(pair.0.first()),
+                    pair.0.prefix_len(),
+                    store::ip_to_bytes(pair.1.first()),
+                    pair.1.prefix_len()
                 ],
             )?;
+            copied.push(pair);
         }
     }
 
@@ -164,7 +210,7 @@ fn rebuild(
          FROM origin_peers ORDER BY id",
     )?;
     let mut rows = stmt.query([])?;
-    let mut has_server = false;
+    let mut server_cidr = None;
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let public_key: String = row.get(4)?;
@@ -176,17 +222,15 @@ fn rebuild(
             .parse()
             .map_err(|_| anyhow!("peer {id} has an invalid IP {ip}"))?;
         let cidr_id: i64 = row.get(3)?;
-        let smallest = cidrs
-            .iter()
-            .filter(|(_, prefix)| prefix.contains_addr(&ip))
-            .max_by_key(|(_, prefix)| prefix.prefix_len());
-        if smallest.map(|(id, _)| *id) != Some(cidr_id) {
-            bail!(
-                "peer {id} at {ip} belongs to CIDR {cidr_id}, which isn't the smallest CIDR that \
-                 holds its IP; the rebuilt database finds a peer's CIDR by its IP, so the peer \
-                 would see other peers"
-            );
-        }
+        let stored = prefix_of(cidr_id);
+        let given = smallest_cidr_holding(&Prefix::host(ip), &prefixes);
+        ensure!(
+            stored == given,
+            "peer {id} at {ip} lies in the CIDR {}, but the smallest CIDR that holds its IP is {}; \
+             the rebuilt database finds a peer's CIDR by its IP, so the peer would see other peers",
+            describe_cidr(stored),
+            describe_cidr(given),
+        );
         let endpoint =
             row.get::<_, Option<String>>(5)?
                 .and_then(|text| match text.parse::<Endpoint>() {
@@ -228,13 +272,19 @@ fn rebuild(
         if let Err(refusal) = scope.accept(&[&contents])?.remove(0) {
             bail!("peer {id} at {ip}: {refusal}");
         }
-        has_server |= public_key == server_key;
+        if public_key == server_key {
+            server_cidr = Some(cidr_id);
+        }
     }
     drop(rows);
     drop(stmt);
+    let server_cidr = server_cidr
+        .ok_or_else(|| anyhow!("no peer has the public key {server_key} of the server's config"))?;
     ensure!(
-        has_server,
-        "no peer has the public key {server_key} of the server's config"
+        server_cidr == ORIGIN_INFRA_CIDR_ID || prefix_of(ORIGIN_INFRA_CIDR_ID).is_none(),
+        "the server's own peer lies in CIDR {server_cidr}, not in CIDR {ORIGIN_INFRA_CIDR_ID}, \
+         which every peer sees; the rebuilt database marks the CIDR that every peer sees as \
+         infra, and every peer is to see the server's own peer"
     );
     // A redeemed peer keeps using plain HTTP until it first connects over TLS. An invitation not
     // yet redeemed is latched, as one that the server issues is, so that only a client that speaks
@@ -249,6 +299,11 @@ fn rebuild(
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+/// A CIDR, or the lack of one, for an error.
+fn describe_cidr(cidr: Option<Prefix>) -> String {
+    cidr.map_or("none".into(), |cidr| cidr.to_string())
 }
 
 /// Copies the database of `conn`, at `path`, to `<path>.v2.0.0`, or `.v2.0.0.N` with the first
@@ -293,7 +348,8 @@ mod tests {
             "INSERT INTO cidrs VALUES (1, 'net', '10.0.0.0', 16, NULL);
              INSERT INTO cidrs VALUES (2, 'innernet-server', '10.0.0.1', 32, 1);
              INSERT INTO cidrs VALUES (3, 'humans', '10.0.1.0', 24, 1);
-             INSERT INTO associations VALUES (1, 3, 2);",
+             INSERT INTO cidrs VALUES (4, 'loose', '10.0.2.5', 24, 1);
+             INSERT INTO associations VALUES (1, 3, 2), (2, 3, 3), (3, 2, 3);",
         )
         .unwrap();
         conn.execute(
@@ -361,18 +417,35 @@ mod tests {
             .collect();
         assert_eq!(latched, [false, false, true]);
 
-        // The infra CIDR is marked, and the association joins the CIDRs that it joined.
-        let infra: Vec<String> = store::load_cidrs(&store)
-            .unwrap()
-            .into_iter()
+        // The infra CIDR is marked, and a CIDR whose address has host bits set is the prefix of
+        // its network.
+        let cidrs = store::load_cidrs(&store).unwrap();
+        let infra: Vec<&str> = cidrs
+            .iter()
             .filter(|cidr| cidr.infra)
-            .map(|cidr| cidr.name)
+            .map(|cidr| cidr.name.as_str())
             .collect();
         assert_eq!(infra, ["innernet-server"]);
-        let associations: i64 = store
-            .query_row("SELECT count(*) FROM associations", [], |r| r.get(0))
+        assert_eq!(cidrs[3].name, "loose");
+        assert_eq!(cidrs[3].prefix, "10.0.2.0/24".parse().unwrap());
+
+        // The association joins the CIDRs that it joined, the lower first, and the association of
+        // a CIDR with itself and the second one of the same CIDRs are dropped.
+        let associations: Vec<String> = store
+            .prepare("SELECT hex(address_1), prefix_len_1, hex(address_2) FROM associations")
+            .unwrap()
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}/{} {}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(associations, 1);
+        assert_eq!(associations, ["0A000001/32 0A000100"]);
 
         // The copy is the database of 2.0.0, and opening again changes nothing.
         let copy = Connection::open(dir.path().join("wg0.db.v2.0.0")).unwrap();
@@ -384,14 +457,35 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_rolls_back() {
-        // A peer whose CIDR isn't the smallest that holds its IP leaves the database as it was.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.db");
-        let server = Key::generate_private().get_public();
-        origin(&path, &server, &[(2, "alice", "10.0.1.2", 1, "[]")]);
-        assert!(open(&path, network(), &server).is_err());
-        let conn = Connection::open(&path).unwrap();
-        assert!(node_db::has_column(&conn, "peers", "id").unwrap());
+    fn test_rebuild_keeps_what_peers_see() {
+        // A database that stores a parent, a CIDR of a peer, or a CIDR that every peer sees,
+        // other than what the prefixes give, is left as it was.
+        for (change, reason) in [
+            (
+                "UPDATE cidrs SET parent = NULL WHERE id = 3",
+                "smallest CIDR that holds it is 10.0.0.0/16",
+            ),
+            (
+                "UPDATE peers SET cidr_id = 1 WHERE id = 7",
+                "smallest CIDR that holds its IP is 10.0.1.0/24",
+            ),
+            (
+                "UPDATE peers SET cidr_id = 3, ip = '10.0.1.1' WHERE id = 1",
+                "which every peer sees",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wg0.db");
+            let server = Key::generate_private().get_public();
+            origin(&path, &server, &[(7, "alice", "10.0.1.2", 3, "[]")]);
+            Connection::open(&path)
+                .unwrap()
+                .execute(change, [])
+                .unwrap();
+            let error = format!("{:#}", open(&path, network(), &server).unwrap_err());
+            assert!(error.contains(reason), "{change}: {error}");
+            let conn = Connection::open(&path).unwrap();
+            assert!(node_db::has_column(&conn, "peers", "id").unwrap());
+        }
     }
 }
