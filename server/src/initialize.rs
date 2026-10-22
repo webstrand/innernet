@@ -10,7 +10,8 @@ use indoc::printdoc;
 use innernet_node::Store;
 use innernet_publicip::Preference;
 use innernet_shared::{
-    prompts, CidrContents, Endpoint, IpNetExt, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    prompts, CidrContents, Endpoint, IpNetExt, PeerContents, Prefix,
+    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
 use std::{
@@ -96,7 +97,7 @@ fn populate_database(store: &Store, db_init_data: DbInitData) -> Result<(), Erro
         store,
         PeerContents {
             name: Some(SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?),
-            ip: db_init_data.our_ip,
+            delegations: vec![Prefix::host(db_init_data.our_ip)],
             cidr_id: server_cidr.id,
             public_key: db_init_data.public_key_base64,
             endpoint: Some(db_init_data.endpoint),

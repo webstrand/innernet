@@ -243,8 +243,8 @@ pub fn name_holder(conn: &Connection, name: &str) -> Result<Option<[u8; 32]>, ru
 }
 
 /// Writes `peer`, keyed by `key`, the bytes of its public key: its record, in place of the stored
-/// one, its address as its only delegation, pinned to its key as [`pin_delegations`] pins it, and
-/// its endpoint and candidates. A peer without a name is stored with a NULL name.
+/// one, its delegations, pinned to its key as [`pin_delegations`] pins them, and its endpoint and
+/// candidates. A peer without a name is stored with a NULL name.
 pub fn write_peer(
     conn: &Connection,
     key: &[u8; 32],
@@ -275,9 +275,8 @@ pub fn write_peer(
             invite_expires,
         ],
     )?;
-    let delegations = [Prefix::host(peer.ip)];
-    pin_delegations(conn, key, &delegations)?;
-    write_delegations(conn, key, &delegations)?;
+    pin_delegations(conn, key, &peer.delegations)?;
+    write_delegations(conn, key, &peer.delegations)?;
     write_endpoints(conn, key, EndpointKind::Endpoint, &peer.endpoint)?;
     write_endpoints(conn, key, EndpointKind::Candidate, &peer.candidates)
 }
@@ -320,10 +319,33 @@ pub fn forget_peer(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Er
     Ok(())
 }
 
-/// The peers that the node records, invitations included, each at the lowest address of its
-/// delegations, ordered by that address. A peer without a delegation is left out. Server IDs
-/// aren't stored, so every peer's CIDR ID is 0: a host that needs IDs assigns them. A stored name
-/// that isn't a valid [`Hostname`] reads as no name.
+/// The delegations of every peer, or only of the peer with the public key `only`, by public key,
+/// each sorted.
+pub fn load_delegations(
+    conn: &Connection,
+    only: Option<&[u8; 32]>,
+) -> Result<HashMap<String, Vec<Prefix>>, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT public_key, address, prefix_len FROM delegations
+         WHERE ?1 IS NULL OR public_key = ?1
+         ORDER BY length(address), address, prefix_len",
+    )?;
+    let mut rows = stmt.query(params![only])?;
+    let mut delegations: HashMap<String, Vec<Prefix>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let delegation = prefix_from_row(row.get(1)?, row.get(2)?)?;
+        delegations
+            .entry(row_key(row, 0)?)
+            .or_default()
+            .push(delegation);
+    }
+    Ok(delegations)
+}
+
+/// The peers that the node records, invitations included, each with its delegations, ordered by
+/// their hosts fallback addresses, those without one last, then by public key. Server IDs aren't
+/// stored, so every peer's CIDR ID is 0: a host that needs IDs assigns them. A stored name that
+/// isn't a valid [`Hostname`] reads as no name.
 pub fn load_peers(conn: &Connection) -> Result<Vec<PeerContents>, rusqlite::Error> {
     load_peers_where(conn, None)
 }
@@ -340,16 +362,13 @@ fn load_peers_where(
     conn: &Connection,
     only: Option<&[u8; 32]>,
 ) -> Result<Vec<PeerContents>, rusqlite::Error> {
+    let mut delegations = load_delegations(conn, only)?;
     let mut endpoints = load_endpoints(conn, only)?;
     let mut peers = vec![];
     let mut stmt = conn.prepare_cached(
-        "SELECT p.public_key, p.name, p.is_admin, p.is_disabled, p.is_redeemed,
-                p.persistent_keepalive_interval, p.invite_expires, min(d.address)
-         FROM peers p
-         JOIN delegations d ON d.public_key = p.public_key
-         WHERE ?1 IS NULL OR p.public_key = ?1
-         GROUP BY p.public_key
-         ORDER BY length(min(d.address)), min(d.address)",
+        "SELECT public_key, name, is_admin, is_disabled, is_redeemed,
+                persistent_keepalive_interval, invite_expires
+         FROM peers WHERE ?1 IS NULL OR public_key = ?1",
     )?;
     let mut rows = stmt.query(params![only])?;
     while let Some(row) = rows.next()? {
@@ -357,15 +376,12 @@ fn load_peers_where(
         let invite_expires = row
             .get::<_, Option<u64>>(6)?
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-        let name = row
-            .get::<_, Option<String>>(1)?
-            .and_then(|name| Hostname::try_from(name).ok());
-        let ip = row_ip(row, 7)?
-            .ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "address".into(), Type::Null))?;
         let endpoints = endpoints.remove(&public_key).unwrap_or_default();
         peers.push(PeerContents {
-            name,
-            ip,
+            name: row
+                .get::<_, Option<String>>(1)?
+                .and_then(|name| Hostname::try_from(name).ok()),
+            delegations: delegations.remove(&public_key).unwrap_or_default(),
             cidr_id: 0,
             public_key,
             endpoint: endpoints.endpoint,
@@ -377,6 +393,15 @@ fn load_peers_where(
             candidates: endpoints.candidates,
         });
     }
+    peers.sort_by(|a, b| {
+        let order = |peer: &PeerContents| {
+            let fallback = peer.hosts_fallback();
+            (fallback.is_none(), fallback)
+        };
+        order(a)
+            .cmp(&order(b))
+            .then_with(|| a.public_key.cmp(&b.public_key))
+    });
     Ok(peers)
 }
 

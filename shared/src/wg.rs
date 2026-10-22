@@ -184,8 +184,8 @@ pub fn add_route(interface: &InterfaceName, cidr: IpNet) -> Result<bool, io::Err
 pub use super::netlink::add_route;
 
 pub trait DeviceExt {
-    /// Diff the output of a wgctrl device with a list of peers, of which the disabled peers are
-    /// removed from the device. The endpoint of a peer whose canonical base64 public key is in
+    /// Diff the output of a wgctrl device with a list of peers, of which the disabled peers and
+    /// those without a delegation are removed from the device. The endpoint of a peer whose canonical base64 public key is in
     /// `endpoint_overrides` is replaced with its override.
     fn diff<'a>(
         &'a self,
@@ -212,7 +212,7 @@ impl DeviceExt for Device {
 
         // Match existing peers (by pubkey) to new peer information from the server.
         let modifications = peers.iter().filter_map(|peer| {
-            if peer.is_disabled || peer.public_key == interface_public_key {
+            if !peer.is_routed() || peer.public_key == interface_public_key {
                 None
             } else {
                 let existing_peer = existing_peers
@@ -228,7 +228,7 @@ impl DeviceExt for Device {
             let public_key = existing.config.public_key.to_base64();
             if peers
                 .iter()
-                .any(|p| !p.is_disabled && p.public_key == public_key)
+                .any(|p| p.is_routed() && p.public_key == public_key)
             {
                 None
             } else {
@@ -274,7 +274,7 @@ mod tests {
     fn peer(ip: IpAddr) -> PeerContents {
         PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip,
+            delegations: vec![crate::Prefix::host(ip)],
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
@@ -324,6 +324,20 @@ mod tests {
         let diffs = device.diff(&peers, &BTreeMap::new());
         assert_eq!(diffs.len(), 1);
         assert!(diffs[0].new.is_none());
+
+        // So is a peer without a delegation, which is in effect disabled, and a new one is never
+        // added.
+        let mut without = peer(ip);
+        without.delegations = vec![];
+        let peers = [without];
+        let diffs = device.diff(&peers, &BTreeMap::new());
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].new.is_none());
+        let empty = Device {
+            peers: vec![],
+            ..device_with_peer(ip)
+        };
+        assert!(empty.diff(&peers, &BTreeMap::new()).is_empty());
     }
 
     #[test]

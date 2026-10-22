@@ -1,4 +1,4 @@
-use crate::{wg::PeerInfoExt, Prefix};
+use crate::{hosts_fallback, wg::PeerInfoExt, Prefix};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -629,7 +629,12 @@ pub struct PeerContents {
     /// such a name on its own API.
     #[serde(default, deserialize_with = "deserialize_peer_name")]
     pub name: Option<Hostname>,
-    pub ip: IpAddr,
+    /// The delegations of the peer: the prefixes of its CIDR whose addresses are the peer's,
+    /// sorted, no two of which share an address. A lone address is a `/32` or `/128`. A list that
+    /// isn't sorted is sorted when it is deserialized, and one with two delegations that share an
+    /// address fails to deserialize. A peer may have no delegation at all.
+    #[serde(deserialize_with = "deserialize_delegations")]
+    pub delegations: Vec<Prefix>,
     pub cidr_id: i64,
     #[serde(deserialize_with = "deserialize_public_key")]
     pub public_key: String,
@@ -655,9 +660,10 @@ impl PeerContents {
         self.name.as_deref().unwrap_or("[unnamed]")
     }
 
-    /// The address at which the name of the peer resolves, or `None` if the peer has none.
+    /// The address at which the name of the peer resolves: the lowest address of its delegations,
+    /// or `None` if the peer has none.
     pub fn hosts_fallback(&self) -> Option<IpAddr> {
-        Some(self.ip)
+        hosts_fallback(&self.delegations)
     }
 
     /// The address of the peer for display: its hosts fallback address, or "[no delegation]" if
@@ -669,15 +675,55 @@ impl PeerContents {
         }
     }
 
-    /// The prefixes that WireGuard routes to the peer.
-    pub fn allowed_ips(&self) -> Vec<AllowedIp> {
-        vec![Prefix::host(self.ip).allowed_ip()]
+    /// The delegations of the peer for display, separated by commas, or "[no delegation]" if it
+    /// has none.
+    pub fn display_delegations(&self) -> String {
+        if self.delegations.is_empty() {
+            return "[no delegation]".to_string();
+        }
+        self.delegations
+            .iter()
+            .map(Prefix::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
-    /// Whether the address `ip` is the peer's.
-    pub fn holds(&self, ip: IpAddr) -> bool {
-        self.ip == ip
+    /// The prefixes that WireGuard routes to the peer: its delegations.
+    pub fn allowed_ips(&self) -> Vec<AllowedIp> {
+        self.delegations.iter().map(Prefix::allowed_ip).collect()
     }
+
+    /// Whether the peer belongs on a WireGuard interface: whether it is enabled and holds at least
+    /// one delegation. A peer without a delegation is in effect disabled, so that withdrawing
+    /// every delegation of a peer cuts the tunnels to it.
+    pub fn is_routed(&self) -> bool {
+        !self.is_disabled && !self.delegations.is_empty()
+    }
+
+    /// Whether the address `ip` lies within one of the peer's delegations.
+    pub fn holds(&self, ip: IpAddr) -> bool {
+        self.delegations
+            .iter()
+            .any(|delegation| delegation.contains_addr(&ip))
+    }
+}
+
+/// Deserializes the delegations of a peer, sorting them, and refusing two that share an address.
+fn deserialize_delegations<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Prefix>, D::Error> {
+    let mut delegations = Vec::<Prefix>::deserialize(deserializer)?;
+    delegations.sort();
+    if let Some(pair) = delegations
+        .windows(2)
+        .find(|pair| pair[0].overlaps(&pair[1]))
+    {
+        return Err(de::Error::custom(format!(
+            "the delegations {} and {} overlap",
+            pair[0], pair[1]
+        )));
+    }
+    Ok(delegations)
 }
 
 impl AsRef<PeerContents> for PeerContents {
@@ -826,13 +872,14 @@ pub struct LegacyPeerContents {
 }
 
 impl LegacyPeerContents {
-    /// `peer` as clients that predate TLS know it, or `None` if they can't represent it: a peer
-    /// without a name.
+    /// `peer` as clients that predate TLS know it, with its hosts fallback address as its IP, or
+    /// `None` if they can't represent it: a peer without a name or without a hosts fallback
+    /// address. The other addresses of its delegations are left out.
     pub fn from_peer(peer: &PeerContents) -> Option<Self> {
         peer.name.as_ref()?;
         Some(Self {
             name: peer.name.clone(),
-            ip: peer.ip,
+            ip: peer.hosts_fallback()?,
             cidr_id: peer.cidr_id,
             public_key: peer.public_key.clone(),
             endpoint: peer.endpoint.clone(),
@@ -847,10 +894,11 @@ impl LegacyPeerContents {
 }
 
 impl From<LegacyPeerContents> for PeerContents {
+    /// The peer, with its IP as its only delegation, a host prefix.
     fn from(peer: LegacyPeerContents) -> Self {
         Self {
             name: peer.name,
-            ip: peer.ip,
+            delegations: vec![Prefix::host(peer.ip)],
             cidr_id: peer.cidr_id,
             public_key: peer.public_key,
             endpoint: peer.endpoint,
@@ -1000,8 +1048,9 @@ impl<'a> PeerDiff<'a> {
         let mut builder = PeerConfigBuilder::new(&public_key);
         let mut changes = vec![];
 
-        // Remove peer from interface if they're deleted or disabled, and we can return early.
-        if new.is_none() || matches!(new, Some(new) if new.is_disabled) {
+        // Remove peer from interface if they're deleted, disabled or without a delegation, and we
+        // can return early.
+        if new.is_none() || matches!(new, Some(new) if !new.is_routed()) {
             return Some((builder.remove(), changes));
         }
         // diff.new is now guaranteed to be a Some(_) variant.
@@ -1355,7 +1404,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip,
+            delegations: vec![Prefix::host(ip)],
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
@@ -1387,7 +1436,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip,
+            delegations: vec![Prefix::host(ip)],
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: None,
@@ -1419,7 +1468,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip,
+            delegations: vec![Prefix::host(ip)],
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: Some("1.1.1.1:1111".parse().unwrap()),
@@ -1461,7 +1510,7 @@ mod tests {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let peer = PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip: "10.0.0.1".parse().unwrap(),
+            delegations: vec!["10.0.0.1/32".parse().unwrap()],
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
             endpoint: Some("1.1.1.1:1111".parse().unwrap()),
@@ -1523,7 +1572,7 @@ mod tests {
         let peer = |name: serde_json::Value| {
             serde_json::from_value::<PeerContents>(serde_json::json!({
                 "name": name,
-                "ip": "10.0.0.1",
+                "delegations": ["10.0.0.1/32"],
                 "cidr_id": 1,
                 "public_key": PUBKEY,
                 "endpoint": null,
@@ -1577,9 +1626,8 @@ mod tests {
         // server that allows other names reports it.
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let peer = serde_json::json!({
-            "id": 1,
             "name": "peer\n10.0.0.1 example.com",
-            "ip": "10.0.0.1",
+            "delegations": ["10.0.0.1/32"],
             "cidr_id": 1,
             "public_key": PUBKEY,
             "endpoint": null,
@@ -1595,6 +1643,124 @@ mod tests {
         assert_eq!(state.peers[0].name, None);
         assert_eq!(state.peers[0].public_key, PUBKEY);
         assert!(state.invalid_peer_keys.is_empty());
+    }
+
+    /// A peer with the delegations `delegations`.
+    fn peer_with(delegations: &[&str]) -> PeerContents {
+        PeerContents {
+            name: Some("peer1".parse().unwrap()),
+            delegations: delegations.iter().map(|d| d.parse().unwrap()).collect(),
+            cidr_id: 1,
+            public_key: "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=".to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
+        }
+    }
+
+    fn info_with_allowed_ips(peer: &PeerContents, allowed_ips: &[&str]) -> PeerInfo {
+        let allowed_ips: Vec<AllowedIp> =
+            allowed_ips.iter().map(|ip| ip.parse().unwrap()).collect();
+        let builder = PeerConfigBuilder::new(&Key::from_base64(&peer.public_key).unwrap())
+            .add_allowed_ips(&allowed_ips);
+        PeerInfo {
+            config: builder.into_peer_config(),
+            stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_delegations() {
+        let peer = peer_with(&["10.0.0.32/28", "10.0.0.7/32"]);
+        assert_eq!(peer.hosts_fallback(), Some("10.0.0.7".parse().unwrap()));
+        assert!(peer.holds("10.0.0.47".parse().unwrap()));
+        assert!(!peer.holds("10.0.0.48".parse().unwrap()));
+        assert_eq!(peer.display_delegations(), "10.0.0.32/28, 10.0.0.7/32");
+
+        // Delegations are sorted when they are deserialized, and two that overlap are refused.
+        let deserialize = |delegations: &[&str]| {
+            let mut value = serde_json::to_value(&peer).unwrap();
+            value["delegations"] = serde_json::json!(delegations);
+            serde_json::from_value::<PeerContents>(value)
+        };
+        assert_eq!(
+            deserialize(&["10.0.0.32/28", "10.0.0.7/32"])
+                .unwrap()
+                .delegations,
+            [
+                "10.0.0.7/32".parse::<Prefix>().unwrap(),
+                "10.0.0.32/28".parse().unwrap()
+            ]
+        );
+        assert!(deserialize(&["10.0.0.32/28", "10.0.0.40/32"]).is_err());
+        assert!(deserialize(&["10.0.0.33/28"]).is_err());
+
+        // A peer without a delegation has no address, and clients that predate TLS can't
+        // represent it.
+        let without = deserialize(&[]).unwrap();
+        assert_eq!(without.hosts_fallback(), None);
+        assert_eq!(without.display_address(), "[no delegation]");
+        assert!(without.allowed_ips().is_empty());
+        assert!(LegacyPeerContents::from_peer(&without).is_none());
+        let legacy = LegacyPeerContents::from_peer(&peer).unwrap();
+        assert_eq!(legacy.ip.to_string(), "10.0.0.7");
+        assert_eq!(
+            PeerContents::from(legacy).delegations,
+            ["10.0.0.7/32".parse::<Prefix>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_state_drops_peers_with_overlapping_delegations() {
+        // A peer whose delegations overlap is dropped from a state, and its key is kept.
+        let mut peer = serde_json::to_value(peer_with(&["10.0.0.32/28"])).unwrap();
+        peer["delegations"] = serde_json::json!(["10.0.0.32/28", "10.0.0.32/27"]);
+        let state: State =
+            serde_json::from_value(serde_json::json!({ "peers": [peer], "cidrs": [] })).unwrap();
+        assert!(state.peers.is_empty());
+        assert_eq!(state.invalid_peer_keys, [peer_with(&[]).public_key]);
+    }
+
+    #[test]
+    fn test_allowed_ips_are_the_delegations() {
+        let peer = peer_with(&["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"]);
+        let config = PeerConfigBuilder::from(&peer).into_peer_config();
+        assert_eq!(config.allowed_ips, peer.allowed_ips());
+        assert_eq!(
+            peer.allowed_ips(),
+            ["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"]
+                .map(|ip| ip.parse::<AllowedIp>().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_peer_diff_delegations() {
+        let peer = peer_with(&["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32"]);
+
+        // The same allowed IPs, listed in another order, are no change.
+        let info = info_with_allowed_ips(&peer, &["10.0.0.7/32", "10.0.0.1/32", "10.0.0.32/28"]);
+        assert_eq!(PeerDiff::new(Some(&info), Some(&peer), None).unwrap(), None);
+
+        // A delegation added or withdrawn replaces the allowed IPs.
+        for allowed_ips in [
+            &["10.0.0.1/32", "10.0.0.32/28"][..],
+            &["10.0.0.1/32", "10.0.0.32/28", "10.0.0.7/32", "10.0.0.64/28"],
+        ] {
+            let info = info_with_allowed_ips(&peer, allowed_ips);
+            let diff = PeerDiff::new(Some(&info), Some(&peer), None)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                diff.changes(),
+                [PeerChange::AllowedIPs { new, .. }] if *new == peer.allowed_ips()
+            ));
+            let config = PeerConfigBuilder::from(diff).into_peer_config();
+            assert_eq!(config.allowed_ips, peer.allowed_ips());
+        }
     }
 
     #[test]
@@ -1629,7 +1795,10 @@ mod tests {
 
         let state = State::from(state);
         assert_eq!(state.peers[0].public_key, PUBKEY);
-        assert_eq!(state.peers[0].ip.to_string(), "10.0.0.1");
+        assert_eq!(
+            state.peers[0].delegations,
+            ["10.0.0.1/32".parse::<Prefix>().unwrap()]
+        );
         assert_eq!(state.invalid_peer_keys, [INVALID_KEY]);
         assert!(LegacyPeerContents::from_peer(&PeerContents {
             name: None,

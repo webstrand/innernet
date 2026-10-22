@@ -93,9 +93,11 @@ fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
 }
 
 /// The tag of a peer: that of everything an admin reads of the peer, its public key included, but
-/// its endpoint and candidates, which the peer reports on its own.
+/// its endpoint and candidates, which the peer reports on its own, and its delegations, which an
+/// admin changes apart from the rest of the peer.
 fn peer_tag(peer: &PeerContents) -> Result<String, ServerError> {
     let peer = PeerContents {
+        delegations: vec![],
         endpoint: None,
         candidates: vec![],
         ..peer.clone()
@@ -553,6 +555,74 @@ mod tests {
             ..peer.clone()
         };
         assert_ne!(peer_tag(&renamed)?, tag);
+
+        // The delegations, which an admin changes apart from the rest of the peer, leave the
+        // tag unchanged.
+        let delegated = PeerContents {
+            delegations: vec!["10.80.64.16/28".parse()?],
+            ..peer.clone()
+        };
+        assert_eq!(peer_tag(&delegated)?, tag);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_peer_with_delegations() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (wider, ip, host_len) = if cfg!(feature = "v6-test") {
+            ("fd00:1337::2:0:1:0/112", "fd00:1337::2:0:0:9", 128)
+        } else {
+            ("10.80.64.16/28", "10.80.64.9", 32)
+        };
+        let with = |delegations: &[&str]| -> Result<PeerContents, Error> {
+            Ok(PeerContents {
+                delegations: delegations
+                    .iter()
+                    .map(|d| d.parse())
+                    .collect::<Result<_, _>>()?,
+                ..test::developer_peer_contents("developer3", ip)?
+            })
+        };
+
+        // A peer without a delegation, or with one that another peer holds, is refused.
+        let host = format!("{ip}/{host_len}");
+        let taken = format!("{}/{host_len}", test::DEVELOPER2_PEER_IP);
+        for (delegations, reason) in [
+            (vec![], "at least one"),
+            (vec![wider, taken.as_str()], "delegated to peer developer2"),
+        ] {
+            let res = server
+                .form_request(
+                    test::ADMIN_PEER_IP,
+                    "POST",
+                    "/v1/admin/peers",
+                    with(&delegations)?,
+                )
+                .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = hyper::body::to_bytes(res.into_body()).await?;
+            assert!(String::from_utf8_lossy(&body).contains(reason), "{reason}");
+        }
+
+        // A peer is created with every delegation it is offered.
+        let peer = with(&[wider, &host])?;
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let created: PeerContents = serde_json::from_slice(&body)?;
+        let mut sorted = peer.delegations.clone();
+        sorted.sort();
+        assert_eq!(created.delegations, sorted);
+        let key = Key::from_base64(&peer.public_key)?;
+        let stored = DatabasePeer::get_from_public_key(&server.db.lock(), &key)?;
+        assert_eq!(stored.delegations, sorted);
+
+        // Clients that predate TLS see the lowest address of its delegations as its IP.
+        let id = DatabasePeer::plain_http_ids(&server.db.lock())?[&peer.public_key];
+        let legacy = stored.legacy(id).unwrap();
+        assert_eq!(Some(legacy.ip), stored.hosts_fallback());
         Ok(())
     }
 

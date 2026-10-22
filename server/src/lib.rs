@@ -389,7 +389,7 @@ fn check_internal_address(myself: &DatabasePeer, address: IpAddr) -> Result<(), 
         bail!(
             "the server's internal address {address}, from its config, lies outside the \
              delegations of its own peer ({}); the config or the database is inconsistent",
-            myself.display_address()
+            myself.display_delegations()
         );
     }
     Ok(())

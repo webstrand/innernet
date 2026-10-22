@@ -212,7 +212,7 @@ fn rebuild(
                     .parse()
                     .map_err(|_| anyhow!("peer {id} has an invalid name"))?,
             ),
-            ip,
+            delegations: vec![Prefix::host(ip)],
             cidr_id,
             public_key: public_key.clone(),
             endpoint,

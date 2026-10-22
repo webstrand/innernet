@@ -67,8 +67,9 @@ pub async fn invite(
     let peer = rest_client.create_peer(&peer_contents).await?;
 
     let cidr_tree = CidrTree::new(existing_cidrs);
-    let address = &cidr_tree
-        .ip_net_for(peer.ip)
+    let address = &peer
+        .hosts_fallback()
+        .and_then(|ip| cidr_tree.ip_net_for(ip).ok())
         .expect("Peer's IpNet address to be valid because the peer was created successfully.");
     let interface_info = InterfaceInfo::new(interface, &keypair, *address);
 

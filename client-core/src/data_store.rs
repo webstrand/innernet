@@ -285,14 +285,21 @@ impl DataStore {
             .collect()
     }
 
-    /// The peers, ordered by IP, each with the smallest CIDR that holds its IP as its CIDR.
+    /// The peers, ordered by their hosts fallback addresses, those without one last, each with the
+    /// smallest CIDR that holds all its delegations as its CIDR.
     pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
         let cidrs = self.cidrs()?;
         Ok(store::load_peers(&self.store)?
             .into_iter()
             .map(|mut peer| {
-                peer.cidr_id = smallest_containing(&cidrs, |cidr| cidr.contains(&peer.ip))
-                    .unwrap_or(UNKNOWN_ID);
+                peer.cidr_id = smallest_containing(&cidrs, |cidr| {
+                    !peer.delegations.is_empty()
+                        && peer
+                            .delegations
+                            .iter()
+                            .all(|delegation| cidr.contains(&delegation.net()))
+                })
+                .unwrap_or(UNKNOWN_ID);
                 peer
             })
             .collect())
@@ -417,7 +424,7 @@ fn smallest_containing(cidrs: &[Cidr], contains: impl Fn(&IpNet) -> bool) -> Opt
 fn introduced_peers(config: &InterfaceConfig) -> Result<[PeerContents; 2], Error> {
     let introduced = |ip, public_key: String, endpoint| PeerContents {
         name: None,
-        ip,
+        delegations: vec![Prefix::host(ip)],
         cidr_id: UNKNOWN_ID,
         public_key,
         endpoint,
@@ -453,7 +460,7 @@ mod tests {
     static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
         vec![PeerContents {
             name: Some("blah".parse().unwrap()),
-            ip: "10.0.0.1".parse().unwrap(),
+            delegations: host("10.0.0.1"),
             cidr_id: 1,
             public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
             endpoint: None,
@@ -477,6 +484,11 @@ mod tests {
     });
 
     static NETWORK: Lazy<IpNet> = Lazy::new(|| "10.0.0.0/16".parse().unwrap());
+
+    /// The delegations of a peer whose only address is `ip`.
+    fn host(ip: &str) -> Vec<Prefix> {
+        vec![Prefix::host(ip.parse().unwrap())]
+    }
 
     fn db_path(dir: &Path) -> PathBuf {
         dir.join("wg0.db")
@@ -568,6 +580,87 @@ mod tests {
         assert_eq!(store.peers().unwrap(), disabled(&BASE_PEERS));
     }
 
+    /// The number of rows of `table` of the peer with the public key `key`.
+    fn rows_of(store: &DataStore, table: &str, key: &str) -> i64 {
+        store
+            .store
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE public_key = ?1"),
+                [store::key_to_bytes(key).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_reported_delegations() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+        let other_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+        let delegations = |prefixes: &[&str]| -> Vec<Prefix> {
+            prefixes
+                .iter()
+                .map(|prefix| prefix.parse().unwrap())
+                .collect()
+        };
+
+        // A peer's delegations are routed to it, and each is pinned to its key.
+        let mut wider = BASE_PEERS.clone();
+        wider[0].delegations = delegations(&["10.0.0.1/32", "10.0.0.32/28"]);
+        assert!(store.update_peers(&wider).is_empty());
+        assert_eq!(store.peers().unwrap(), wider);
+        assert_eq!(rows_of(&store, "delegations", &BASE_PEERS[0].public_key), 2);
+        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
+
+        // A withdrawn delegation is no longer routed, but stays pinned: another key is refused
+        // within it, which drops that peer whole.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
+        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
+        let mut other = BASE_PEERS[0].clone();
+        other.name = Some("other".parse().unwrap());
+        other.public_key = other_key.to_string();
+        other.delegations = delegations(&["10.0.0.2/32", "10.0.0.40/29"]);
+        let reported = [BASE_PEERS[0].clone(), other.clone()];
+        let dropped = store.update_peers(&reported);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, &other);
+        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
+
+        // A delegation that covers a prefix pinned to another key is refused, and the stored
+        // record of the peer is kept as it was.
+        other.delegations = delegations(&["10.0.0.2/32"]);
+        assert!(store
+            .update_peers(&[BASE_PEERS[0].clone(), other.clone()])
+            .is_empty());
+        let mut covering = other.clone();
+        covering.delegations = delegations(&["10.0.0.2/32", "10.0.0.0/30"]);
+        covering.name = Some("renamed".parse().unwrap());
+        let reported = [BASE_PEERS[0].clone(), covering];
+        assert_eq!(store.update_peers(&reported).len(), 1);
+        assert_eq!(
+            store.peers().unwrap(),
+            [BASE_PEERS[0].clone(), other.clone()]
+        );
+
+        // A peer may have no delegation, and is then listed last, without a CIDR.
+        let mut without = other.clone();
+        without.delegations = vec![];
+        assert!(store
+            .update_peers(&[without.clone(), BASE_PEERS[0].clone()])
+            .is_empty());
+        without.cidr_id = UNKNOWN_ID;
+        assert_eq!(
+            store.peers().unwrap(),
+            [BASE_PEERS[0].clone(), without.clone()]
+        );
+        assert_eq!(
+            open(dir.path(), false).unwrap().peers().unwrap(),
+            [BASE_PEERS[0].clone(), without]
+        );
+    }
+
     #[test]
     fn test_pins_accumulate() {
         let dir = tempfile::tempdir().unwrap();
@@ -577,7 +670,7 @@ mod tests {
         // The same public key reported at another IP moves there, and its old IP stays pinned to
         // it.
         let mut moved = BASE_PEERS.clone();
-        moved[0].ip = "10.0.0.2".parse().unwrap();
+        moved[0].delegations = host("10.0.0.2");
         assert!(store.update_peers(&moved).is_empty());
         assert_eq!(store.peers().unwrap(), moved);
         let mut impostor = BASE_PEERS.clone();
@@ -589,7 +682,7 @@ mod tests {
         updated[0].name = Some("renamed".parse().unwrap());
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.name = Some("new".parse().unwrap());
-        new_peer.ip = "10.0.0.3".parse().unwrap();
+        new_peer.delegations = host("10.0.0.3");
         new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         updated.push(new_peer);
         assert!(store.update_peers(&updated).is_empty());
@@ -664,7 +757,7 @@ mod tests {
 
         // A peer whose name isn't a valid hostname is recorded as a peer without a name.
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.ip = "10.0.0.2".parse().unwrap();
+        new_peer.delegations = host("10.0.0.2");
         new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         let mut invalid = serde_json::to_value(&new_peer).unwrap();
         invalid["name"] = "peer\n10.0.0.1 example.com".into();
@@ -704,7 +797,7 @@ mod tests {
         let mut nameless = BASE_PEERS.clone();
         nameless[0].name = None;
         let mut other = nameless[0].clone();
-        other.ip = "10.0.0.2".parse().unwrap();
+        other.delegations = host("10.0.0.2");
         other.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         nameless.push(other);
         assert!(store.update_peers(&nameless).is_empty());
@@ -725,7 +818,7 @@ mod tests {
         // A new peer outside the network is dropped, and the other peers are kept.
         let mut outside = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.ip = "1.1.1.1".parse().unwrap();
+        new_peer.delegations = host("1.1.1.1");
         new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         outside.push(new_peer);
         let dropped = store.update_peers(&outside);
@@ -746,7 +839,7 @@ mod tests {
         // A legacy data store with an invalid public key is refused, while a state drops the peer
         // and keeps the others.
         let mut invalid = BASE_PEERS[0].clone();
-        invalid.ip = "10.0.0.2".parse().unwrap();
+        invalid.delegations = host("10.0.0.2");
         invalid.public_key = "abc".to_string();
         let peers = [BASE_PEERS[0].clone(), invalid];
         write_legacy(dir.path(), &peers, &[]);
@@ -771,7 +864,7 @@ mod tests {
         // A reported peer that fails to deserialize, but whose public key is valid, was still
         // reported, so the stored peer with that key keeps its record rather than being disabled.
         let mut entry = serde_json::to_value(&BASE_PEERS[0]).unwrap();
-        entry["ip"] = "not an IP".into();
+        entry["delegations"] = serde_json::json!(["not a prefix"]);
         let state: State =
             serde_json::from_value(serde_json::json!({ "peers": [entry], "cidrs": *BASE_CIDRS }))
                 .unwrap();
@@ -798,7 +891,7 @@ mod tests {
         let mut same_ip = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.name = Some("second".parse().unwrap());
-        new_peer.ip = "10.0.0.2".parse().unwrap();
+        new_peer.delegations = host("10.0.0.2");
         new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
         new_peer.name = Some("third".parse().unwrap());
@@ -813,11 +906,11 @@ mod tests {
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.name = Some("fourth".parse().unwrap());
-        new_peer.ip = "10.0.0.3".parse().unwrap();
+        new_peer.delegations = host("10.0.0.3");
         new_peer.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
         new_peer.name = Some("fifth".parse().unwrap());
-        new_peer.ip = "10.0.0.4".parse().unwrap();
+        new_peer.delegations = host("10.0.0.4");
         same_public_key.push(new_peer);
         let dropped = store.update_peers(&same_public_key);
         assert_eq!(dropped.len(), 1);
@@ -830,7 +923,7 @@ mod tests {
         // A legacy data store holding two records of a peer at different IPs, or two peers at one
         // IP, is refused.
         let mut moved = BASE_PEERS[0].clone();
-        moved.ip = "10.0.0.2".parse().unwrap();
+        moved.delegations = host("10.0.0.2");
         let mut replaced = BASE_PEERS[0].clone();
         replaced.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         for conflicting in [moved, replaced] {
@@ -906,10 +999,10 @@ mod tests {
         store.introduce(&config).unwrap();
         let peers = store.peers().unwrap();
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].ip, COORDINATOR.ip);
+        assert_eq!(peers[0].delegations, COORDINATOR.delegations);
         assert_eq!(peers[0].public_key, COORDINATOR.public_key);
         assert_eq!(peers[0].name, None);
-        assert_eq!(peers[1].ip, "10.0.0.2".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(peers[1].delegations, host("10.0.0.2"));
         assert_eq!(peers[1].public_key, own_key.public.to_base64());
         assert_eq!(peers[1].name, None);
 
@@ -947,7 +1040,7 @@ mod tests {
         v4.is_admin = true;
         let mut domain = BASE_PEERS[0].clone();
         domain.name = Some("domain".parse().unwrap());
-        domain.ip = "10.0.1.1".parse().unwrap();
+        domain.delegations = host("10.0.1.1");
         domain.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         domain.endpoint = Some("vpn.example.com:51820".parse().unwrap());
         domain.cidr_id = 2;
@@ -1013,7 +1106,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let network: IpNet = "fd00::/64".parse().unwrap();
         let mut peer = BASE_PEERS[0].clone();
-        peer.ip = "fd00::1".parse().unwrap();
+        peer.delegations = host("fd00::1");
         peer.cidr_id = UNKNOWN_ID;
         peer.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
         let mut store = DataStore::open_with_paths(
@@ -1130,7 +1223,7 @@ mod tests {
 
         let mut pinned = BASE_PEERS[0].clone();
         pinned.name = Some("pinned".parse().unwrap());
-        pinned.ip = "10.0.0.2".parse().unwrap();
+        pinned.delegations = host("10.0.0.2");
         pinned.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         let mut with_pinned = BASE_PEERS.clone();
         with_pinned.push(pinned.clone());

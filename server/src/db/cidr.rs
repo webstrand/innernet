@@ -178,9 +178,11 @@ impl DatabaseCidr {
             .iter()
             .find(|cidr| cidr.id == id)
             .ok_or(ServerError::NotFound)?;
-        let holds_peer = super::DatabasePeer::list(conn)?
-            .iter()
-            .any(|peer| cidr.cidr.contains(&peer.ip));
+        let holds_peer = super::DatabasePeer::list(conn)?.iter().any(|peer| {
+            peer.delegations
+                .iter()
+                .any(|delegation| cidr.cidr.contains(&delegation.net()))
+        });
         let holds_cidr = cidrs.iter().any(|other| other.parent == Some(id));
         if holds_peer || holds_cidr {
             log::warn!("tried to delete a CIDR that holds peers or other CIDRs.");

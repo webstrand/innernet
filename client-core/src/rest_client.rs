@@ -95,8 +95,9 @@ impl<'a> RestClient<'a> {
 
     /// Creates a peer, and returns it as the server created it. A server in plain HTTP is sent the
     /// peer as clients that predate TLS know it, and returns the peer with its ID, which is left
-    /// out. A peer without a name, which such clients can't represent, is refused as
-    /// [`RestError::NamelessUnsupported`] without a request.
+    /// out. A peer that such clients can't represent is refused without a request: one without a
+    /// name as [`RestError::NamelessUnsupported`], and one whose delegations are anything but a
+    /// single address as [`RestError::DelegationsUnsupported`].
     pub async fn create_peer(
         &self,
         peer_contents: &PeerContents,
@@ -104,8 +105,14 @@ impl<'a> RestClient<'a> {
         match self.admin_api().await? {
             AdminApi::ByKey => self.http_form("POST", "/admin/peers", peer_contents).await,
             AdminApi::Legacy => {
+                if peer_contents.name.is_none() {
+                    return Err(RestError::NamelessUnsupported);
+                }
+                if !matches!(&peer_contents.delegations[..], [address] if address.is_host()) {
+                    return Err(RestError::DelegationsUnsupported);
+                }
                 let legacy = LegacyPeerContents::from_peer(peer_contents)
-                    .ok_or(RestError::NamelessUnsupported)?;
+                    .ok_or(RestError::DelegationsUnsupported)?;
                 let peer: LegacyPeer = self.http_form("POST", "/admin/peers", legacy).await?;
                 Ok(peer.contents.into())
             },
@@ -160,7 +167,8 @@ impl<'a> RestClient<'a> {
 
     /// Reads the peer `listed` and its tag in the API of TLS sessions, as long as the peer is
     /// still as it was listed, but for its endpoint and candidates, which the peer reports on its
-    /// own. A peer that has changed since it was listed is refused as
+    /// own, and its delegations, which an admin changes apart from the rest of the peer. A peer
+    /// that has changed since it was listed is refused as
     /// [`RestError::PeerChanged`]. A peer that the server does not find by its key, since it has
     /// been deleted or its key has changed, as a redeemed invitation's does, is refused as
     /// [`RestError::NoSuchPeer`].
@@ -170,15 +178,15 @@ impl<'a> RestClient<'a> {
             .http("GET", &path)
             .await
             .map_err(RestError::peer_refusal)?;
-        if !same_but_endpoints(&tagged.peer, listed) {
+        if !same_but_untagged(&tagged.peer, listed) {
             return Err(RestError::PeerChanged);
         }
         Ok(tagged)
     }
 
     /// The peer `listed` as a server in plain HTTP lists it, with the ID by which it names the
-    /// peer, as long as the peer is still as it was listed, but for its endpoint and candidates.
-    /// The client keeps no IDs, so it lists the peers again, and takes the peer with the public
+    /// peer, as long as the peer is still as it was listed, but for what
+    /// [`Self::get_tagged_peer`] leaves out. The client keeps no IDs, so it lists the peers again, and takes the peer with the public
     /// key of `listed`. A peer that has changed since it was listed, or is gone, is refused as
     /// [`RestError::PeerChanged`].
     async fn get_legacy_peer(&self, listed: &PeerContents) -> Result<LegacyPeer, RestError> {
@@ -186,7 +194,7 @@ impl<'a> RestClient<'a> {
             .await?
             .into_iter()
             .find(|peer| peer.public_key == listed.public_key)
-            .filter(|peer| same_but_endpoints(&peer.contents.clone().into(), listed))
+            .filter(|peer| same_but_untagged(&peer.contents.clone().into(), listed))
             .ok_or(RestError::PeerChanged)
     }
 
@@ -391,15 +399,17 @@ impl<'a> RestClient<'a> {
     }
 }
 
-/// Whether the peers `a` and `b` are the same, but for their endpoints and candidates, which the
-/// peer reports on its own.
-fn same_but_endpoints(a: &PeerContents, b: &PeerContents) -> bool {
-    let without_endpoints = |peer: &PeerContents| PeerContents {
+/// Whether the peers `a` and `b` are the same, but for what the server's tag of a peer leaves
+/// out: their endpoints and candidates, which a peer reports on its own, and their delegations,
+/// which an admin changes apart from the rest of the peer.
+fn same_but_untagged(a: &PeerContents, b: &PeerContents) -> bool {
+    let tagged = |peer: &PeerContents| PeerContents {
+        delegations: vec![],
         endpoint: None,
         candidates: vec![],
         ..peer.clone()
     };
-    without_endpoints(a) == without_endpoints(b)
+    tagged(a) == tagged(b)
 }
 
 /// Decodes the body of an answer as JSON. An empty body decodes as `null`, so that it decodes as
@@ -513,6 +523,11 @@ pub enum RestError {
          must upgrade the server first."
     )]
     NamelessUnsupported,
+    #[error(
+        "The innernet server predates TLS, and offers a peer a single address only, not \
+         delegations. The operator must upgrade the server first."
+    )]
+    DelegationsUnsupported,
     /// The request failed to reach the server, or the server failed to answer it.
     #[error("Error sending request: {0}")]
     RequestSend(Box<dyn std::error::Error + Send + Sync>),
@@ -732,7 +747,7 @@ mod tests {
         }
         PeerContents {
             name: Some("peer".parse().unwrap()),
-            ip: "10.0.0.7".parse().unwrap(),
+            delegations: vec!["10.0.0.7/32".parse().unwrap()],
             cidr_id: 1,
             public_key: wireguard_control::Key(bytes).to_base64(),
             endpoint: None,
@@ -955,6 +970,17 @@ mod tests {
         let nameless = PeerContents { name: None, ..peer };
         let error = client.create_peer(&nameless).await.unwrap_err();
         assert!(matches!(error, RestError::NamelessUnsupported), "{error:?}");
+        for delegations in [vec![], vec!["10.0.0.8/31".parse().unwrap()]] {
+            let delegated = PeerContents {
+                delegations,
+                ..listed_peer()
+            };
+            let error = client.create_peer(&delegated).await.unwrap_err();
+            assert!(
+                matches!(error, RestError::DelegationsUnsupported),
+                "{error:?}"
+            );
+        }
         let error = client.update_peer(&nameless, &nameless).await.unwrap_err();
         assert!(matches!(error, RestError::NamelessUnsupported), "{error:?}");
         assert_eq!(

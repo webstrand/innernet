@@ -55,8 +55,8 @@ CREATE INDEX delegations_by_key ON delegations (public_key);
 CREATE INDEX delegations_by_last ON delegations (last);
 
 -- The CIDRs of the network, each keyed by its prefix. The parent of a CIDR is the smallest other
--- CIDR that holds it, and the CIDR of a peer the smallest that holds its address. Every peer sees
--- the peers of an `infra` CIDR.
+-- CIDR that holds it, and the CIDR of a peer that of its delegations. Every peer sees the peers of
+-- an `infra` CIDR.
 CREATE TABLE cidrs (
   address    BLOB NOT NULL CHECK (length(address) IN (4, 16)),  -- host bits zero
   prefix_len INTEGER NOT NULL CHECK (prefix_len BETWEEN 0 AND length(address) * 8),

@@ -2,7 +2,7 @@ use crate::{
     interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
     AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
     Endpoint, Error, Hostname, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, PeerContents,
-    RenameCidrOpts, RenamePeerOpts,
+    Prefix, RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -372,7 +372,7 @@ pub fn gather_new_peer_info(
     if args.yes || confirm(&format!("Create peer {}?", name.yellow()))? {
         let input = NewPeerInfo {
             name,
-            ip,
+            delegations: vec![Prefix::host(ip)],
             cidr_id: cidr.id,
             is_admin,
             invite_expires,

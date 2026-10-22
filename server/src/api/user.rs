@@ -171,6 +171,7 @@ mod tests {
     use bytes::Buf;
     use innernet_shared::{
         AssociationContents, CidrContents, Endpoint, EndpointContents, Error, LegacyPeer,
+        PeerContents,
     };
 
     #[tokio::test]
@@ -227,6 +228,48 @@ mod tests {
         for peer in peers {
             assert_eq!(peer.id, ids[&peer.public_key]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peers_without_a_delegation() -> Result<(), Error> {
+        // A peer without a delegation has no CIDR, so no other peer sees it. It stays in the
+        // admin listing of TLS sessions, with no delegations, and clients that predate TLS can't
+        // represent it.
+        let server = test::Server::new()?;
+        let developer2 = test::peer(&server.db().lock(), test::DEVELOPER2_PEER_ID);
+        server.db().lock().execute(
+            "DELETE FROM delegations WHERE public_key = ?1",
+            [wireguard_control::Key::from_base64(&developer2.public_key)?.0],
+        )?;
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let State { peers, .. } = serde_json::from_slice(&body)?;
+        assert!(!peers.is_empty());
+        assert!(peers
+            .iter()
+            .all(|peer| peer.public_key != developer2.public_key));
+
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let peers: Vec<PeerContents> = serde_json::from_slice(&body)?;
+        let listed = peers
+            .iter()
+            .find(|peer| peer.public_key == developer2.public_key)
+            .unwrap();
+        assert!(listed.delegations.is_empty());
+        assert!(test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID)
+            .legacy(1)
+            .is_some());
+        let without = DatabasePeer::get_from_public_key(
+            &server.db().lock(),
+            &wireguard_control::Key::from_base64(&developer2.public_key)?,
+        )?;
+        assert!(without.legacy(1).is_none());
         Ok(())
     }
 

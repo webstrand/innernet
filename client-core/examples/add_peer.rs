@@ -6,7 +6,7 @@ use innernet_client_core::{
     rest_client::RestClient,
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
-use innernet_shared::prompts;
+use innernet_shared::{prompts, Prefix};
 use std::{
     env,
     net::{IpAddr, Ipv4Addr},
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Error> {
 
     let new_peer_info = NewPeerInfo {
         name: "joe".parse().unwrap(),
-        ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        delegations: vec![Prefix::host(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))],
         cidr_id: cidrs[0].id,
         is_admin: false,
         invite_expires: "1m".parse().unwrap(),

@@ -5,8 +5,8 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    check_delegations, xeddsa, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents, Prefix,
-    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    check_delegations, xeddsa, Cidr, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents,
+    Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
 use rusqlite::{params, Connection};
@@ -68,12 +68,13 @@ impl DatabasePeer {
             .collect())
     }
 
-    /// Creates the peer `contents`, which the server offers its IP as a host-prefix delegation.
-    /// The delegation must follow the rules of [`check_delegations`] within the CIDR that the peer
-    /// names, a CIDR without child CIDRs, and the server's node must accept the peer: a name, if
-    /// it has one, that no other peer has, and an address and a key that are pinned to no other
-    /// key and address.
-    pub fn create(store: &Store, contents: PeerContents) -> Result<Self, ServerError> {
+    /// Creates the peer `contents`, offering it its delegations, of which it must have at least
+    /// one. The delegations must follow the rules of [`check_delegations`] within the CIDR that
+    /// the peer names, a CIDR without child CIDRs, and the server's node must accept the peer: a
+    /// name, if it has one, that no other peer has, and delegations that overlap no prefix pinned
+    /// to another key.
+    pub fn create(store: &Store, mut contents: PeerContents) -> Result<Self, ServerError> {
+        contents.delegations.sort();
         log::info!("creating peer {:?}", contents);
 
         if !Self::is_valid_public_key(&contents.public_key) {
@@ -89,7 +90,12 @@ impl DatabasePeer {
             log::warn!("tried to add peer to a CIDR that has child CIDRs.");
             return Err(ServerError::InvalidQuery);
         }
-        check_new_delegations(store, &[Prefix::host(contents.ip)], &cidr.cidr, None)?;
+        if contents.delegations.is_empty() {
+            return Err(ServerError::Delegation(
+                "a new peer must be offered at least one delegation".into(),
+            ));
+        }
+        check_new_delegations(store, &contents.delegations, &cidr.cidr, None)?;
 
         let key = key_to_bytes(&contents.public_key).map_err(|_| ServerError::InvalidQuery)?;
         let tx = store.unchecked_transaction()?;
@@ -323,21 +329,21 @@ impl DatabasePeer {
 
         Ok(Self::list_enabled(conn)?
             .into_iter()
-            .filter(|peer| visible.iter().any(|cidr| cidr.contains(&peer.ip)))
+            .filter(|peer| {
+                cidr_of(&peer.delegations, &cidrs)
+                    .is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr.cidr)))
+            })
             .collect())
     }
 
-    /// Every peer, ordered by IP.
+    /// Every peer, ordered by hosts fallback address, those without one last.
     pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
         let cidrs = DatabaseCidr::list(conn)?;
         let latched = Self::latched(conn)?;
         Ok(store::load_peers(conn)?
             .into_iter()
             .map(|mut contents| {
-                contents.cidr_id = cidrs
-                    .iter()
-                    .filter(|cidr| cidr.cidr.contains(&contents.ip))
-                    .max_by_key(|cidr| cidr.cidr.prefix_len())
+                contents.cidr_id = cidr_of(&contents.delegations, &cidrs)
                     .map(|cidr| cidr.id)
                     .unwrap_or(0);
                 contents.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
@@ -385,6 +391,22 @@ impl DatabasePeer {
         }
         Ok(expired.len())
     }
+}
+
+/// The CIDR of a peer whose delegations are `delegations`, among `cidrs`: the smallest that holds
+/// them all, or `None` for a peer without a delegation.
+fn cidr_of<'a>(delegations: &[Prefix], cidrs: &'a [Cidr]) -> Option<&'a Cidr> {
+    if delegations.is_empty() {
+        return None;
+    }
+    cidrs
+        .iter()
+        .filter(|cidr| {
+            delegations
+                .iter()
+                .all(|delegation| cidr.cidr.contains(&delegation.net()))
+        })
+        .max_by_key(|cidr| cidr.cidr.prefix_len())
 }
 
 /// Checks that `delegations` may be delegated together to a peer of the CIDR `cidr`, as

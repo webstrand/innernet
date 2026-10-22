@@ -13,7 +13,7 @@ fn network() -> ipnet::IpNet {
 fn peer(name: &str, ip: &str) -> PeerContents {
     PeerContents {
         name: Some(name.parse().unwrap()),
-        ip: ip.parse().unwrap(),
+        delegations: vec![Prefix::host(ip.parse().unwrap())],
         cidr_id: 0,
         public_key: KeyPair::generate().public.to_base64(),
         endpoint: None,
@@ -39,7 +39,7 @@ fn test_pins() {
     // The key may move to another address, but its old address stays pinned to it, so that no
     // other key may take it.
     let moved = PeerContents {
-        ip: "10.0.0.3".parse().unwrap(),
+        delegations: vec!["10.0.0.3/32".parse().unwrap()],
         ..a.clone()
     };
     assert_eq!(accept(&store, &[&moved]), [Ok(())]);
@@ -47,7 +47,7 @@ fn test_pins() {
     assert_eq!(
         accept(&store, &[&impostor]),
         [Err(Refusal::Pinned {
-            prefix: Prefix::host(a.ip)
+            prefix: a.delegations[0]
         })]
     );
     let pins: i64 = store
@@ -72,7 +72,7 @@ fn test_network() {
     assert_eq!(
         accept(&store, &[&outside]),
         [Err(Refusal::OutsideNetwork {
-            prefix: Prefix::host(outside.ip),
+            prefix: outside.delegations[0],
             network: network()
         })]
     );
@@ -226,4 +226,62 @@ fn test_invalid_stored_names_are_no_names() {
         .execute("UPDATE peers SET name = 'Not Valid'", [])
         .unwrap();
     assert_eq!(store::load_peers(&store).unwrap()[0].name, None);
+}
+
+#[test]
+fn test_delegations() {
+    let store = Store::in_memory(network()).unwrap();
+    let delegations = |prefixes: &[&str]| -> Vec<Prefix> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.parse().unwrap())
+            .collect()
+    };
+    let a = PeerContents {
+        delegations: delegations(&["10.0.0.2/32"]),
+        ..peer("a", "10.0.0.2")
+    };
+    assert_eq!(accept(&store, &[&a]), [Ok(())]);
+
+    // A wider delegation that holds a prefix pinned to the same key nests within its pins.
+    let wider = PeerContents {
+        delegations: delegations(&["10.0.0.0/28", "10.0.1.0/24"]),
+        ..a.clone()
+    };
+    assert_eq!(accept(&store, &[&wider]), [Ok(())]);
+    assert_eq!(store::load_peers(&store).unwrap(), [wider]);
+
+    // Another key is refused within any of them, even after they are withdrawn, as is a record
+    // whose delegations overlap one another, or those of an earlier record of the batch.
+    assert_eq!(accept(&store, &[&a]), [Ok(())]);
+    let inside = PeerContents {
+        delegations: delegations(&["10.0.1.128/25"]),
+        ..peer("b", "10.0.2.1")
+    };
+    assert_eq!(
+        accept(&store, &[&inside]),
+        [Err(Refusal::Pinned {
+            prefix: inside.delegations[0]
+        })]
+    );
+    let overlapping = PeerContents {
+        delegations: delegations(&["10.0.2.0/24", "10.0.2.0/25"]),
+        ..peer("b", "10.0.2.1")
+    };
+    assert_eq!(accept(&store, &[&overlapping]), [Err(Refusal::Overlapping)]);
+    let b = peer("b", "10.0.2.1");
+    let c = PeerContents {
+        delegations: delegations(&["10.0.2.0/24"]),
+        ..peer("c", "10.0.3.1")
+    };
+    assert_eq!(accept(&store, &[&b, &c]), [Ok(()), Err(Refusal::Duplicate)]);
+
+    // A peer may have no delegation, and is then listed last.
+    let without = PeerContents {
+        delegations: vec![],
+        ..a.clone()
+    };
+    assert_eq!(accept(&store, &[&without]), [Ok(())]);
+    let listed = store::load_peers(&store).unwrap();
+    assert_eq!(listed.last(), Some(&without));
 }

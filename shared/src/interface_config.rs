@@ -356,6 +356,7 @@ impl PeerInvitation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Prefix;
 
     const INVITATION: &str = r#"
         [interface]
@@ -395,7 +396,7 @@ mod tests {
     fn peer(ip: &str, public_key: &str) -> PeerContents {
         PeerContents {
             name: Some("peer1".parse().unwrap()),
-            ip: ip.parse().unwrap(),
+            delegations: vec![Prefix::host(ip.parse().unwrap())],
             cidr_id: 1,
             public_key: public_key.to_owned(),
             endpoint: None,

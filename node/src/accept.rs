@@ -64,7 +64,9 @@ impl std::error::Error for Refusal {}
 
 /// The delegations of `peer`, sorted.
 fn delegations(peer: &PeerContents) -> Vec<Prefix> {
-    vec![Prefix::host(peer.ip)]
+    let mut delegations = peer.delegations.clone();
+    delegations.sort();
+    delegations
 }
 
 /// Decides what the node accepts of `peers`, within the network `network`, without writing

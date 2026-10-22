@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
-use innernet_shared::{Cidr, CidrContents, Error, PeerContents};
+use innernet_shared::{Cidr, CidrContents, Error, PeerContents, Prefix};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -338,7 +338,7 @@ pub fn peer_contents(
 
     Ok(PeerContents {
         name: Some(name.parse().map_err(|e: &str| anyhow!(e))?),
-        ip: ip_str.parse()?,
+        delegations: vec![Prefix::host(ip_str.parse()?)],
         cidr_id,
         public_key: public_key.to_base64(),
         is_admin,

@@ -938,7 +938,12 @@ fn print_peer(
             peer.display_name().yellow(),
             public_key.yellow(),
         );
-        println_pad!(pad, "  {}: {}", "ip".bold(), peer.display_address());
+        println_pad!(
+            pad,
+            "  {}: {}",
+            "delegations".bold(),
+            peer.display_delegations()
+        );
         if let Some(info) = info {
             if let Some(endpoint) = info.config.endpoint {
                 println_pad!(

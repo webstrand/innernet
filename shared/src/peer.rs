@@ -1,10 +1,11 @@
-use crate::{Hostname, PeerContents, Timestring, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
-use std::{net::IpAddr, time::SystemTime};
+use crate::{Hostname, PeerContents, Prefix, Timestring, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use std::time::SystemTime;
 use wireguard_control::KeyPair;
 
 pub struct NewPeerInfo {
     pub name: Hostname,
-    pub ip: IpAddr,
+    /// The delegations that the server offers the new peer.
+    pub delegations: Vec<Prefix>,
     pub cidr_id: i64,
     pub is_admin: bool,
     pub invite_expires: Timestring,
@@ -14,7 +15,7 @@ impl NewPeerInfo {
     pub fn into_peer_contents(self, keypair: &KeyPair) -> PeerContents {
         PeerContents {
             name: Some(self.name),
-            ip: self.ip,
+            delegations: self.delegations,
             cidr_id: self.cidr_id,
             public_key: keypair.public.to_base64(),
             endpoint: None,
