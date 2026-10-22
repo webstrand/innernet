@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use innernet_shared::{
-    interface_config::{InterfaceConfig, InterfaceInfo, FEATURE_TLS},
+    interface_config::{InterfaceConfig, InterfaceInfo, ServerInfo, FEATURE_TLS},
     CidrTree,
 };
 use std::path::Path;
@@ -22,7 +22,8 @@ pub enum CreatePeerError {
     RestRequest(#[from] RestError),
 }
 
-/// Create a new innernet [`Peer`] and a [`PeerInvitation`] they can use to join the network.
+/// Create a new innernet [`Peer`] and a [`PeerInvitation`] they can use to join the network, as
+/// the admin client of `interface` in `config_dir` and `data_dir`, as [`invite`] does.
 pub async fn create_peer(
     config_dir: &Path,
     data_dir: &Path,
@@ -34,7 +35,33 @@ pub async fn create_peer(
     let interface_config = InterfaceConfig::from_interface(config_dir, interface)
         .map_err(CreatePeerError::InterfaceConfigAccess)?;
     let rest_client = RestClient::for_interface(&interface_config, data_dir, interface)?;
+    invite(
+        &rest_client,
+        interface,
+        &interface_config.server,
+        existing_cidrs,
+        existing_peers,
+        new_peer_info,
+    )
+    .await
+}
 
+/// Creates a new innernet [`Peer`] through `rest_client`, an admin client of the coordinator of
+/// `interface`, which `server` names, and a [`PeerInvitation`] that the peer can use to join the
+/// network.
+///
+/// The coordinator is the peer with the key of `server`, which authenticated the server. The
+/// invitation names it at the endpoint of its peer in `existing_peers`, if it has one, and at the
+/// external endpoint of `server` otherwise. It states that the server speaks TLS only if the
+/// server answered this client over TLS.
+pub async fn invite(
+    rest_client: &RestClient<'_>,
+    interface: &InterfaceName,
+    server: &ServerInfo,
+    existing_cidrs: &[Cidr],
+    existing_peers: &[Peer],
+    new_peer_info: NewPeerInfo,
+) -> Result<(Peer, PeerInvitation), CreatePeerError> {
     let keypair = KeyPair::generate();
     let peer_contents = new_peer_info.into_peer_contents(&keypair);
     let peer = rest_client.create_peer(&peer_contents).await?;
@@ -45,10 +72,7 @@ pub async fn create_peer(
         .expect("Peer's IpNet address to be valid because the peer was created successfully.");
     let interface_info = InterfaceInfo::new(interface, &keypair, *address);
 
-    // The coordinator is the peer with the key of the interface config, which authenticated the
-    // server. Its record holds its current endpoint, if it has one. The invitation states that
-    // the server speaks TLS only if the server answered this client over TLS.
-    let mut server_info = interface_config.server.clone();
+    let mut server_info = server.clone();
     server_info.features = if rest_client.speaks_tls() {
         vec![FEATURE_TLS.to_string()]
     } else {

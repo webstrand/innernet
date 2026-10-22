@@ -11,13 +11,24 @@ innernet-server \
     --external-endpoint "172.18.1.1:51820" \
     --listen-port 51820
 
-innernet-server \
-    $INNERNET_ARGS \
-    add-cidr evilcorp \
-    --name "humans" \
-    --cidr "10.66.1.0/24" \
-    --parent "evilcorp" \
-    --yes
+# The admin commands of innernet-server go through the running server's coordinator, so the
+# first is retried until the coordinator listens.
+innernet-server $INNERNET_ARGS serve evilcorp &
+serve_pid=$!
+
+for attempt in $(seq 50); do
+    if innernet-server \
+        $INNERNET_ARGS \
+        add-cidr evilcorp \
+        --name "humans" \
+        --cidr "10.66.1.0/24" \
+        --parent "evilcorp" \
+        --yes; then
+        break
+    fi
+    [ "$attempt" -lt 50 ] || exit 1
+    sleep 0.2
+done
 
 innernet-server \
     $INNERNET_ARGS \
@@ -30,4 +41,4 @@ innernet-server \
     --invite-expires "30d" \
     --yes
 
-innernet-server $INNERNET_ARGS serve evilcorp
+wait "$serve_pid"

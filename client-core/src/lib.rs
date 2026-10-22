@@ -14,6 +14,7 @@ use anyhow::Error;
 use innernet_shared::wg;
 use std::path::Path;
 
+pub mod admin;
 pub mod data_store;
 pub mod interface;
 pub mod peer;

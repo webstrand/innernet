@@ -25,6 +25,8 @@ sudo innernet-server new
 
 The init wizard will ask you questions about your network and give you some reasonable defaults. It's good to familiarize yourself with [network CIDRs](https://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing) as a lot of innernet's access control is based upon them. As an example, let's say the root CIDR for this network is `10.60.0.0/16`. Server initialization creates a special "infra" CIDR which contains the `innernet` server itself and is reachable from all CIDRs on the network.
 
+The server must run before it can change the network: every admin subcommand of `innernet-server`, such as `add-cidr` and `add-peer`, goes through the API of the running server, as the admin subcommands of `innernet` do. Run it with `innernet-server serve <interface>`, or on Linux via `systemctl`, with `systemctl enable --now innernet-server@<interface>`. On a home network, port forwarding to the `Listen Port` given at creation lets peers reach the server.
+
 Next we'll also create a `humans` CIDR where we can start adding some peers.
 
 ```sh
@@ -42,8 +44,6 @@ sudo innernet-server add-peer <interface>
 ```
 
 Select the `humans` CIDR, and the CLI will automatically suggest the next available IP address. Any name is fine, just answer "yes" when asked if you would like to make the peer an admin. The process of adding a peer results in an invitation file. This file contains just enough information for the new peer to contact the `innernet` server and redeem its invitation. It should be transferred securely to the new peer, and it can only be used once to initialize the peer.
-
-You can run the server with `innernet-server serve <interface>`, or if you're on Linux and want to run it via `systemctl`, run `systemctl enable --now innernet-server@<interface>`. If you're on a home network, don't forget to configure port forwarding to the `Listen Port` you specified when creating the `innernet` server.
 
 ### Peer Initialization
 
@@ -171,8 +171,6 @@ With dnsmasq, the line `server=/<interface>.wg/127.0.0.55` does so. `--host-suff
 ### What Wakes a Node
 
 A node configures its interface in rounds: it brings what it holds of the network up to date, configures its tunnel and its DNS server, reports its NAT traversal candidates, and starts NAT traversal of the peers that changed, whose steps follow five seconds apart. `innernet up --daemon` runs a round of each interface at its `--interval` and whenever the host's addresses change; the server runs one whenever its coordinator changes the network and whenever the host's addresses change. On Linux, the kernel reports changes of the addresses as they happen. The node reads its tunnel every ten seconds for the endpoints at which it reaches its peers and the handshakes that complete: the server reports to each peer the endpoints at which its tunnel reaches the others, and the NAT traversal of a peer ends once a handshake with it completes, which each step of the traversal also checks.
-
-The commands of `innernet-server` that change the network write its database; a running server's node picks the change up when it next starts.
 
 ### Remove Network
 

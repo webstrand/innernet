@@ -34,6 +34,20 @@ coordination_server() {
 }
 client() { local peer=$1; shift; ns "$peer" "$BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" "$@"; }
 db() { sqlite3 "$work/coordination-server/data/e2e.db" "$@"; }
+# Waits until the coordinator of the server in the namespace `$1`, whose config is `$2`, listens
+# for its API, which the admin commands of innernet-server reach it at.
+await_coordinator() { # <namespace> <config>
+    local port
+    port=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["listen-port"])' "$2")
+    for _ in $(seq 50); do
+        if ip netns exec "$1" ss -Hltn "sport = :$port" | grep -q .; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "FAIL: the coordinator in $1 doesn't listen" >&2
+    exit 1
+}
 
 echo "testing $BIN"
 
@@ -58,13 +72,14 @@ done
 mkdir -p "$work/coordination-server" "$work/alice" "$work/bob"
 coordination_server new --network-name e2e --network-cidr 10.66.0.0/16 \
     --external-endpoint 1.1.1.1:51820 --listen-port 51820 >/dev/null
+# The admin commands of innernet-server go through the running server's coordinator.
+coordination_server serve e2e --no-write-hosts >"$work/coordination-server.log" 2>&1 &
+await_coordinator coordination-server "$work/coordination-server/conf/e2e.conf"
 coordination_server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
 for peer in alice bob; do
     coordination_server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin false \
         --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
 done
-coordination_server serve e2e --no-write-hosts >"$work/coordination-server.log" 2>&1 &
-sleep 1
 for peer in alice bob; do
     client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 \
         --delete-invite --no-write-hosts >/dev/null 2>&1

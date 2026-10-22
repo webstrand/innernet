@@ -6,10 +6,10 @@ use innernet_shared::{
 };
 use std::{env, path::PathBuf};
 
+use innernet_client_core::admin;
 use innernet_server::{
-    add_cidr, add_peer, delete_cidr, enable_or_disable_peer,
     initialize::{self, InitializeOpts},
-    rename_cidr, rename_peer, serve, uninstall, ServerConfig,
+    serve, uninstall, AdminClient, ServerConfig,
 };
 use innernet_shared::Interface;
 
@@ -66,8 +66,6 @@ enum Command {
     },
 
     /// Add a peer to an existing network.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
     AddPeer {
         interface: Interface,
 
@@ -75,9 +73,7 @@ enum Command {
         args: AddPeerOpts,
     },
 
-    /// Disable an enabled peer.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
+    /// Disable an enabled peer
     DisablePeer {
         interface: Interface,
 
@@ -85,9 +81,7 @@ enum Command {
         args: EnableDisablePeerOpts,
     },
 
-    /// Enable a disabled peer.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
+    /// Enable a disabled peer
     EnablePeer {
         interface: Interface,
 
@@ -96,8 +90,6 @@ enum Command {
     },
 
     /// Rename an existing peer.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
     RenamePeer {
         interface: Interface,
 
@@ -106,8 +98,6 @@ enum Command {
     },
 
     /// Add a new CIDR to an existing network.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
     AddCidr {
         interface: Interface,
 
@@ -116,8 +106,6 @@ enum Command {
     },
 
     /// Rename an existing CIDR.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
     RenameCidr {
         interface: Interface,
 
@@ -126,8 +114,6 @@ enum Command {
     },
 
     /// Delete a CIDR.
-    ///
-    /// It writes the database; a running server's node picks the change up when it next starts.
     DeleteCidr {
         interface: Interface,
 
@@ -178,17 +164,55 @@ async fn run(opts: Opts) -> Result<(), anyhow::Error> {
             network: routing,
             hosts,
         } => serve(*interface, &conf, routing, hosts).await?,
-        Command::AddPeer { interface, args } => add_peer(&interface, &conf, args)?,
-        Command::RenamePeer { interface, args } => rename_peer(&interface, &conf, args)?,
+        Command::AddPeer { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::add_peer(&rest_client, &interface, admin.server(), args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::RenamePeer { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::rename_peer(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
         Command::DisablePeer { interface, args } => {
-            enable_or_disable_peer(&interface, &conf, false, args)?
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::enable_or_disable_peer(&rest_client, args, false)
+                .await
+                .map_err(|e| admin.explain(e))?
         },
         Command::EnablePeer { interface, args } => {
-            enable_or_disable_peer(&interface, &conf, true, args)?
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::enable_or_disable_peer(&rest_client, args, true)
+                .await
+                .map_err(|e| admin.explain(e))?
         },
-        Command::AddCidr { interface, args } => add_cidr(&interface, &conf, args)?,
-        Command::RenameCidr { interface, args } => rename_cidr(&interface, &conf, args)?,
-        Command::DeleteCidr { interface, args } => delete_cidr(&interface, &conf, args)?,
+        Command::AddCidr { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::add_cidr(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::RenameCidr { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::rename_cidr(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
+        Command::DeleteCidr { interface, args } => {
+            let admin = AdminClient::new(&interface, &conf)?;
+            let rest_client = admin.rest_client()?;
+            admin::delete_cidr(&rest_client, args)
+                .await
+                .map_err(|e| admin.explain(e))?
+        },
         Command::Completions { shell } => {
             use clap::CommandFactory;
             let mut app = Opts::command();

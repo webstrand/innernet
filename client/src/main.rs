@@ -5,9 +5,9 @@ use colored::*;
 use dialoguer::{Confirm, Input};
 use indoc::eprintdoc;
 use innernet_client_core::{
+    admin,
     data_store::DataStore,
     interface::{fetch, redeem_invite, round, NodeState},
-    peer::create_peer,
     rest_client::{RestClient, RestError},
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
@@ -19,11 +19,10 @@ use innernet_node::{
 };
 use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
-    AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
-    DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
-    Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, PeerContents, RenameCidrOpts, RenamePeerOpts,
-    ServerCapabilities, WrappedIoError,
+    AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
+    Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts,
+    NatOpts, NetworkOpts, OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts,
+    RenamePeerOpts, ServerCapabilities, WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -545,92 +544,6 @@ fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Er
     Ok(())
 }
 
-async fn add_cidr(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: AddCidrOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    log::info!("Fetching CIDRs");
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-    let cidrs: Vec<Cidr> = rest_client.get_cidrs().await?;
-
-    if let Some(cidr_request) = prompts::add_cidr(&cidrs, &sub_opts)? {
-        log::info!("Creating CIDR...");
-        let cidr: Cidr = rest_client.create_cidr(&cidr_request).await?;
-
-        eprintdoc!(
-            "
-            CIDR \"{cidr_name}\" added.
-
-            Right now, peers within {cidr_name} can only see peers in the same CIDR
-            , and in the special \"infra\" CIDR that includes the innernet server peer.
-
-            You'll need to add more associations for peers in diffent CIDRs to communicate.
-            ",
-            cidr_name = cidr.name.bold()
-        );
-    } else {
-        log::info!("exited without creating CIDR.");
-    }
-
-    Ok(())
-}
-
-async fn rename_cidr(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: RenameCidrOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
-
-    if let Some((cidr_request, old_name)) = prompts::rename_cidr(&cidrs, &sub_opts)? {
-        log::info!("Renaming CIDR...");
-
-        let id = cidrs
-            .iter()
-            .find(|c| c.name == old_name)
-            .ok_or_else(|| anyhow!("CIDR not found."))?
-            .id;
-
-        rest_client
-            .http_form::<_, ()>("PUT", &format!("/admin/cidrs/{id}"), cidr_request)
-            .await?;
-        log::info!("CIDR renamed.");
-    } else {
-        log::info!("Exited without renaming CIDR.");
-    }
-
-    Ok(())
-}
-
-async fn delete_cidr(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: DeleteCidrOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    println!("Fetching eligible CIDRs");
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
-    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers").await?;
-
-    let cidr_id = prompts::delete_cidr(&cidrs, &peers, &sub_opts)?;
-
-    println!("Deleting CIDR...");
-    rest_client
-        .http::<()>("DELETE", &format!("/admin/cidrs/{cidr_id}"))
-        .await?;
-
-    println!("CIDR deleted.");
-
-    Ok(())
-}
-
 fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), Error> {
     let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
@@ -646,196 +559,6 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
             println!("{} {}", cidr.cidr, cidr.name);
         }
     }
-    Ok(())
-}
-
-async fn add_peer(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: AddPeerOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching CIDRs");
-    let cidrs = rest_client.get_cidrs().await?;
-    log::info!("Fetching peers");
-    let peers = rest_client.get_peers().await?;
-    let cidr_tree = CidrTree::new(&cidrs[..]);
-
-    if let Some((new_peer_info, target_path)) =
-        prompts::gather_new_peer_info(&peers, &cidr_tree, &sub_opts)?
-    {
-        log::info!("Creating peer...");
-        let (peer, invitation) = create_peer(
-            &opts.config_dir,
-            &opts.data_dir,
-            interface,
-            &cidrs,
-            &peers,
-            new_peer_info,
-        )
-        .await?;
-
-        invitation.save_new(&target_path)?;
-        prompts::print_invitation_info(&peer, &target_path);
-    } else {
-        log::info!("Exited without creating peer.");
-    }
-
-    Ok(())
-}
-
-async fn rename_peer(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: RenamePeerOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching peers");
-    let peers = rest_client.get_peers().await?;
-
-    if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
-        log::info!("Renaming peer...");
-
-        let listed = peers
-            .iter()
-            .find(|p| p.name == old_name)
-            .ok_or_else(|| anyhow!("Peer not found."))?;
-
-        rest_client.update_peer(listed, &peer_request).await?;
-        log::info!("Peer renamed.");
-    } else {
-        log::info!("exited without renaming peer.");
-    }
-
-    Ok(())
-}
-
-async fn enable_or_disable_peer(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: EnableDisablePeerOpts,
-    enable: bool,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching peers.");
-    let peers = rest_client.get_peers().await?;
-
-    if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
-        let contents = PeerContents {
-            is_disabled: !enable,
-            ..peer.contents.clone()
-        };
-        rest_client.update_peer(&peer, &contents).await?;
-    } else {
-        log::info!("exiting without enabling or disabling peer.");
-    }
-
-    Ok(())
-}
-
-async fn add_association(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: AddDeleteAssociationOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
-
-    let association = if let (Some(ref cidr1), Some(ref cidr2)) = (&sub_opts.cidr1, &sub_opts.cidr2)
-    {
-        let cidr1 = cidrs
-            .iter()
-            .find(|c| &c.name == cidr1)
-            .ok_or_else(|| anyhow!("can't find cidr '{}'", cidr1))?;
-        let cidr2 = cidrs
-            .iter()
-            .find(|c| &c.name == cidr2)
-            .ok_or_else(|| anyhow!("can't find cidr '{}'", cidr2))?;
-        (cidr1, cidr2)
-    } else if let Some((cidr1, cidr2)) = prompts::add_association(&cidrs[..], &sub_opts)? {
-        (cidr1, cidr2)
-    } else {
-        log::info!("exiting without adding association.");
-        return Ok(());
-    };
-
-    rest_client
-        .http_form::<_, ()>(
-            "POST",
-            "/admin/associations",
-            AssociationContents {
-                cidr_id_1: association.0.id,
-                cidr_id_2: association.1.id,
-            },
-        )
-        .await?;
-
-    Ok(())
-}
-
-async fn delete_association(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: AddDeleteAssociationOpts,
-) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
-    log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
-
-    if let Some(association) =
-        prompts::delete_association(&associations[..], &cidrs[..], &sub_opts)?
-    {
-        rest_client
-            .http::<()>("DELETE", &format!("/admin/associations/{}", association.id))
-            .await?;
-    } else {
-        log::info!("exiting without adding association.");
-    }
-
-    Ok(())
-}
-
-async fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let rest_client = RestClient::for_interface(&config, &opts.data_dir, interface)?;
-
-    log::info!("Fetching CIDRs");
-    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs").await?;
-    log::info!("Fetching associations");
-    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations").await?;
-
-    for association in associations {
-        println!(
-            "{}: {} <=> {}",
-            association.id,
-            cidrs
-                .iter()
-                .find(|c| c.id == association.cidr_id_1)
-                .unwrap()
-                .name
-                .yellow(),
-            cidrs
-                .iter()
-                .find(|c| c.id == association.cidr_id_2)
-                .unwrap()
-                .name
-                .yellow()
-        );
-    }
-
     Ok(())
 }
 
@@ -1254,6 +977,14 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         interface: None,
     });
 
+    // Binds the config of the admin client of `interface`, and its client of the API.
+    macro_rules! admin_client {
+        ($interface:expr, $config:ident, $rest_client:ident) => {
+            let $config = InterfaceConfig::from_interface(&opts.config_dir, &$interface)?;
+            let $rest_client = RestClient::for_interface(&$config, &opts.data_dir, &$interface)?;
+        };
+    }
+
     match command {
         Command::Install {
             invite,
@@ -1304,41 +1035,71 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         Command::AddPeer {
             interface,
             sub_opts,
-        } => add_peer(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, config, rest_client);
+            admin::add_peer(&rest_client, &interface, &config.server, sub_opts).await?
+        },
         Command::RenamePeer {
             interface,
             sub_opts,
-        } => rename_peer(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::rename_peer(&rest_client, sub_opts).await?
+        },
         Command::AddCidr {
             interface,
             sub_opts,
-        } => add_cidr(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::add_cidr(&rest_client, sub_opts).await?
+        },
         Command::RenameCidr {
             interface,
             sub_opts,
-        } => rename_cidr(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::rename_cidr(&rest_client, sub_opts).await?
+        },
         Command::DeleteCidr {
             interface,
             sub_opts,
-        } => delete_cidr(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::delete_cidr(&rest_client, sub_opts).await?
+        },
         Command::ListCidrs { interface, tree } => list_cidrs(&interface, opts, tree)?,
         Command::DisablePeer {
             interface,
             sub_opts,
-        } => enable_or_disable_peer(&interface, opts, sub_opts, false).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::enable_or_disable_peer(&rest_client, sub_opts, false).await?
+        },
         Command::EnablePeer {
             interface,
             sub_opts,
-        } => enable_or_disable_peer(&interface, opts, sub_opts, true).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::enable_or_disable_peer(&rest_client, sub_opts, true).await?
+        },
         Command::AddAssociation {
             interface,
             sub_opts,
-        } => add_association(&interface, opts, sub_opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::add_association(&rest_client, sub_opts).await?
+        },
         Command::DeleteAssociation {
             interface,
             sub_opts,
-        } => delete_association(&interface, opts, sub_opts).await?,
-        Command::ListAssociations { interface } => list_associations(&interface, opts).await?,
+        } => {
+            admin_client!(interface, _config, rest_client);
+            admin::delete_association(&rest_client, sub_opts).await?
+        },
+        Command::ListAssociations { interface } => {
+            admin_client!(interface, _config, rest_client);
+            admin::list_associations(&rest_client).await?
+        },
         Command::SetListenPort {
             interface,
             sub_opts,

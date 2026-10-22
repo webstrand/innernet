@@ -118,7 +118,7 @@ impl ServerInfo {
 }
 
 impl InterfaceConfig {
-    fn new(interface: InterfaceInfo, server: ServerInfo) -> Self {
+    pub fn new(interface: InterfaceInfo, server: ServerInfo) -> Self {
         InterfaceConfig {
             interface,
             server,

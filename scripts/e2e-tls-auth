@@ -67,6 +67,21 @@ client() {
         >"$work/$peer.log" 2>&1 || { cat "$work/$peer.log" >&2; return 1; }
 }
 
+# Waits until the coordinator of the server in the namespace `$1`, whose config is `$2`, listens
+# for its API, which the admin commands of innernet-server reach it at.
+await_coordinator() { # <namespace> <config>
+    local port
+    port=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["listen-port"])' "$2")
+    for _ in $(seq 50); do
+        if ip netns exec "$1" ss -Hltn "sport = :$port" | grep -q .; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "FAIL: the coordinator in $1 doesn't listen" >&2
+    exit 1
+}
+
 db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
 
 # Serves a network in the background, recording the server's PID in $served. The server is
@@ -152,6 +167,9 @@ step "server"
 mkdir -p "$work/srv"
 server new --network-name e2e --network-cidr 10.66.0.0/16 \
     --external-endpoint 198.18.0.1:51820 --listen-port 51820 >/dev/null
+# The admin commands of innernet-server go through the running server's coordinator.
+serve srv "$E2E_BIN/innernet-server" "$work/srv" e2e "$work/srv.log"
+await_coordinator srv "$work/srv/conf/e2e.conf"
 server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
 for peer in a adm old new; do
     admin=false
@@ -162,7 +180,6 @@ done
 # The server issued old's invitation before it spoke TLS. The server latched the invitation, and
 # the operator cleared the latch, so that a client that predates TLS can redeem it.
 db "UPDATE peers SET tls = 0 WHERE name = 'old'"
-serve srv "$E2E_BIN/innernet-server" "$work/srv" e2e "$work/srv.log"
 server_key=$(invitation "$work/a.toml" server public-key)
 api=$(invitation "$work/a.toml" server internal-endpoint)
 

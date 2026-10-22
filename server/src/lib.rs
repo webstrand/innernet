@@ -1,9 +1,9 @@
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use colored::*;
 use coordinator::{Coordinator, Hooks, Sockets};
-use db::{DatabaseCidr, DatabasePeer};
+use db::DatabasePeer;
 use dialoguer::Confirm;
-use indoc::printdoc;
+use innernet_client_core::rest_client::{RestClient, RestError};
 use innernet_node::{
     addresses,
     events::{EventSource, TunnelEvent, TunnelEvents},
@@ -12,10 +12,8 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    interface_config::{DnsInfo, InterfaceInfo, PeerInvitation, ServerInfo, FEATURE_TLS},
-    prompts, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Error,
-    HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts, PeerContents, RenameCidrOpts,
-    RenamePeerOpts,
+    interface_config::{DnsInfo, InterfaceConfig, InterfaceInfo, ServerInfo, FEATURE_TLS},
+    prompts, wg, Error, HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts,
 };
 use ipnet::IpNet;
 use node::LocalLink;
@@ -32,7 +30,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use wireguard_control::{InterfaceName, Key, KeyPair};
+use wireguard_control::{InterfaceName, Key};
 
 mod api;
 mod coordinator;
@@ -171,170 +169,63 @@ fn open_database_connection(
     db::open(&database_path, config.network(), &server_key)
 }
 
-pub fn add_peer(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    opts: AddPeerOpts,
-) -> Result<(), Error> {
-    let config = ConfigFile::from_file(conf.config_path(interface))?;
-    let conn = open_database_connection(interface, conf)?;
-    let peers = DatabasePeer::list(&conn)?
-        .into_iter()
-        .map(|dp| dp.inner)
-        .collect::<Vec<_>>();
-    let cidrs = DatabaseCidr::list(&conn)?;
-    let cidr_tree = CidrTree::new(&cidrs[..]);
+/// The admin client of the coordinator of a network, which the running server serves: the
+/// server's own peer, an admin, over TLS, at the primary IP and the API port of its config. Every
+/// change of the network goes through the coordinator, so a command fails if the server isn't
+/// running.
+pub struct AdminClient {
+    interface: InterfaceName,
+    config: InterfaceConfig,
+}
 
-    if let Some((new_peer_info, target_path)) =
-        innernet_shared::prompts::gather_new_peer_info(&peers, &cidr_tree, &opts)?
-    {
-        let server_key = Key::from_base64(&config.private_key)?.get_public();
-        let server_peer = DatabasePeer::own(&conn, &server_key)?;
+impl AdminClient {
+    pub fn new(interface: &InterfaceName, conf: &ServerConfig) -> Result<Self, Error> {
+        let config = ConfigFile::from_file(conf.config_path(interface))?;
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_info = ServerInfo {
+        let server = ServerInfo {
+            public_key: Key::from_base64(&config.private_key)?
+                .get_public()
+                .to_base64(),
+            // Invitations name the coordinator at the endpoint of the server's own peer, which
+            // `new` records and the coordinator lists, in place of this one.
+            external_endpoint: internal_endpoint.into(),
+            internal_endpoint,
             features: vec![FEATURE_TLS.to_string()],
-            ..ServerInfo::new(&server_peer, internal_endpoint)
         };
-
-        let keypair = KeyPair::generate();
-        let peer_contents = new_peer_info.into_peer_contents(&keypair);
-        let peer = DatabasePeer::create(&conn, peer_contents)?;
-
-        let address = cidr_tree
-            .ip_net_for(peer.ip)
-            .expect("Peer's IpNet address to be valid because the peer was created successfully.");
-        let interface_info = InterfaceInfo::new(interface, &keypair, address);
-
-        let invitation = PeerInvitation::new(interface_info, server_info);
-        invitation.save_new(target_path)?;
-    } else {
-        println!("exited without creating peer.");
+        let own = InterfaceInfo {
+            network_name: interface.to_string(),
+            address: IpNet::new(config.address, config.network_cidr_prefix)?,
+            private_key: config.private_key,
+            listen_port: Some(config.listen_port),
+        };
+        Ok(Self {
+            interface: *interface,
+            config: InterfaceConfig::new(own, server),
+        })
     }
 
-    Ok(())
-}
-
-pub fn rename_peer(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    opts: RenamePeerOpts,
-) -> Result<(), Error> {
-    let conn = open_database_connection(interface, conf)?;
-    let peers = DatabasePeer::list(&conn)?
-        .into_iter()
-        .map(|dp| dp.inner)
-        .collect::<Vec<_>>();
-
-    if let Some((peer_request, old_name)) = innernet_shared::prompts::rename_peer(&peers, &opts)? {
-        let mut db_peer = DatabasePeer::list(&conn)?
-            .into_iter()
-            .find(|p| p.name == old_name)
-            .ok_or_else(|| anyhow!("Peer not found."))?;
-        db_peer.update(&conn, peer_request)?;
-    } else {
-        println!("exited without creating peer.");
+    /// The coordinator, as invitations name it.
+    pub fn server(&self) -> &ServerInfo {
+        &self.config.server
     }
 
-    Ok(())
-}
+    pub fn rest_client(&self) -> Result<RestClient<'_>, Error> {
+        Ok(RestClient::new(&self.config, true)?)
+    }
 
-pub fn enable_or_disable_peer(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    enable: bool,
-    opts: EnableDisablePeerOpts,
-) -> Result<(), Error> {
-    let conn = open_database_connection(interface, conf)?;
-    let peers = DatabasePeer::list(&conn)?
-        .into_iter()
-        .map(|dp| dp.inner)
-        .collect::<Vec<_>>();
-
-    if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &opts, enable)? {
-        let mut db_peer = DatabasePeer::get(&conn, peer.id)?;
-        db_peer.update(
-            &conn,
-            PeerContents {
-                is_disabled: !enable,
-                ..peer.contents.clone()
+    /// `error`, which a command met, explained if the coordinator didn't answer.
+    pub fn explain(&self, error: Error) -> Error {
+        match error.downcast_ref::<RestError>() {
+            Some(rest) if rest.is_transport_error() => {
+                let interface = self.interface.as_str_lossy();
+                error.context(format!(
+                    "the coordinator of {interface} doesn't answer; `innernet-server serve \
+                     {interface}` must be running"
+                ))
             },
-        )?;
-    } else {
-        log::info!("exiting without enabling or disabling peer.");
+            _ => error,
+        }
     }
-
-    Ok(())
-}
-
-pub fn add_cidr(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    opts: AddCidrOpts,
-) -> Result<(), Error> {
-    let conn = open_database_connection(interface, conf)?;
-    let cidrs = DatabaseCidr::list(&conn)?;
-    if let Some(cidr_request) = innernet_shared::prompts::add_cidr(&cidrs, &opts)? {
-        let cidr = DatabaseCidr::create(&conn, cidr_request)?;
-        printdoc!(
-            "
-            CIDR \"{cidr_name}\" added.
-
-            Right now, peers within {cidr_name} can only see peers in the same CIDR, and in
-            the special \"innernet-server\" CIDR that includes the innernet server peer.
-
-            You'll need to add more associations for peers in diffent CIDRs to communicate.
-            ",
-            cidr_name = cidr.name.bold()
-        );
-    } else {
-        println!("exited without creating CIDR.");
-    }
-
-    Ok(())
-}
-
-pub fn rename_cidr(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    opts: RenameCidrOpts,
-) -> Result<(), Error> {
-    let conn = open_database_connection(interface, conf)?;
-    let cidrs = DatabaseCidr::list(&conn)?;
-
-    if let Some((cidr_request, old_name)) = innernet_shared::prompts::rename_cidr(&cidrs, &opts)? {
-        let db_cidr = DatabaseCidr::list(&conn)?
-            .into_iter()
-            .find(|c| c.name == old_name)
-            .ok_or_else(|| anyhow!("CIDR not found."))?;
-        db::DatabaseCidr::from(db_cidr).update(&conn, cidr_request)?;
-    } else {
-        println!("exited without renaming CIDR.");
-    }
-
-    Ok(())
-}
-
-pub fn delete_cidr(
-    interface: &InterfaceName,
-    conf: &ServerConfig,
-    args: DeleteCidrOpts,
-) -> Result<(), Error> {
-    println!("Fetching eligible CIDRs");
-    let conn = open_database_connection(interface, conf)?;
-    let cidrs = DatabaseCidr::list(&conn)?;
-    let peers = DatabasePeer::list(&conn)?
-        .into_iter()
-        .map(|dp| dp.inner)
-        .collect::<Vec<_>>();
-
-    let cidr_id = prompts::delete_cidr(&cidrs, &peers, &args)?;
-
-    println!("Deleting CIDR...");
-    DatabaseCidr::delete(&conn, cidr_id)?;
-
-    println!("CIDR deleted.");
-
-    Ok(())
 }
 
 pub fn uninstall(
