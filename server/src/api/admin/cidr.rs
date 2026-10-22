@@ -150,7 +150,7 @@ mod tests {
     /// The path of the CIDR `cidr` in the API of TLS sessions.
     fn path(cidr: &str) -> Result<String, Error> {
         Ok(format!(
-            "/v1/admin/cidrs/{}",
+            "/admin/cidrs/{}",
             cidr.parse::<Prefix>()?.api_path_segment()
         ))
     }
@@ -195,7 +195,7 @@ mod tests {
         let contents = cidr("experimental", test::EXPERIMENTAL_CIDR)?;
 
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", &contents)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/cidrs", &contents)
             .await;
 
         assert_eq!(res.status(), 201);
@@ -208,7 +208,7 @@ mod tests {
 
         // The CIDR is listed without an ID or a parent, and is found by its prefix.
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/cidrs")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/cidrs")
             .await;
         let body = hyper::body::to_bytes(res.into_body()).await?;
         let listed: Vec<Cidr> = cbor::from_slice(&body)?;
@@ -221,7 +221,7 @@ mod tests {
         // A misaligned prefix is refused.
         let misaligned = serde_json::json!({ "name": "loose", "cidr": "10.80.2.5/24" });
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", misaligned)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/cidrs", misaligned)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
@@ -234,13 +234,13 @@ mod tests {
 
         let contents = cidr("experimental", test::EXPERIMENTAL_CIDR)?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", &contents)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/cidrs", &contents)
             .await;
         assert!(res.status().is_success());
 
         let contents = cidr("experimental", test::EXPERIMENTAL_SUBCIDR)?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", &contents)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/cidrs", &contents)
             .await;
         assert!(!res.status().is_success());
 
@@ -254,7 +254,7 @@ mod tests {
         let contents = cidr("experimental", test::EXPERIMENTAL_CIDR)?;
 
         let res = server
-            .form_request(test::USER1_PEER_IP, "POST", "/v1/admin/cidrs", &contents)
+            .form_request(test::USER1_PEER_IP, "POST", "/admin/cidrs", &contents)
             .await;
         assert!(!res.status().is_success());
 
@@ -270,7 +270,7 @@ mod tests {
             .form_request(
                 test::ADMIN_PEER_IP,
                 "POST",
-                "/v1/admin/cidrs",
+                "/admin/cidrs",
                 cidr("experimental", test::EXPERIMENTAL_CIDR)?,
             )
             .await;
@@ -308,7 +308,7 @@ mod tests {
         };
         let contents = cidr("experimental", holding)?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/cidrs", &contents)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/cidrs", &contents)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
@@ -382,9 +382,9 @@ mod tests {
             .await;
         test::problem(res, &problem::NO_SUCH_CIDR).await?;
         for path in [
-            format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR_ID),
-            format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR),
-            format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR.replace('/', "-")),
+            format!("/admin/cidrs/{}", test::DEVELOPER_CIDR_ID),
+            format!("/admin/cidrs/{}", test::DEVELOPER_CIDR),
+            format!("/admin/cidrs/{}", test::DEVELOPER_CIDR.replace('/', "-")),
         ] {
             let res = put(&server, &path, &current).await;
             test::blank_problem(res, StatusCode::NOT_FOUND).await?;

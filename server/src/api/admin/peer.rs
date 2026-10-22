@@ -323,7 +323,7 @@ mod tests {
         };
 
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
 
         assert_eq!(res.status(), StatusCode::CREATED);
@@ -355,7 +355,7 @@ mod tests {
         let mut invalid = serde_json::to_value(test::developer_peer_contents("developer3", ip)?)?;
         invalid["name"] = "devel oper".into();
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &invalid)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &invalid)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
@@ -392,7 +392,7 @@ mod tests {
         let peer = test::developer_peer_contents("developer2", ip)?;
 
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -415,7 +415,7 @@ mod tests {
         let peer = test::developer_peer_contents("developer3", test::DEVELOPER2_PEER_IP)?;
 
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
 
         let problem = test::problem(res, &problem::DELEGATION_REFUSED).await?;
@@ -461,7 +461,7 @@ mod tests {
         for (ip, reason) in refused {
             let peer = test::developer_peer_contents("developer3", ip)?;
             let res = server
-                .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+                .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
                 .await;
             let problem = test::problem(res, &problem::DELEGATION_REFUSED).await?;
             assert!(problem.detail.unwrap().contains(reason), "{ip}");
@@ -489,7 +489,7 @@ mod tests {
         };
         let peer = test::peer_contents("developer3", ip, false)?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
         let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
         assert!(detail.contains("child CIDR"), "{detail}");
@@ -509,7 +509,7 @@ mod tests {
 
         // Try to create a new developer peer from a user peer.
         let res = server
-            .form_request(test::USER1_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::USER1_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
 
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -523,7 +523,7 @@ mod tests {
 
     /// The path of the peer `id` in the API of TLS sessions.
     fn key_path(server: &test::Server, id: i64) -> String {
-        format!("/v1/admin/peers/{}", peer(server, id).api_path_segment())
+        format!("/admin/peers/{}", peer(server, id).api_path_segment())
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
             public_key: KeyPair::generate().public.to_base64(),
             ..new_peer.inner.clone()
         };
-        let path = format!("/v1/admin/peers/{}", unknown.api_path_segment());
+        let path = format!("/admin/peers/{}", unknown.api_path_segment());
         let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
         test::problem(res, &problem::NO_SUCH_PEER).await?;
         let res = server
@@ -675,7 +675,7 @@ mod tests {
                 .form_request(
                     test::ADMIN_PEER_IP,
                     "POST",
-                    "/v1/admin/peers",
+                    "/admin/peers",
                     with(&delegations)?,
                 )
                 .await;
@@ -686,7 +686,7 @@ mod tests {
         // A peer is created with every delegation it is offered.
         let peer = with(&[wider, &host])?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
         assert_eq!(res.status(), StatusCode::CREATED);
         let created: PeerContents = test::cbor_body(res).await?;
@@ -946,7 +946,7 @@ mod tests {
             public_key: KeyPair::generate().public.to_base64(),
             ..without.inner.clone()
         };
-        let unknown_path = format!("/v1/admin/peers/{}/delegations", unknown.api_path_segment());
+        let unknown_path = format!("/admin/peers/{}/delegations", unknown.api_path_segment());
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", &unknown_path)
             .await;
@@ -1061,7 +1061,7 @@ mod tests {
 
         // Any other path under a peer is not found, rather than routed to the peer itself, and
         // the endpoints are not reached by ID.
-        let id_path = format!("/v1/admin/peers/{}/endpoints", test::DEVELOPER1_PEER_ID);
+        let id_path = format!("/admin/peers/{}/endpoints", test::DEVELOPER1_PEER_ID);
         for path in [
             format!("{peer_path}/other"),
             format!("{path}/other"),
@@ -1101,7 +1101,7 @@ mod tests {
             ..test::developer_peer_contents("invitee", ip)?
         };
         let invitee = DatabasePeer::create(&server.db.lock(), contents)?;
-        let path = format!("/v1/admin/peers/{}", invitee.api_path_segment());
+        let path = format!("/admin/peers/{}", invitee.api_path_segment());
         let mut change = unchanged(&server, &path).await;
         change.name = Some("renamed".parse().unwrap());
 
@@ -1125,7 +1125,7 @@ mod tests {
     async fn test_tls_sessions_refuse_ids() -> Result<(), Error> {
         let server = test::Server::new()?;
         let old_peer = peer(&server, test::DEVELOPER1_PEER_ID);
-        let id_path = format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID);
+        let id_path = format!("/admin/peers/{}", test::DEVELOPER1_PEER_ID);
 
         let change = PeerContents {
             name: Some("new-peer-name".parse().unwrap()),
@@ -1172,7 +1172,7 @@ mod tests {
 
         // Once it has connected over TLS, it can be.
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(promote().await.status(), StatusCode::NO_CONTENT);
@@ -1192,7 +1192,7 @@ mod tests {
         // A low-order point.
         peer.public_key = Key([0; 32]).to_base64();
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &peer)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         Ok(())
@@ -1202,7 +1202,7 @@ mod tests {
     async fn test_list_all_peers_from_admin() -> Result<(), Error> {
         let server = test::Server::new()?;
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/peers")
             .await;
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -1243,7 +1243,7 @@ mod tests {
 
         // The admin API lists and creates peers without IDs.
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/peers")
             .await;
         let peers = cbor(res).await;
         assert_eq!(peers.as_array().unwrap().len(), 6);
@@ -1254,7 +1254,7 @@ mod tests {
             .all(|peer| peer.get("id").is_none()));
         let contents = test::developer_peer_contents("developer3", ip)?;
         let res = server
-            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &contents)
+            .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &contents)
             .await;
         assert_eq!(res.status(), StatusCode::CREATED);
         assert!(cbor(res).await.get("id").is_none());
@@ -1265,7 +1265,7 @@ mod tests {
     async fn test_list_all_peers_from_non_admin() -> Result<(), Error> {
         let server = test::Server::new()?;
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/admin/peers")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/admin/peers")
             .await;
 
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -1280,14 +1280,14 @@ mod tests {
         let server = test::Server::new()?;
         server.predate_tls(test::ADMIN_PEER_ID);
         let old_peers = DatabasePeer::list(&server.db().lock())?;
-        let peer_path = format!("/v1/admin/peers/{}", test::USER1_PEER_ID);
+        let peer_path = format!("/admin/peers/{}", test::USER1_PEER_ID);
         for (method, path) in [
-            ("GET", "/v1/admin/peers"),
-            ("POST", "/v1/admin/peers"),
+            ("GET", "/admin/peers"),
+            ("POST", "/admin/peers"),
             ("PUT", &peer_path),
             ("DELETE", &peer_path),
-            ("GET", "/v1/admin/cidrs"),
-            ("GET", "/v1/admin/associations"),
+            ("GET", "/admin/cidrs"),
+            ("GET", "/admin/associations"),
         ] {
             let res = server
                 .plain_request(test::ADMIN_PEER_IP, method, path)
@@ -1333,7 +1333,7 @@ mod tests {
 
         // Over TLS, a peer without a name has a null name.
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/peers")
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = hyper::body::to_bytes(res.into_body()).await?;
@@ -1353,7 +1353,7 @@ mod tests {
             2
         );
         let res = server
-            .request(test::USER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::USER1_PEER_IP, "GET", "/user/state")
             .await;
         let state: State = test::cbor_body(res).await?;
         assert_eq!(state.peers.iter().filter(|p| p.name.is_none()).count(), 2);

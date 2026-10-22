@@ -185,7 +185,7 @@ mod tests {
     async fn test_get_state_from_developer1() -> Result<(), Error> {
         let server = test::Server::new()?;
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -212,7 +212,7 @@ mod tests {
 
         // The state is sent in the deterministic encoding of CBOR, so that it encodes again to
         // the same bytes, in the version that the request accepts.
-        let res = server.request(ip, "GET", "/v1/user/state").await;
+        let res = server.request(ip, "GET", "/user/state").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers()["Content-Type"],
@@ -236,7 +236,7 @@ mod tests {
             ("application/vnd.innernet+cbor; version=2", cbor.clone()),
             ("application/vnd.innernet+cbor; version=01", cbor.clone()),
         ] {
-            let req = server.body_request("PUT", "/v1/user/candidates", content_type, body);
+            let req = server.body_request("PUT", "/user/candidates", content_type, body);
             let res = server.raw_request(ip, req).await;
             assert_eq!(
                 res.status(),
@@ -244,11 +244,11 @@ mod tests {
                 "{content_type}"
             );
         }
-        let mut req = server.body_request("PUT", "/v1/user/candidates", "", cbor.clone());
+        let mut req = server.body_request("PUT", "/user/candidates", "", cbor.clone());
         req.headers_mut().remove("Content-Type");
         let res = server.raw_request(ip, req).await;
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        let req = server.body_request("GET", "/v1/user/state", "application/json", vec![]);
+        let req = server.body_request("GET", "/user/state", "application/json", vec![]);
         let res = server.raw_request(ip, req).await;
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
@@ -256,12 +256,12 @@ mod tests {
         // the array in two bytes rather than one.
         let mut longer = vec![0x98, 0x01];
         longer.extend_from_slice(&cbor[1..]);
-        let req = server.body_request("PUT", "/v1/user/candidates", &test::content_type(), longer);
+        let req = server.body_request("PUT", "/user/candidates", &test::content_type(), longer);
         let res = server.raw_request(ip, req).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         let content_type = "Application/VND.innernet+CBOR; Version=\"1\"";
-        let req = server.body_request("PUT", "/v1/user/candidates", content_type, cbor);
+        let req = server.body_request("PUT", "/user/candidates", content_type, cbor);
         let res = server.raw_request(ip, req).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
@@ -281,7 +281,7 @@ mod tests {
         let server = test::Server::new()?;
         let ip = test::DEVELOPER1_PEER_IP;
         let get = |accept: Option<&str>| {
-            let mut req = server.body_request("GET", "/v1/user/state", "", vec![]);
+            let mut req = server.body_request("GET", "/user/state", "", vec![]);
             req.headers_mut().remove("Content-Type");
             req.headers_mut().remove("Accept");
             if let Some(accept) = accept {
@@ -343,7 +343,7 @@ mod tests {
         for accept in [None, Some("*/*"), Some(ours)] {
             let mut req = server.body_request(
                 "PUT",
-                "/v1/user/candidates",
+                "/user/candidates",
                 &test::content_type(),
                 cbor.clone(),
             );
@@ -354,7 +354,7 @@ mod tests {
             let res = server.raw_request(ip, req).await;
             assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE, "{accept:?}");
         }
-        let req = server.body_request("PUT", "/v1/user/candidates", &test::content_type(), cbor);
+        let req = server.body_request("PUT", "/user/candidates", &test::content_type(), cbor);
         let res = server.raw_request(ip, req).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
@@ -368,10 +368,10 @@ mod tests {
             cidr_2: test::DEVELOPER_CIDR.parse()?,
         };
         let res = server
-            .form_request(admin, "POST", "/v1/admin/associations", association)
+            .form_request(admin, "POST", "/admin/associations", association)
             .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let path = format!("/v1/admin/associations/{}", association.api_path());
+        let path = format!("/admin/associations/{}", association.api_path());
         let delete = |accept: &str, content_type: Option<String>| {
             let mut req = server.body_request("DELETE", &path, "", vec![]);
             req.headers_mut().remove("Content-Length");
@@ -394,6 +394,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paths_by_transport() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        server.predate_tls(test::DEVELOPER2_PEER_ID);
+
+        // The API of TLS sessions has no version in its paths, and that of plain-HTTP sessions
+        // stays under /v1, as clients that predate TLS know it.
+        let ip = test::DEVELOPER1_PEER_IP;
+        let res = server.request(ip, "GET", "/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = server.request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_state_has_ids_only_in_plain_http() -> Result<(), Error> {
         let server = test::Server::new()?;
         server.predate_tls(test::DEVELOPER2_PEER_ID);
@@ -404,7 +427,7 @@ mod tests {
             peers: Vec<std::collections::BTreeMap<String, serde::de::IgnoredAny>>,
         }
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         let Fields { peers } = test::cbor_body(res).await?;
@@ -461,7 +484,7 @@ mod tests {
             [wireguard_control::Key::from_base64(&developer2.public_key)?.0],
         )?;
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
         let State { peers, .. } = test::cbor_body(res).await?;
         assert!(!peers.is_empty());
@@ -470,7 +493,7 @@ mod tests {
             .all(|peer| peer.public_key != developer2.public_key));
 
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/peers")
             .await;
         let peers: Vec<PeerContents> = test::cbor_body(res).await?;
         let listed = peers
@@ -498,7 +521,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/endpoint",
+                    "/user/endpoint",
                     &EndpointContents::Set("1.1.1.1:51820".parse().unwrap())
                 )
                 .await
@@ -512,7 +535,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/endpoint",
+                    "/user/endpoint",
                     &EndpointContents::Unset,
                 )
                 .await
@@ -525,7 +548,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/endpoint",
+                    "/user/endpoint",
                     "endpoint=blah",
                 )
                 .await
@@ -575,7 +598,7 @@ mod tests {
         }
 
         for ip in &[test::DEVELOPER1_PEER_IP, test::EXPERIMENT_SUBCIDR_PEER_IP] {
-            let res = server.request(ip, "GET", "/v1/user/state").await;
+            let res = server.request(ip, "GET", "/user/state").await;
             assert_eq!(res.status(), StatusCode::OK);
             let State { peers, .. } = test::cbor_body(res).await?;
             let mut peer_names = peers
@@ -616,7 +639,7 @@ mod tests {
 
         // Step 1: Ensure that before redeeming, other endpoints aren't yet accessible.
         let res = server
-            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/v1/user/state")
+            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
@@ -628,7 +651,7 @@ mod tests {
             .form_request(
                 test::EXPERIMENT_SUBCIDR_PEER_IP,
                 "POST",
-                "/v1/user/redeem",
+                "/user/redeem",
                 &body,
             )
             .await;
@@ -639,7 +662,7 @@ mod tests {
             .form_request(
                 test::EXPERIMENT_SUBCIDR_PEER_IP,
                 "POST",
-                "/v1/user/redeem",
+                "/user/redeem",
                 &body,
             )
             .await;
@@ -647,7 +670,7 @@ mod tests {
 
         // Step 3: Ensure that after redemption, fetching state works.
         let res = server
-            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/v1/user/state")
+            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         Ok(())
@@ -671,7 +694,7 @@ mod tests {
 
         // Step 1: Ensure that before redeeming, other endpoints aren't yet accessible.
         let res = server
-            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/v1/user/state")
+            .request(test::EXPERIMENT_SUBCIDR_PEER_IP, "GET", "/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
@@ -683,7 +706,7 @@ mod tests {
             .form_request(
                 test::EXPERIMENT_SUBCIDR_PEER_IP,
                 "POST",
-                "/v1/user/redeem",
+                "/user/redeem",
                 &body,
             )
             .await;
@@ -717,9 +740,7 @@ mod tests {
                 .plain_form_request(ip, "POST", "/v1/user/redeem", &body)
                 .await;
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-            let res = server
-                .form_request(ip, "POST", "/v1/user/redeem", &body)
-                .await;
+            let res = server.form_request(ip, "POST", "/user/redeem", &body).await;
             assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
             // The redeemed peer keeps the invitation's latch.
@@ -766,9 +787,7 @@ mod tests {
         let body = RedeemContents {
             public_key: wireguard_control::Key(low_order).to_base64(),
         };
-        let res = server
-            .form_request(ip, "POST", "/v1/user/redeem", &body)
-            .await;
+        let res = server.form_request(ip, "POST", "/user/redeem", &body).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         Ok(())
     }
@@ -786,7 +805,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/candidates",
+                    "/user/candidates",
                     &candidates
                 )
                 .await
@@ -795,7 +814,7 @@ mod tests {
         );
 
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -823,7 +842,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/candidates",
+                    "/user/candidates",
                     &candidates
                 )
                 .await
@@ -832,7 +851,7 @@ mod tests {
         );
 
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -857,7 +876,7 @@ mod tests {
                 .form_request(
                     test::DEVELOPER1_PEER_IP,
                     "PUT",
-                    "/v1/user/endpoint",
+                    "/user/endpoint",
                     &EndpointContents::Set("1.2.3.4:51820".parse().unwrap())
                 )
                 .await
@@ -866,7 +885,7 @@ mod tests {
         );
 
         let res = server
-            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/user/state")
             .await;
 
         assert_eq!(res.status(), StatusCode::OK);

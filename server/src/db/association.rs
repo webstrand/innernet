@@ -112,7 +112,7 @@ mod tests {
             server.form_request(
                 test::ADMIN_PEER_IP,
                 "POST",
-                "/v1/admin/associations",
+                "/admin/associations",
                 association,
             )
         };
@@ -129,23 +129,23 @@ mod tests {
         assert!(res.status().is_client_error());
 
         let res = server
-            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/associations")
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/associations")
             .await;
         let listed: Vec<Association> = test::cbor_body(res).await?;
         assert_eq!(listed, [flipped]);
 
         // A deletion names the CIDRs in either order, and an unknown association is not found.
-        let path = format!("/v1/admin/associations/{}", association.api_path());
+        let path = format!("/admin/associations/{}", association.api_path());
         let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
         test::problem(res, &innernet_shared::problem::NO_SUCH_ASSOCIATION).await?;
         // A path that names no pair of prefixes is no route of the server.
         for path in [
-            "/v1/admin/associations/1",
-            &format!("/v1/admin/associations/{}", user.api_path_segment()),
+            "/admin/associations/1",
+            &format!("/admin/associations/{}", user.api_path_segment()),
             &format!(
-                "/v1/admin/associations/{}/{}/x",
+                "/admin/associations/{}/{}/x",
                 user.api_path_segment(),
                 developer.api_path_segment()
             ),

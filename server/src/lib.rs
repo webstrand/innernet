@@ -429,10 +429,17 @@ fn get_listener(addr: SocketAddr, _interface: &InterfaceName) -> Result<TcpListe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test;
+    use crate::{coordinator::serve_api, test};
     use anyhow::Result;
     use hyper::{Body, Request, StatusCode};
+    use innernet_shared::{tls, INNERNET_PUBKEY_HEADER};
     use std::path::Path;
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        net::TcpStream,
+    };
+    use tokio_rustls::rustls;
+    use wireguard_control::KeyPair;
 
     #[test]
     fn test_init_wizard() -> Result<(), Error> {
@@ -461,6 +468,182 @@ mod tests {
         Ok(())
     }
 
+    async fn requires_tls(server: &test::Server, id: i64) -> bool {
+        test::peer(&server.db.lock(), id).requires_tls
+    }
+
+    #[tokio::test]
+    async fn test_tls_latch() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        server.predate_tls(test::DEVELOPER1_PEER_ID);
+        server.predate_tls(test::DEVELOPER2_PEER_ID);
+        let ip = test::DEVELOPER1_PEER_IP;
+
+        // A peer from before TLS that has never connected over TLS is identified by its IP...
+        assert!(!requires_tls(&server, test::DEVELOPER1_PEER_ID).await);
+        let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!requires_tls(&server, test::DEVELOPER1_PEER_ID).await);
+
+        // ...until it does, after which it must always.
+        let res = server.request(ip, "GET", "/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(requires_tls(&server, test::DEVELOPER1_PEER_ID).await);
+
+        let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert!(String::from_utf8_lossy(&body).contains("TLS"));
+
+        // Other peers are unaffected.
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_errors_by_transport() -> Result<(), Error> {
+        let server = test::Server::new()?;
+
+        // A TLS session is told of errors in problem details, in deterministic CBOR. An error
+        // without a meaning of innernet's own is of the type about:blank.
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", "/admin/nothing")
+            .await;
+        assert_eq!(
+            res.headers()[hyper::header::CONTENT_TYPE],
+            "application/problem+cbor"
+        );
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let problem: innernet_shared::problem::Problem = innernet_shared::cbor::from_slice(&body)?;
+        assert_eq!(innernet_shared::cbor::to_vec(&problem)?, body);
+        assert_eq!(
+            problem,
+            innernet_shared::problem::Problem::about_blank(404, Some("Not Found"))
+        );
+        for (ip, path, status) in [
+            (test::ADMIN_PEER_IP, "/v1/user/state", StatusCode::NOT_FOUND),
+            (
+                test::USER1_PEER_IP,
+                "/admin/peers",
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let res = server.request(ip, "GET", path).await;
+            test::blank_problem(res, status).await?;
+        }
+
+        // A request that chooses the debug view is told of errors in the debug view too, even a
+        // change, which the debug view doesn't answer.
+        for (method, path, status) in [
+            ("GET", "/admin/nothing", StatusCode::NOT_FOUND),
+            ("PUT", "/user/candidates", StatusCode::NOT_ACCEPTABLE),
+        ] {
+            let mut req = server.body_request(method, path, &test::content_type(), vec![0x80]);
+            req.headers_mut()
+                .insert(hyper::header::ACCEPT, "*/*".parse().unwrap());
+            let res = server.raw_request(test::ADMIN_PEER_IP, req).await;
+            assert_eq!(res.status(), status);
+            assert_eq!(
+                res.headers()[hyper::header::CONTENT_TYPE],
+                "application/problem+cbor-diagnostic"
+            );
+            let body = hyper::body::to_bytes(res.into_body()).await?;
+            let text = String::from_utf8(body.to_vec())?;
+            assert!(
+                text.starts_with(
+                    "# unstable debug view; use Accept: application/vnd.innernet+cbor; \
+                     version=1\n{"
+                ),
+                "{text}"
+            );
+            assert!(text.contains("\"type\": \"about:blank\""), "{text}");
+        }
+
+        // A request that accepts no version is told so in CBOR.
+        let mut req = server.body_request("GET", "/user/state", "", vec![]);
+        req.headers_mut().remove(hyper::header::CONTENT_TYPE);
+        req.headers_mut().insert(
+            hyper::header::ACCEPT,
+            "application/vnd.innernet+cbor; version=2".parse().unwrap(),
+        );
+        let res = server.raw_request(test::ADMIN_PEER_IP, req).await;
+        test::blank_problem(res, StatusCode::NOT_ACCEPTABLE).await?;
+
+        // A plain-HTTP session is told of errors as before: with an explanation in plain text
+        // for those that clients that predate TLS can't make sense of, and an empty body
+        // otherwise, without a content type.
+        server.predate_tls(test::USER1_PEER_ID);
+        let res = server
+            .plain_request(test::USER1_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().get(hyper::header::CONTENT_TYPE).is_none());
+        assert!(hyper::body::to_bytes(res.into_body()).await?.is_empty());
+        let res = server
+            .plain_request(test::USER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(hyper::header::CONTENT_TYPE).is_none());
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert_eq!(body, ServerError::TlsRequired.to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peers_require_tls_from_creation() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        for (id, ip) in [
+            (test::ADMIN_PEER_ID, test::ADMIN_PEER_IP),
+            (test::DEVELOPER1_PEER_ID, test::DEVELOPER1_PEER_IP),
+        ] {
+            assert!(requires_tls(&server, id).await);
+            let res = server.plain_request(ip, "GET", "/v1/user/state").await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            let res = server.request(ip, "GET", "/user/state").await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_authentication_by_delegated_address() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let (prefix, within) = if cfg!(feature = "v6-test") {
+            ("fd00:1337::2:0:1:0/112", "fd00:1337::2:0:1:5")
+        } else {
+            ("10.80.64.16/28", "10.80.64.20")
+        };
+        server.delegate(test::DEVELOPER1_PEER_ID, prefix);
+        let developer1 = test::peer(&server.db.lock(), test::DEVELOPER1_PEER_ID);
+        let key = Key::from_base64(&developer1.public_key)?;
+        let request = || {
+            Request::builder()
+                .uri("/user/state")
+                .header(INNERNET_PUBKEY_HEADER, server_key(&server))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Over TLS, the peer's key is accepted from any address of its delegations.
+        let res = server
+            .raw_request_as(within, Some(key.clone()), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = server
+            .raw_request_as(test::DEVELOPER2_PEER_IP, Some(key), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // In plain HTTP, any address of its delegations identifies the peer.
+        server.predate_tls(test::DEVELOPER1_PEER_ID);
+        let res = server.plain_request(within, "GET", "/v1/user/state").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
+
     #[test]
     fn test_internal_address_lies_in_the_server_delegation() -> Result<(), Error> {
         let server = test::Server::new()?;
@@ -472,6 +655,133 @@ mod tests {
         let error = check_internal_address(&myself, test::ADMIN_PEER_IP.parse()?).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_key_must_match_peer_and_ip() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let admin_key = {
+            let admin = test::peer(&server.db.lock(), test::ADMIN_PEER_ID);
+            Key::from_base64(&admin.public_key)?
+        };
+        let request = || {
+            let path = if cfg!(feature = "v6-test") {
+                format!("http://[{}]/admin/peers", test::WG_MANAGE_PEER_IP)
+            } else {
+                format!("http://{}/admin/peers", test::WG_MANAGE_PEER_IP)
+            };
+            Request::builder()
+                .uri(path)
+                .header(INNERNET_PUBKEY_HEADER, server_key(&server))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // The admin's key from another peer's IP.
+        let res = server
+            .raw_request_as(test::USER1_PEER_IP, Some(admin_key.clone()), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // An unknown key from the admin's IP.
+        let unknown = KeyPair::generate().public;
+        let res = server
+            .raw_request_as(test::ADMIN_PEER_IP, Some(unknown), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = server
+            .raw_request_as(test::ADMIN_PEER_IP, Some(admin_key), request())
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // A user peer connecting over TLS gains nothing beyond its own rights.
+        let res = server
+            .request(test::USER1_PEER_IP, "GET", "/admin/peers")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Sends a request for `path` on a raw stream and returns the response's status line.
+    async fn status_line<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        server_key: &str,
+        path: &str,
+    ) -> String {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: innernet\r\n{INNERNET_PUBKEY_HEADER}: \
+             {server_key}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_serves_tls_and_plain_http_on_one_port() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let server_tls_key = KeyPair::generate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(serve_api(
+            listener,
+            server.context(),
+            tls::server_config(&server_tls_key.private.to_base64())?,
+        ));
+
+        // A peer whose private key is known, at an IP other than the loopback's.
+        let peer_key = KeyPair::generate();
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:9"
+        } else {
+            "10.80.64.9"
+        };
+        let mut contents = test::developer_peer_contents("developer3", ip)?;
+        contents.public_key = peer_key.public.to_base64();
+        let peer = DatabasePeer::create(&server.db.lock(), contents)?;
+        server.predate_tls_key(&peer.public_key);
+
+        let header_key = server_key(&server);
+        let connect_tls = |client: &KeyPair, pinned: &Key| {
+            let config = tls::client_config(&client.private.to_base64(), &pinned.to_base64());
+            let connector = tokio_rustls::TlsConnector::from(config.unwrap());
+            async move {
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+                connector.connect(name, stream).await
+            }
+        };
+
+        // Plain HTTP is still served; nothing is at the loopback's IP.
+        let plain = TcpStream::connect(addr).await?;
+        assert_eq!(
+            status_line(plain, &header_key, "/v1/user/state").await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+
+        // TLS is served on the same port. The peer's key is accepted by the handshake, but not
+        // from an IP other than its own, and that doesn't latch it.
+        let tls = connect_tls(&peer_key, &server_tls_key.public).await?;
+        assert_eq!(
+            status_line(tls, &header_key, "/user/state").await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+        assert!(!peer.reload(&server.db.lock())?.requires_tls);
+
+        // A client pinning another server key refuses the handshake.
+        let wrong = KeyPair::generate().public;
+        assert!(connect_tls(&peer_key, &wrong).await.is_err());
+        Ok(())
+    }
+
+    fn server_key(server: &test::Server) -> String {
+        server.context().public_key.to_base64()
     }
 
     #[tokio::test]

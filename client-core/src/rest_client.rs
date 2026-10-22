@@ -568,7 +568,7 @@ impl<'a> RestClient<'a> {
                     .into_plain_body()
                     .map(|body| (Transport::Plain, body));
             }
-            let request = request(format!("/v1{endpoint}"), Transport::Tls)?;
+            let request = request(endpoint.to_string(), Transport::Tls)?;
             match timed(self.tls_exchange(request)).await {
                 // The server authenticated with its key and answered over TLS.
                 Ok(answer) => {
@@ -1378,19 +1378,19 @@ mod tests {
         assert!(requests
             .recv()
             .unwrap()
-            .starts_with("GET /v1/user/capabilities "));
+            .starts_with("GET /user/capabilities "));
 
         // The client reads the peer by key, and changes it with the tag it read.
         let segment = peer.api_path_segment();
         assert!(!segment.contains(['+', '/']));
         let get = requests.recv().unwrap();
         assert!(
-            get.starts_with(&format!("GET /v1/admin/peers/{segment} ")),
+            get.starts_with(&format!("GET /admin/peers/{segment} ")),
             "{get}"
         );
         let put = requests.recv().unwrap();
         assert!(
-            put.starts_with(&format!("PUT /v1/admin/peers/{segment} ")),
+            put.starts_with(&format!("PUT /admin/peers/{segment} ")),
             "{put}"
         );
         let body: PeerUpdate = put.cbor();
@@ -1680,7 +1680,7 @@ mod tests {
 
         // The client reads the delegations with their tag, and replaces them with the tag.
         client.set_delegations(&peer, wider.clone()).await.unwrap();
-        let path = format!("/v1/admin/peers/{}/delegations", peer.api_path_segment());
+        let path = format!("/admin/peers/{}/delegations", peer.api_path_segment());
         assert!(requests
             .recv()
             .unwrap()
@@ -1726,9 +1726,9 @@ mod tests {
         // tag, and renames it with the tag it read.
         client.rename_cidr(&users, "people").await.unwrap();
         let get = requests.recv().unwrap();
-        assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
+        assert!(get.starts_with("GET /admin/cidrs/10.0.1.0_24 "), "{get}");
         let put = requests.recv().unwrap();
-        assert!(put.starts_with("PUT /v1/admin/cidrs/10.0.1.0_24 "), "{put}");
+        assert!(put.starts_with("PUT /admin/cidrs/10.0.1.0_24 "), "{put}");
         let body: TaggedCidr = put.cbor();
         assert_eq!(
             body,
@@ -1745,12 +1745,12 @@ mod tests {
         assert!(requests
             .recv()
             .unwrap()
-            .starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "));
+            .starts_with("GET /admin/cidrs/10.0.1.0_24 "));
         client.delete_association(&association).await.unwrap();
         assert!(requests
             .recv()
             .unwrap()
-            .starts_with("DELETE /v1/admin/associations/10.0.1.0_24/fd00::_64 "));
+            .starts_with("DELETE /admin/associations/10.0.1.0_24/fd00::_64 "));
         let error = client.delete_association(&association).await.unwrap_err();
         assert!(matches!(error, RestError::NoSuchAssociation), "{error:?}");
     }
@@ -1786,10 +1786,10 @@ mod tests {
         // The client reads the CIDR by prefix, and deletes it with the tag it read.
         client.delete_cidr(&users).await.unwrap();
         let get = requests.recv().unwrap();
-        assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
+        assert!(get.starts_with("GET /admin/cidrs/10.0.1.0_24 "), "{get}");
         let delete = requests.recv().unwrap();
         assert!(
-            delete.starts_with("DELETE /v1/admin/cidrs/10.0.1.0_24 "),
+            delete.starts_with("DELETE /admin/cidrs/10.0.1.0_24 "),
             "{delete}"
         );
         let body: CidrDeletion = delete.cbor();
