@@ -1,4 +1,4 @@
-//! Validation of canonical domain names and labels that resolve through `/etc/hosts`.
+//! Validation of canonical domain names and labels that name hosts.
 //!
 //! A canonical domain consists of one or more labels separated by dots, and is at most 253 bytes
 //! long. Each label consists of 1 to 63 lowercase ASCII letters, digits and hyphens, and neither
@@ -13,8 +13,7 @@
 //! neither all ASCII digits nor a `0x` prefix followed by zero or more hexadecimal digits. The
 //! WHATWG URL Standard parses a host that ends in a number as an IPv4 address, and rejects the
 //! host if that parse fails. Every canonical name that `inet_aton` reads as an address also ends
-//! in a number, and `getaddrinfo` returns such a name as an address without consulting
-//! `/etc/hosts`.
+//! in a number, and `getaddrinfo` returns such a name as an address without looking it up.
 //!
 //! The rule examines only the final label, so every suffix of an accepted name, that is, every
 //! name formed by removing leading labels, also satisfies it. [`is_canonical_domain`] therefore

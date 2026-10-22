@@ -1,7 +1,7 @@
 [package]
 authors = ["webstrand <webstrand@gmail.com>"]
 categories = ["network-programming"]
-description = "Validation of hostnames that resolve through /etc/hosts"
+description = "Validation of hostnames"
 edition = "2021"
 keywords.workspace = true
 license = "MIT"
