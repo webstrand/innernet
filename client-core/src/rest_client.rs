@@ -1609,6 +1609,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         }
     }
 
@@ -1853,6 +1856,7 @@ mod tests {
         let state = State {
             peers: vec![peer.clone()],
             cidrs: vec![users_cidr()],
+            observed_endpoint: None,
             invalid_peer_keys: vec![],
         };
         let server_key = KeyPair::generate();
@@ -1885,6 +1889,7 @@ mod tests {
         let state = State {
             peers: vec![peer.clone()],
             cidrs: vec![],
+            observed_endpoint: None,
             invalid_peer_keys: vec![],
         };
         let server_key = KeyPair::generate();

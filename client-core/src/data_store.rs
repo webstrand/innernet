@@ -304,6 +304,7 @@ impl DataStore {
         let state = State {
             peers: new_peers.to_vec(),
             cidrs: self.cidrs().unwrap(),
+            observed_endpoint: None,
             invalid_peer_keys: vec![],
         };
         let dropped: Vec<usize> = self
@@ -473,6 +474,9 @@ fn introduced_peers(
         is_redeemed: true,
         invite_expires: None,
         candidates: vec![],
+        announcement: None,
+        allowed_ips: None,
+        primary_ip: None,
     };
     // Public keys are compared in their canonical encoding, as a state's are deserialized.
     let server_key = Key::from_base64(&config.server.public_key)?.to_base64();
@@ -510,6 +514,9 @@ mod tests {
             persistent_keepalive_interval: None,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         }]
     });
     static BASE_CIDRS: Lazy<Vec<Cidr>> = Lazy::new(|| {
@@ -584,6 +591,7 @@ mod tests {
             .update(&State {
                 peers: BASE_PEERS.to_owned(),
                 cidrs: BASE_CIDRS.to_owned(),
+                observed_endpoint: None,
                 invalid_peer_keys: vec![],
             })
             .unwrap();
@@ -926,6 +934,7 @@ mod tests {
         let state = State {
             peers: peers.to_vec(),
             cidrs: vec![],
+            observed_endpoint: None,
             invalid_peer_keys: vec![],
         };
         let state: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -1179,6 +1188,7 @@ mod tests {
             .update(&State {
                 peers: varied_peers(),
                 cidrs,
+                observed_endpoint: None,
                 invalid_peer_keys: vec![],
             })
             .unwrap();
@@ -1357,6 +1367,7 @@ mod tests {
                         let state = State {
                             peers,
                             cidrs: BASE_CIDRS.clone(),
+                            observed_endpoint: None,
                             invalid_peer_keys: vec![],
                         };
                         assert!(store.update(&state).unwrap().is_empty());

@@ -268,6 +268,9 @@ fn rebuild(
                 .get::<_, Option<u64>>(9)?
                 .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
             candidates,
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         if let Err(refusal) = scope.accept(&[&contents])?.remove(0) {
             bail!("peer {id} at {ip}: {refusal}");

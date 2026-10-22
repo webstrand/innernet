@@ -11,6 +11,7 @@ use std::{
 };
 use wireguard_control::InterfaceName;
 
+pub mod announcement;
 pub mod cbor;
 pub mod interface_config;
 pub mod media_type;

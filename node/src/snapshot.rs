@@ -38,6 +38,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let snapshot = snapshot([peer("a", "10.0.0.2", false), peer("b", "10.0.0.3", true)]);
 

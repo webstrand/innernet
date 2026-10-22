@@ -390,6 +390,9 @@ fn load_peers_where(
             is_redeemed: row.get(4)?,
             invite_expires,
             candidates: endpoints.candidates,
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         });
     }
     peers.sort_by(|a, b| {

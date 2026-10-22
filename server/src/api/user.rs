@@ -79,6 +79,7 @@ mod handlers {
                 State {
                     peers: peers.into_iter().map(|peer| peer.inner).collect(),
                     cidrs: cidrs.iter().map(DatabaseCidr::contents).collect(),
+                    observed_endpoint: None,
                     invalid_peer_keys: vec![],
                 },
             )

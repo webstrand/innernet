@@ -22,6 +22,9 @@ fn peer(name: &str, ip: &str) -> PeerContents {
         is_redeemed: true,
         invite_expires: None,
         candidates: vec![],
+        announcement: None,
+        allowed_ips: None,
+        primary_ip: None,
     }
 }
 

@@ -1,4 +1,7 @@
-use crate::{cidr_of_delegations, hosts_fallback, parent_cidr, wg::PeerInfoExt, Prefix};
+use crate::{
+    announcement::SignedAnnouncement, cidr_of_delegations, hosts_fallback, parent_cidr,
+    wg::PeerInfoExt, Prefix,
+};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -797,6 +800,23 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+    /// The announcement of the peer, as it signed it, or, for a peer that has never announced,
+    /// unsigned, as the server makes it of what it records, which the API of TLS sessions relays
+    /// with the peer. The server stores only signed announcements, so `None` there means that the
+    /// peer has never announced. A recipient checks it before it accepts it, and
+    /// [`Self::effective_with`] makes the peer of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<SignedAnnouncement>,
+    /// The prefixes that WireGuard routes to the peer, as its announcement states them, shrunk to
+    /// its delegations, once [`Self::effective_with`] has made the peer of its announcement, or
+    /// `None` for all of its delegations. They are never transferred.
+    #[serde(skip)]
+    pub allowed_ips: Option<Vec<Prefix>>,
+    /// The primary IP of the peer, as its announcement states it, once
+    /// [`Self::effective_with`] has made the peer of its announcement, or `None` for the lowest
+    /// address of its delegations. It is never transferred.
+    #[serde(skip)]
+    pub primary_ip: Option<IpAddr>,
 }
 
 impl PeerContents {
@@ -811,10 +831,11 @@ impl PeerContents {
         self.name.as_deref().unwrap_or("[unnamed]")
     }
 
-    /// The address at which the name of the peer resolves: the lowest address of its delegations,
-    /// or `None` if the peer has none.
+    /// The address at which the name of the peer resolves: its primary IP, otherwise the lowest
+    /// address of its delegations, or `None` if the peer has neither.
     pub fn hosts_fallback(&self) -> Option<IpAddr> {
-        hosts_fallback(&self.delegations)
+        self.primary_ip
+            .or_else(|| hosts_fallback(&self.delegations))
     }
 
     /// The address of the peer for display: its hosts fallback address, or "[no delegation]" if
@@ -847,16 +868,22 @@ impl PeerContents {
         cidrs.iter().find(|candidate| candidate.cidr == cidr)
     }
 
-    /// The prefixes that WireGuard routes to the peer: its delegations.
+    /// The prefixes that WireGuard routes to the peer: its allowed IPs, or, without them, its
+    /// delegations.
     pub fn allowed_ips(&self) -> Vec<AllowedIp> {
-        self.delegations.iter().map(Prefix::allowed_ip).collect()
+        self.allowed_ips
+            .as_deref()
+            .unwrap_or(&self.delegations)
+            .iter()
+            .map(Prefix::allowed_ip)
+            .collect()
     }
 
-    /// Whether the peer belongs on a WireGuard interface: whether it is enabled and holds at least
-    /// one delegation. A peer without a delegation is in effect disabled, so that withdrawing
-    /// every delegation of a peer cuts the tunnels to it.
+    /// Whether the peer belongs on a WireGuard interface: whether it is enabled and WireGuard
+    /// routes at least one prefix to it. A peer without a delegation is in effect disabled, so
+    /// that withdrawing every delegation of a peer cuts the tunnels to it.
     pub fn is_routed(&self) -> bool {
-        !self.is_disabled && !self.delegations.is_empty()
+        !self.is_disabled && !self.allowed_ips().is_empty()
     }
 
     /// Whether the address `ip` lies within one of the peer's delegations.
@@ -868,7 +895,7 @@ impl PeerContents {
 }
 
 /// Deserializes the delegations of a peer, sorting them, and refusing two that share an address.
-fn deserialize_delegations<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_delegations<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<Prefix>, D::Error> {
     let mut delegations = Vec::<Prefix>::deserialize(deserializer)?;
@@ -1080,6 +1107,9 @@ impl From<LegacyPeerContents> for PeerContents {
             is_redeemed: peer.is_redeemed,
             invite_expires: peer.invite_expires,
             candidates: peer.candidates,
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         }
     }
 }
@@ -1325,6 +1355,13 @@ pub struct State {
     /// eligible to communicate with them or not.
     pub cidrs: Vec<Cidr>,
 
+    /// The endpoint at which the server observes the peer that requests the state, which the
+    /// peer may claim in its announcements, or `None` if the server hasn't observed it. It is the
+    /// requester's own, so nothing has to sign it; the server never relays the observed endpoint
+    /// of a peer that announces to other peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_endpoint: Option<Endpoint>,
+
     /// The public keys of the peers that failed to deserialize, which the server nonetheless
     /// reported. It is never sent.
     #[serde(skip)]
@@ -1339,13 +1376,20 @@ impl<'de> Deserialize<'de> for State {
         struct Fields {
             peers: Vec<MaybePeer<PeerContents>>,
             cidrs: Vec<Cidr>,
+            #[serde(default)]
+            observed_endpoint: Option<Endpoint>,
         }
 
-        let Fields { peers, cidrs } = Fields::deserialize(deserializer)?;
+        let Fields {
+            peers,
+            cidrs,
+            observed_endpoint,
+        } = Fields::deserialize(deserializer)?;
         let (peers, invalid_peer_keys) = split_valid_peers(peers);
         Ok(Self {
             peers,
             cidrs,
+            observed_endpoint,
             invalid_peer_keys,
         })
     }
@@ -1402,6 +1446,7 @@ impl From<LegacyState> for State {
                 .map(|peer| peer.contents.into())
                 .collect(),
             cidrs,
+            observed_endpoint: None,
             invalid_peer_keys: state.invalid_peer_keys,
         }
     }
@@ -1670,6 +1715,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1701,6 +1749,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1732,6 +1783,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1773,6 +1827,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();
 
@@ -1817,6 +1874,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         };
         let encoded = crate::cbor::to_vec(&peer).unwrap();
         let value = cbor_core::Value::decode(&encoded).unwrap();
@@ -1972,6 +2032,9 @@ mod tests {
             is_redeemed: true,
             invite_expires: None,
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         }
     }
 

@@ -23,6 +23,9 @@ impl NewPeerInfo {
             persistent_keepalive_interval: Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS),
             invite_expires: Some(SystemTime::now() + self.invite_expires.into()),
             candidates: vec![],
+            announcement: None,
+            allowed_ips: None,
+            primary_ip: None,
         }
     }
 }
