@@ -2,7 +2,8 @@ use crate::data_store::DataStore;
 use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response, StatusCode};
 use innernet_shared::{
     interface_config::{InterfaceConfig, ServerInfo},
-    tls, Cidr, CidrContents, Peer, PeerContents, PeerUpdate, TaggedPeer, INNERNET_PUBKEY_HEADER,
+    tls, Cidr, CidrContents, LegacyPeer, LegacyPeerContents, LegacyState, PeerContents, PeerUpdate,
+    State, TaggedPeer, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -92,18 +93,46 @@ impl<'a> RestClient<'a> {
         self.http("GET", "/admin/cidrs").await
     }
 
-    /// Creates a peer, and returns it as the server created it. A server in plain HTTP returns the
-    /// peer with its ID, which is left out.
+    /// Creates a peer, and returns it as the server created it. A server in plain HTTP is sent the
+    /// peer as clients that predate TLS know it, and returns the peer with its ID, which is left
+    /// out.
     pub async fn create_peer(
         &self,
         peer_contents: &PeerContents,
     ) -> Result<PeerContents, RestError> {
-        self.http_form("POST", "/admin/peers", peer_contents).await
+        match self.admin_api().await? {
+            AdminApi::ByKey => self.http_form("POST", "/admin/peers", peer_contents).await,
+            AdminApi::Legacy => {
+                let legacy = LegacyPeerContents::from_peer(peer_contents);
+                let peer: LegacyPeer = self.http_form("POST", "/admin/peers", legacy).await?;
+                Ok(peer.contents.into())
+            },
+        }
+    }
+
+    /// The state of the network as this peer sees it. A server in plain HTTP sends the peers with
+    /// their IDs, which are left out.
+    pub async fn get_state(&self) -> Result<State, RestError> {
+        let (transport, body) = self.request_raw::<()>("GET", "/user/state", None).await?;
+        match transport {
+            Transport::Tls => decode(&body),
+            Transport::Plain => decode::<LegacyState>(&body).map(State::from),
+        }
     }
 
     /// Lists every peer of the network. A server in plain HTTP lists the peers with their IDs,
     /// which are left out.
     pub async fn get_peers(&self) -> Result<Vec<PeerContents>, RestError> {
+        let (transport, body) = self.request_raw::<()>("GET", "/admin/peers", None).await?;
+        match transport {
+            Transport::Tls => decode(&body),
+            Transport::Plain => decode::<Vec<LegacyPeer>>(&body)
+                .map(|peers| peers.into_iter().map(|peer| peer.contents.into()).collect()),
+        }
+    }
+
+    /// Lists every peer of the network as a server in plain HTTP lists them, with their IDs.
+    pub async fn get_legacy_peers(&self) -> Result<Vec<LegacyPeer>, RestError> {
         self.http("GET", "/admin/peers").await
     }
 
@@ -145,18 +174,17 @@ impl<'a> RestClient<'a> {
         Ok(tagged)
     }
 
-    /// The ID by which a server in plain HTTP names the peer `listed`, as long as the peer is
-    /// still as it was listed, but for its endpoint and candidates. The client keeps no IDs, so it
-    /// lists the peers again, and takes the ID of the peer with the public key of `listed`. A peer
-    /// that has changed since it was listed, or is gone, is refused as
+    /// The peer `listed` as a server in plain HTTP lists it, with the ID by which it names the
+    /// peer, as long as the peer is still as it was listed, but for its endpoint and candidates.
+    /// The client keeps no IDs, so it lists the peers again, and takes the peer with the public
+    /// key of `listed`. A peer that has changed since it was listed, or is gone, is refused as
     /// [`RestError::PeerChanged`].
-    async fn get_legacy_id(&self, listed: &PeerContents) -> Result<i64, RestError> {
-        let peers: Vec<Peer> = self.http("GET", "/admin/peers").await?;
-        peers
-            .iter()
+    async fn get_legacy_peer(&self, listed: &PeerContents) -> Result<LegacyPeer, RestError> {
+        self.get_legacy_peers()
+            .await?
+            .into_iter()
             .find(|peer| peer.public_key == listed.public_key)
-            .filter(|peer| same_but_endpoints(&peer.contents, listed))
-            .map(|peer| peer.id)
+            .filter(|peer| same_but_endpoints(&peer.contents.clone().into(), listed))
             .ok_or(RestError::PeerChanged)
     }
 
@@ -180,8 +208,15 @@ impl<'a> RestClient<'a> {
                     .map_err(RestError::peer_refusal)
             },
             AdminApi::Legacy => {
-                let id = self.get_legacy_id(listed).await?;
-                self.http_form("PUT", &format!("/admin/peers/{id}"), contents)
+                // The peer is sent as the server lists it, with the changes an admin may make.
+                let LegacyPeer { id, contents: peer } = self.get_legacy_peer(listed).await?;
+                let legacy = LegacyPeerContents {
+                    name: contents.name.clone(),
+                    is_admin: contents.is_admin,
+                    is_disabled: contents.is_disabled,
+                    ..peer
+                };
+                self.http_form("PUT", &format!("/admin/peers/{id}"), legacy)
                     .await
             },
         }
@@ -216,6 +251,20 @@ impl<'a> RestClient<'a> {
         endpoint: &str,
         form: Option<S>,
     ) -> Result<T, RestError> {
+        let (_, body) = self.request_raw(verb, endpoint, form).await?;
+        decode(&body)
+    }
+
+    /// Performs a `verb` HTTP request at `endpoint`, with `form` as its body, and returns the
+    /// transport that the server answered in, with the body of the answer. The form of the
+    /// answer can depend on the transport, since a server in plain HTTP serves the API as clients
+    /// that predate TLS know it.
+    async fn request_raw<S: Serialize>(
+        &self,
+        verb: &str,
+        endpoint: &str,
+        form: Option<S>,
+    ) -> Result<(Transport, Vec<u8>), RestError> {
         let method = Method::from_bytes(verb.as_bytes()).map_err(|_| RestError::Method)?;
         let payload = form
             .map(|form| serde_json::to_vec(&form))
@@ -236,16 +285,17 @@ impl<'a> RestClient<'a> {
             .map_err(|_| RestError::Method)
         };
 
-        let (status, body) = loop {
+        let (transport, (status, body)) = loop {
             if self.predates_tls.get() {
                 let uri = format!("http://{}/v1{endpoint}", self.server.internal_endpoint);
-                break timed(self.plain_exchange(request(uri)?)).await?;
+                let answer = timed(self.plain_exchange(request(uri)?)).await?;
+                break (Transport::Plain, answer);
             }
             match timed(self.tls_exchange(request(format!("/v1{endpoint}"))?)).await {
                 // The server authenticated with its key and answered over TLS.
                 Ok(answer) => {
                     self.record_tls();
-                    break answer;
+                    break (Transport::Tls, answer);
                 },
                 // The server answered the handshake without reading the request, so the request
                 // is sent again in plain HTTP, unless the server is known to speak TLS.
@@ -273,9 +323,7 @@ impl<'a> RestClient<'a> {
             });
         }
 
-        // A little trick for serde to parse an empty response as `()`.
-        let body: &[u8] = if body.is_empty() { b"null" } else { &body };
-        serde_json::from_slice(body).map_err(RestError::ResponseDeserialize)
+        Ok((transport, body))
     }
 
     /// Exchanges `request` for an answer in plain HTTP.
@@ -345,6 +393,22 @@ fn same_but_endpoints(a: &PeerContents, b: &PeerContents) -> bool {
         ..peer.clone()
     };
     without_endpoints(a) == without_endpoints(b)
+}
+
+/// Decodes the body of an answer as JSON. An empty body decodes as `null`, so that it decodes as
+/// `()`.
+fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, RestError> {
+    let body: &[u8] = if body.is_empty() { b"null" } else { body };
+    serde_json::from_slice(body).map_err(RestError::ResponseDeserialize)
+}
+
+/// The transport that a server answered a request in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// TLS, authenticated with the server's key.
+    Tls,
+    /// Plain HTTP, as servers that predate TLS speak it.
+    Plain,
 }
 
 /// The admin API that a server offers a client.
@@ -673,9 +737,9 @@ mod tests {
     fn legacy_list_response(peers: &[PeerContents]) -> String {
         let peers: Vec<_> = peers
             .iter()
-            .map(|contents| Peer {
+            .map(|contents| LegacyPeer {
                 id: 7,
-                contents: contents.clone(),
+                contents: LegacyPeerContents::from_peer(contents),
             })
             .collect();
         json_response("200 OK", &serde_json::to_string(&peers).unwrap())
@@ -842,6 +906,44 @@ mod tests {
                 TLS_HANDSHAKE,
                 "GET /v1/user/capabilities HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
+                "GET /v1/admin/peers HTTP/1.1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decodes_by_transport() {
+        // A server in plain HTTP sends peers with their IDs, which are left out.
+        let peer = listed_peer();
+        let state = format!(
+            r#"{{"peers": {}, "cidrs": []}}"#,
+            serde_json::to_string(&[LegacyPeer {
+                id: 7,
+                contents: LegacyPeerContents::from_peer(&peer),
+            }])
+            .unwrap()
+        );
+        let server_key = KeyPair::generate();
+        let (addr, server) = plain_http_server_answering(vec![
+            NO_CONTENT_CLOSE.into(),
+            json_response("200 OK", &state),
+            legacy_list_response(std::slice::from_ref(&peer)),
+        ]);
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+        assert_eq!(
+            client.get_state().await.unwrap().peers,
+            std::slice::from_ref(&peer)
+        );
+        assert_eq!(
+            client.get_peers().await.unwrap(),
+            std::slice::from_ref(&peer)
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                TLS_HANDSHAKE,
+                "GET /v1/user/state HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
             ]
         );

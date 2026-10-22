@@ -5,7 +5,8 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    xeddsa, Endpoint, Hostname, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    xeddsa, Endpoint, Hostname, LegacyPeer, LegacyPeerContents, PeerContents,
+    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use rusqlite::{params, Connection};
 use std::{
@@ -45,10 +46,10 @@ impl DerefMut for DatabasePeer {
 impl DatabasePeer {
     /// The peer as the API of plain-HTTP sessions transfers it, with the ID `id`, which
     /// [`Self::plain_http_ids`] gives it.
-    pub fn legacy(&self, id: i64) -> Peer {
-        Peer {
+    pub fn legacy(&self, id: i64) -> LegacyPeer {
+        LegacyPeer {
             id,
-            contents: self.inner.clone(),
+            contents: LegacyPeerContents::from_peer(&self.inner),
         }
     }
 

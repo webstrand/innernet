@@ -6,7 +6,7 @@ use innernet_node::{
 };
 use innernet_shared::{
     ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents, Hostname,
-    IoErrorContext, Peer, PeerContents, Prefix, State,
+    IoErrorContext, LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
 use rusqlite::OptionalExtension as _;
@@ -39,7 +39,10 @@ const UNKNOWN_ID: i64 = 0;
 #[serde(tag = "version")]
 enum LegacyContents {
     #[serde(rename = "1")]
-    V1 { peers: Vec<Peer>, cidrs: Vec<Cidr> },
+    V1 {
+        peers: Vec<LegacyPeer>,
+        cidrs: Vec<Cidr>,
+    },
 }
 
 impl DataStore {
@@ -320,7 +323,8 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
     }
     let LegacyContents::V1 { peers, cidrs } = serde_json::from_str(&json)
         .with_context(|| format!("{} is not a valid data store", path.display()))?;
-    let contents: Vec<&PeerContents> = peers.iter().map(|peer| &peer.contents).collect();
+    let peers: Vec<PeerContents> = peers.into_iter().map(|peer| peer.contents.into()).collect();
+    let contents: Vec<&PeerContents> = peers.iter().collect();
     for (peer, decided) in peers.iter().zip(scope.accept(&contents)?) {
         if let Err(refusal) = decided {
             bail!(
@@ -394,7 +398,7 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<[PeerContents; 2], Error
 mod tests {
     use super::*;
     use innernet_node::db::{APPLICATION_ID, BUSY_TIMEOUT, SCHEMA_VERSION};
-    use innernet_shared::{Cidr, CidrContents, Peer, PeerContents};
+    use innernet_shared::{Cidr, CidrContents, LegacyPeerContents, PeerContents};
     use once_cell::sync::Lazy;
     use rusqlite::{config::DbConfig, Connection};
     use std::time::{Duration, UNIX_EPOCH};
@@ -441,12 +445,12 @@ mod tests {
     /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it, with the
     /// peers numbered from 1.
     fn write_legacy(dir: &Path, peers: &[PeerContents], cidrs: &[Cidr]) {
-        let peers: Vec<Peer> = peers
+        let peers: Vec<LegacyPeer> = peers
             .iter()
             .zip(1..)
-            .map(|(contents, id)| Peer {
+            .map(|(contents, id)| LegacyPeer {
                 id,
-                contents: contents.clone(),
+                contents: LegacyPeerContents::from_peer(contents),
             })
             .collect();
         let contents = serde_json::json!({ "version": "1", "peers": peers, "cidrs": cidrs });

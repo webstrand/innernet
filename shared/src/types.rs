@@ -620,7 +620,7 @@ fn parse_host_suffix(suffix: &str) -> Result<String, String> {
 
 /// A peer, without the ID by which the API of plain-HTTP sessions names it. The API of TLS
 /// sessions names a peer by its public key, and transfers peers in this form. A peer that a server
-/// in plain HTTP transfers with its ID deserializes into this form too, without the ID.
+/// in plain HTTP transfers, as a [`LegacyPeer`], converts into this form, without the ID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerContents {
     pub name: Hostname,
@@ -721,31 +721,29 @@ fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 /// What can be read of a peer that failed to deserialize, to identify it.
 #[derive(Deserialize)]
 struct PeerIdentity {
-    ip: Option<String>,
     public_key: Option<String>,
 }
 
-/// A peer of a list, which may fail to deserialize without failing the list.
+/// A peer of a list, of the form `T`, which may fail to deserialize without failing the list.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum MaybePeer {
-    Valid(PeerContents),
+enum MaybePeer<T> {
+    Valid(T),
     Invalid(PeerIdentity),
     Unrecognized(de::IgnoredAny),
 }
 
 /// The peers of `peers` that deserialized, and the canonical public keys of those that didn't but
 /// whose public key is valid, each of which is dropped with a warning.
-fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<PeerContents>, Vec<String>) {
+fn split_valid_peers<T>(peers: Vec<MaybePeer<T>>) -> (Vec<T>, Vec<String>) {
     let mut valid = vec![];
     let mut invalid_keys = vec![];
     for peer in peers {
         match peer {
             MaybePeer::Valid(peer) => valid.push(peer),
-            MaybePeer::Invalid(PeerIdentity { ip, public_key }) => {
+            MaybePeer::Invalid(PeerIdentity { public_key }) => {
                 log::warn!(
-                    "ignoring an invalid peer at IP {} with public key {}.",
-                    ip.as_deref().unwrap_or("[unknown]"),
+                    "ignoring an invalid peer with public key {}.",
                     public_key.as_deref().unwrap_or("[unknown]"),
                 );
                 if let Some(key) = public_key.and_then(|key| Key::from_base64(&key).ok()) {
@@ -758,34 +756,85 @@ fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<PeerContents>, Vec<String>) 
     (valid, invalid_keys)
 }
 
+/// A peer as clients that predate TLS know it, without its ID: the form of the peers of the API
+/// of plain-HTTP sessions, and of the data store of earlier versions. The API of TLS sessions
+/// transfers peers as [`PeerContents`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LegacyPeerContents {
+    pub name: Hostname,
+    pub ip: IpAddr,
+    pub cidr_id: i64,
+    #[serde(deserialize_with = "deserialize_public_key")]
+    pub public_key: String,
+    pub endpoint: Option<Endpoint>,
+    pub persistent_keepalive_interval: Option<u16>,
+    pub is_admin: bool,
+    pub is_disabled: bool,
+    pub is_redeemed: bool,
+    pub invite_expires: Option<SystemTime>,
+    #[serde(default)]
+    pub candidates: Vec<Endpoint>,
+}
+
+impl LegacyPeerContents {
+    /// `peer` as clients that predate TLS know it.
+    pub fn from_peer(peer: &PeerContents) -> Self {
+        Self {
+            name: peer.name.clone(),
+            ip: peer.ip,
+            cidr_id: peer.cidr_id,
+            public_key: peer.public_key.clone(),
+            endpoint: peer.endpoint.clone(),
+            persistent_keepalive_interval: peer.persistent_keepalive_interval,
+            is_admin: peer.is_admin,
+            is_disabled: peer.is_disabled,
+            is_redeemed: peer.is_redeemed,
+            invite_expires: peer.invite_expires,
+            candidates: peer.candidates.clone(),
+        }
+    }
+}
+
+impl From<LegacyPeerContents> for PeerContents {
+    fn from(peer: LegacyPeerContents) -> Self {
+        Self {
+            name: peer.name,
+            ip: peer.ip,
+            cidr_id: peer.cidr_id,
+            public_key: peer.public_key,
+            endpoint: peer.endpoint,
+            persistent_keepalive_interval: peer.persistent_keepalive_interval,
+            is_admin: peer.is_admin,
+            is_disabled: peer.is_disabled,
+            is_redeemed: peer.is_redeemed,
+            invite_expires: peer.invite_expires,
+            candidates: peer.candidates,
+        }
+    }
+}
+
 /// A peer with the ID by which the API of plain-HTTP sessions names it, as clients that predate
 /// TLS transfer peers. The API of TLS sessions transfers peers without an ID, as
 /// [`PeerContents`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Peer {
+pub struct LegacyPeer {
     pub id: i64,
 
     #[serde(flatten)]
-    pub contents: PeerContents,
+    pub contents: LegacyPeerContents,
 }
 
-impl Deref for Peer {
-    type Target = PeerContents;
+impl Deref for LegacyPeer {
+    type Target = LegacyPeerContents;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
     }
 }
 
-impl DerefMut for Peer {
+impl DerefMut for LegacyPeer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.contents
-    }
-}
-
-impl Display for Peer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.contents.fmt(f)
     }
 }
 
@@ -987,7 +1036,7 @@ impl From<PeerDiff<'_>> for PeerConfigBuilder {
 /// to include all the data a client needs to update its WireGuard interface.
 ///
 /// The API of TLS sessions sends the peers without IDs. A state that a server sends in plain HTTP,
-/// as [`LegacyState`], deserializes into this form too, without the IDs.
+/// as [`LegacyState`], converts into this form, without the IDs.
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     /// This list will be only the peers visible to the user requesting this
@@ -1011,7 +1060,7 @@ impl<'de> Deserialize<'de> for State {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Fields {
-            peers: Vec<MaybePeer>,
+            peers: Vec<MaybePeer<PeerContents>>,
             cidrs: Vec<Cidr>,
         }
 
@@ -1029,8 +1078,48 @@ impl<'de> Deserialize<'de> for State {
 /// clients that predate TLS expect.
 #[derive(Debug, Clone, Serialize)]
 pub struct LegacyState {
-    pub peers: Vec<Peer>,
+    pub peers: Vec<LegacyPeer>,
     pub cidrs: Vec<Cidr>,
+
+    /// The public keys of the peers that failed to deserialize, as in [`State`]. It is never
+    /// sent.
+    #[serde(skip)]
+    pub invalid_peer_keys: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for LegacyState {
+    /// Deserializes a state as [`State`] does, dropping with a warning each peer that fails to
+    /// deserialize, but keeping its public key in `invalid_peer_keys` if the key is valid.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            peers: Vec<MaybePeer<LegacyPeer>>,
+            cidrs: Vec<Cidr>,
+        }
+
+        let Fields { peers, cidrs } = Fields::deserialize(deserializer)?;
+        let (peers, invalid_peer_keys) = split_valid_peers(peers);
+        Ok(Self {
+            peers,
+            cidrs,
+            invalid_peer_keys,
+        })
+    }
+}
+
+impl From<LegacyState> for State {
+    /// The state without the IDs of the peers.
+    fn from(state: LegacyState) -> Self {
+        Self {
+            peers: state
+                .peers
+                .into_iter()
+                .map(|peer| peer.contents.into())
+                .collect(),
+            cidrs: state.cidrs,
+            invalid_peer_keys: state.invalid_peer_keys,
+        }
+    }
 }
 
 /// This model is sent as a response to the /capabilities endpoint.
@@ -1408,5 +1497,41 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "peers": [peer], "cidrs": [] })).unwrap();
         assert!(state.peers.is_empty());
         assert_eq!(state.invalid_peer_keys, [PUBKEY]);
+    }
+
+    #[test]
+    fn test_legacy_state() {
+        // A state that a server sends in plain HTTP drops each invalid peer, keeping its key, and
+        // converts into a state without IDs.
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        const INVALID_KEY: &str = "GBfQ6Xqdrw2WsNsW8ZsANpyDLeffy6XqwOYpAyyZ3AQ=";
+        let peer = |id: i64, ip: &str, public_key: &str| {
+            serde_json::json!({
+                "id": id,
+                "name": "peer1",
+                "ip": ip,
+                "cidr_id": 1,
+                "public_key": public_key,
+                "endpoint": null,
+                "persistent_keepalive_interval": null,
+                "is_admin": false,
+                "is_disabled": false,
+                "is_redeemed": true,
+                "invite_expires": null,
+            })
+        };
+        let state: LegacyState = serde_json::from_value(serde_json::json!({
+            "peers": [peer(1, "10.0.0.1", PUBKEY), peer(2, "not an IP", INVALID_KEY)],
+            "cidrs": [],
+        }))
+        .unwrap();
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[0].id, 1);
+        assert_eq!(state.invalid_peer_keys, [INVALID_KEY]);
+
+        let state = State::from(state);
+        assert_eq!(state.peers[0].public_key, PUBKEY);
+        assert_eq!(state.peers[0].ip.to_string(), "10.0.0.1");
+        assert_eq!(state.invalid_peer_keys, [INVALID_KEY]);
     }
 }

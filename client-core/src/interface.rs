@@ -16,7 +16,7 @@ use innernet_node::{
     store,
 };
 use innernet_shared::{
-    interface_config::FEATURE_TLS, wg, Endpoint, PeerChange, PeerContents, RedeemContents, State,
+    interface_config::FEATURE_TLS, wg, Endpoint, PeerChange, PeerContents, RedeemContents,
     REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
@@ -338,7 +338,7 @@ impl Link for RemoteLink<'_> {
     /// data store as it is, unless the data store holds no peer to configure.
     async fn sync(&mut self) -> Result<(), Error> {
         self.fetched = false;
-        let state = match self.rest_client.http::<State>("GET", "/user/state").await {
+        let state = match self.rest_client.get_state().await {
             Ok(state) => state,
             Err(e) if e.is_transport_error() => {
                 if self.store.peers()?.is_empty() {

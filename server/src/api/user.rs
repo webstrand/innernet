@@ -83,6 +83,7 @@ mod handlers {
                     .map(|peer| peer.legacy(ids[&peer.public_key]))
                     .collect(),
                 cidrs,
+                invalid_peer_keys: vec![],
             })
         }
     }
@@ -167,7 +168,7 @@ mod tests {
     use crate::{db::DatabaseAssociation, test};
     use bytes::Buf;
     use innernet_shared::{
-        AssociationContents, CidrContents, Endpoint, EndpointContents, Error, Peer,
+        AssociationContents, CidrContents, Endpoint, EndpointContents, Error, LegacyPeer,
     };
 
     #[tokio::test]
@@ -215,7 +216,7 @@ mod tests {
         let res = server
             .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
             .await;
-        let peers: Vec<Peer> = serde_json::from_value(peers_of(res).await.into())?;
+        let peers: Vec<LegacyPeer> = serde_json::from_value(peers_of(res).await.into())?;
         assert_eq!(peers.len(), 3);
         let ids = DatabasePeer::plain_http_ids(&server.db().lock())?;
         for peer in peers {
