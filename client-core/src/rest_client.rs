@@ -1,12 +1,14 @@
 use crate::data_store::DataStore;
-use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response, StatusCode};
+use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response};
 use innernet_shared::{
     cbor,
     interface_config::{InterfaceConfig, ServerInfo},
-    media_type, parent_cidr, smallest_cidr_holding, tls, Association, Cidr, CidrDeletion,
-    LegacyAssociation, LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer,
-    LegacyPeerContents, LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr,
-    TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
+    media_type, parent_cidr,
+    problem::{self, Problem},
+    smallest_cidr_holding, tls, Association, Cidr, CidrDeletion, LegacyAssociation,
+    LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
+    LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr, TaggedPeer,
+    TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -134,10 +136,7 @@ impl<'a> RestClient<'a> {
     /// [`RestError::NoSuchCidr`].
     pub async fn get_tagged_cidr(&self, listed: &Cidr) -> Result<TaggedCidr, RestError> {
         let path = format!("/admin/cidrs/{}", listed.cidr.api_path_segment());
-        let tagged: TaggedCidr = self
-            .http("GET", &path)
-            .await
-            .map_err(RestError::cidr_refusal)?;
+        let tagged: TaggedCidr = self.http("GET", &path).await?;
         if tagged.cidr != *listed {
             return Err(RestError::CidrChanged);
         }
@@ -162,9 +161,7 @@ impl<'a> RestClient<'a> {
                     },
                     tag,
                 };
-                self.http_form("PUT", &path, renamed)
-                    .await
-                    .map_err(RestError::cidr_refusal)
+                self.http_form("PUT", &path, renamed).await
             },
             AdminApi::Legacy => {
                 let cidrs = self.get_legacy_cidrs().await?;
@@ -191,9 +188,7 @@ impl<'a> RestClient<'a> {
             AdminApi::ByKey => {
                 let TaggedCidr { tag, .. } = self.get_tagged_cidr(listed).await?;
                 let path = format!("/admin/cidrs/{}", listed.cidr.api_path_segment());
-                self.http_form("DELETE", &path, CidrDeletion { tag })
-                    .await
-                    .map_err(RestError::cidr_refusal)
+                self.http_form("DELETE", &path, CidrDeletion { tag }).await
             },
             AdminApi::Legacy => {
                 let path = format!(
@@ -263,8 +258,14 @@ impl<'a> RestClient<'a> {
     /// plain HTTP names an association by ID, so the client lists the associations and the CIDRs
     /// again for its ID.
     pub async fn delete_association(&self, association: &Association) -> Result<(), RestError> {
-        let path = match self.admin_api().await? {
-            AdminApi::ByKey => format!("/admin/associations/{}", association.api_path()),
+        match self.admin_api().await? {
+            AdminApi::ByKey => {
+                self.http(
+                    "DELETE",
+                    &format!("/admin/associations/{}", association.api_path()),
+                )
+                .await
+            },
             AdminApi::Legacy => {
                 let cidrs = self.get_legacy_cidrs().await?;
                 let (id_1, id_2) = (
@@ -280,12 +281,11 @@ impl<'a> RestClient<'a> {
                             || (listed.cidr_id_1, listed.cidr_id_2) == (id_2, id_1)
                     })
                     .ok_or(RestError::NoSuchAssociation)?;
-                format!("/admin/associations/{}", listed.id)
+                self.http("DELETE", &format!("/admin/associations/{}", listed.id))
+                    .await
+                    .map_err(|e| e.not_found_as(RestError::NoSuchAssociation))
             },
-        };
-        self.http("DELETE", &path)
-            .await
-            .map_err(|e| e.not_found_as(RestError::NoSuchAssociation))
+        }
     }
 
     /// Creates a peer, and returns it as the server created it. A server in plain HTTP is sent the
@@ -358,7 +358,10 @@ impl<'a> RestClient<'a> {
                 .http::<serde::de::IgnoredAny>("GET", "/user/capabilities")
                 .await
             {
-                Ok(_) | Err(RestError::Status(_) | RestError::Refused { .. }) => {},
+                Ok(_)
+                | Err(
+                    RestError::Status(_) | RestError::Refused { .. } | RestError::Problem { .. },
+                ) => {},
                 Err(e) => return Err(e),
             }
         }
@@ -378,10 +381,7 @@ impl<'a> RestClient<'a> {
     /// [`RestError::NoSuchPeer`].
     pub async fn get_tagged_peer(&self, listed: &PeerContents) -> Result<TaggedPeer, RestError> {
         let path = format!("/admin/peers/{}", listed.api_path_segment());
-        let tagged: TaggedPeer = self
-            .http("GET", &path)
-            .await
-            .map_err(RestError::peer_refusal)?;
+        let tagged: TaggedPeer = self.http("GET", &path).await?;
         if !same_but_untagged(&tagged.peer, listed) {
             return Err(RestError::PeerChanged);
         }
@@ -421,7 +421,6 @@ impl<'a> RestClient<'a> {
                 let path = format!("/admin/peers/{}", listed.api_path_segment());
                 self.http_form("PUT", &path, PeerUpdate::new(tag, contents))
                     .await
-                    .map_err(RestError::peer_refusal)
             },
             AdminApi::Legacy => {
                 if contents.name.is_none() {
@@ -460,10 +459,7 @@ impl<'a> RestClient<'a> {
         let TaggedPeerDelegations {
             delegations: current,
             tag,
-        } = self
-            .http("GET", &path)
-            .await
-            .map_err(RestError::peer_refusal)?;
+        } = self.http("GET", &path).await?;
         let mut listed_delegations = listed.delegations.clone();
         listed_delegations.sort();
         if current != listed_delegations {
@@ -471,7 +467,6 @@ impl<'a> RestClient<'a> {
         }
         self.http_form("PUT", &path, TaggedPeerDelegations { delegations, tag })
             .await
-            .map_err(RestError::peer_refusal)
     }
 
     /// Perform a `verb` HTTP request at the given `endpoint`.
@@ -719,17 +714,30 @@ async fn timed<T>(
 /// An answer of the server.
 #[derive(Debug)]
 struct Answer {
-    status: StatusCode,
+    status: u16,
     content_type: Option<String>,
     body: Vec<u8>,
 }
 
 impl Answer {
-    /// The body of the answer, an answer of the TLS API, or the refusal that it is. A body must
-    /// state the version of the API that the client reads, so that the client never reads a body
-    /// of another version as one of its own.
+    /// The body of the answer, an answer of the TLS API, or the refusal that it is. The server
+    /// explains every refusal in a problem detail, whose type alone says what the refusal means. A
+    /// body must state the version of the API that the client reads, so that the client never
+    /// reads a body of another version as one of its own.
     fn into_tls_body(self) -> Result<Vec<u8>, RestError> {
-        if !self.status.is_success() {
+        if self.status >= 400 {
+            if self
+                .content_type
+                .as_deref()
+                .is_some_and(problem::is_content_type)
+            {
+                return Err(match read_problem(&self.body) {
+                    Some(problem) => RestError::from_problem(self.status, problem),
+                    None => RestError::Status(self.status),
+                });
+            }
+            // A refusal without a problem detail, which the server never makes, is explained as
+            // one in plain HTTP is.
             return Err(self.refusal());
         }
         let version = self
@@ -748,7 +756,7 @@ impl Answer {
 
     /// The body of the answer, an answer in plain HTTP, or the refusal that it is.
     fn into_plain_body(self) -> Result<Vec<u8>, RestError> {
-        if !self.status.is_success() {
+        if self.status >= 400 {
             return Err(self.refusal());
         }
         Ok(self.body)
@@ -769,18 +777,18 @@ impl Answer {
     }
 }
 
-/// The status, content type and body of `response`, of which only the explanation, the first
-/// [`MAX_EXPLANATION_LEN`] bytes, is read for a refusal.
+/// The status, content type and body of `response`, of which at most [`MAX_PROBLEM_LEN`] bytes
+/// and one more are read for a refusal.
 async fn read_answer(response: Response<Body>) -> Result<Answer, RestError> {
     use hyper::body::HttpBody as _;
-    let status = response.status();
+    let status = response.status().as_u16();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let mut body = response.into_body();
-    if status.is_success() {
+    if status < 400 {
         let body = hyper::body::to_bytes(body)
             .await
             .map_err(|e| RestError::RequestSend(Box::new(e)))?;
@@ -790,32 +798,56 @@ async fn read_answer(response: Response<Body>) -> Result<Answer, RestError> {
             body: body.to_vec(),
         });
     }
-    let mut explanation = vec![];
-    while explanation.len() < MAX_EXPLANATION_LEN {
+    let mut refusal = vec![];
+    while refusal.len() <= MAX_PROBLEM_LEN {
         match body.data().await {
-            Some(Ok(chunk)) => explanation.extend_from_slice(&chunk),
+            Some(Ok(chunk)) => refusal.extend_from_slice(&chunk),
             _ => break,
         }
     }
-    explanation.truncate(MAX_EXPLANATION_LEN);
+    refusal.truncate(MAX_PROBLEM_LEN + 1);
     Ok(Answer {
         status,
         content_type,
-        body: explanation,
+        body: refusal,
     })
 }
 
 /// How many bytes of the server's explanation of a refusal the client reads.
 const MAX_EXPLANATION_LEN: usize = 1024;
 
-/// The server's explanation of a refusal, of which `body` holds at most [`MAX_EXPLANATION_LEN`]
-/// bytes, trimmed and escaped as [`str::escape_debug`] escapes it, so that printing it can't
-/// affect the terminal.
+/// The server's explanation of a refusal, in `body`, escaped as [`escape`] escapes it.
 fn explanation(body: &[u8]) -> String {
-    String::from_utf8_lossy(body)
-        .trim()
-        .escape_debug()
-        .to_string()
+    let body = &body[..body.len().min(MAX_EXPLANATION_LEN)];
+    escape(&String::from_utf8_lossy(body))
+}
+
+/// How many bytes of a problem detail the client reads.
+const MAX_PROBLEM_LEN: usize = 16 * 1024;
+
+/// The problem detail in `body`, or `None` if it doesn't decode, or is too long. Its type, title
+/// and detail are escaped as [`escape`] escapes them, since a problem is shown by its detail, or
+/// else its title, or else its type. The URI of a type of innernet's own has nothing to escape, so
+/// the problem's type still names it.
+fn read_problem(body: &[u8]) -> Option<Problem> {
+    if body.len() > MAX_PROBLEM_LEN {
+        return None;
+    }
+    let mut problem: Problem = cbor::from_slice(body).ok()?;
+    problem.problem_type = escape(&problem.problem_type);
+    problem.title = problem.title.as_deref().map(escape);
+    problem.detail = problem.detail.as_deref().map(escape);
+    Some(problem)
+}
+
+/// At most [`MAX_EXPLANATION_LEN`] bytes of `text`, the server's, trimmed and escaped as
+/// [`str::escape_debug`] escapes it, so that printing it can't affect the terminal.
+fn escape(text: &str) -> String {
+    let mut len = text.len().min(MAX_EXPLANATION_LEN);
+    while !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    text[..len].trim().escape_debug().to_string()
 }
 
 /// Whether the TLS handshake failed because the server answered in plain HTTP, as servers that
@@ -887,10 +919,13 @@ pub enum RestError {
     Handshake(io::Error),
     #[error("The request timed out after {}s", TIMEOUT.as_secs())]
     Timeout,
-    #[error("The server answered with {0}")]
-    Status(StatusCode),
+    #[error("The server responded with status {0}")]
+    Status(u16),
     #[error("The server refused the request ({status}): {message}")]
-    Refused { status: StatusCode, message: String },
+    Refused { status: u16, message: String },
+    /// A refusal over TLS, with a problem detail of a type that has no error of its own.
+    #[error("The server refused the request ({status}): {problem}")]
+    Problem { status: u16, problem: Box<Problem> },
     #[error("Invalid request method")]
     Method,
     #[error("Error serializing request: {0}")]
@@ -900,39 +935,39 @@ pub enum RestError {
 }
 
 impl RestError {
+    /// Whether the error is a refusal with the status `status` without a problem detail, as a
+    /// server in plain HTTP refuses a request. A problem detail is decided on by its type alone.
     pub fn has_status_of(&self, status: u16) -> bool {
         match self {
-            RestError::Status(s) | RestError::Refused { status: s, .. } => s.as_u16() == status,
+            RestError::Status(s) | RestError::Refused { status: s, .. } => *s == status,
             _ => false,
         }
     }
 
-    /// Turns the statuses with which the server refuses a request about a peer named by its key
-    /// into errors that say why: [`Self::PeerChanged`] for a peer that has changed since it was
-    /// read, and [`Self::NoSuchPeer`] for a key that no peer has.
-    fn peer_refusal(self) -> Self {
-        if self.has_status_of(409) {
-            RestError::PeerChanged
-        } else if self.has_status_of(404) {
-            RestError::NoSuchPeer
-        } else {
-            self
-        }
+    /// The error that the problem detail `problem`, of a refusal with the status `status`, says
+    /// by its type: [`Self::PeerChanged`] and [`Self::CidrChanged`] for a stale tag,
+    /// [`Self::NoSuchPeer`], [`Self::NoSuchCidr`] and [`Self::NoSuchAssociation`] for what the
+    /// server doesn't hold, and [`Self::Problem`] for any other type.
+    fn from_problem(status: u16, problem: Problem) -> Self {
+        let errors = [
+            (&problem::PEER_CHANGED, RestError::PeerChanged),
+            (&problem::CIDR_CHANGED, RestError::CidrChanged),
+            (&problem::NO_SUCH_PEER, RestError::NoSuchPeer),
+            (&problem::NO_SUCH_CIDR, RestError::NoSuchCidr),
+            (&problem::NO_SUCH_ASSOCIATION, RestError::NoSuchAssociation),
+        ];
+        errors
+            .into_iter()
+            .find(|(problem_type, _)| problem.is(problem_type))
+            .map(|(_, error)| error)
+            .unwrap_or(RestError::Problem {
+                status,
+                problem: Box::new(problem),
+            })
     }
 
-    /// Turns the statuses with which the server refuses a request about a CIDR named by its
-    /// prefix into errors that say why: [`Self::CidrChanged`] for a CIDR that has changed since
-    /// it was read, and [`Self::NoSuchCidr`] for a prefix that no CIDR has.
-    fn cidr_refusal(self) -> Self {
-        if self.has_status_of(409) {
-            RestError::CidrChanged
-        } else {
-            self.not_found_as(RestError::NoSuchCidr)
-        }
-    }
-
-    /// Turns a refusal with 404, which a server answers for a resource that it doesn't hold, into
-    /// `error`, which says what was not found.
+    /// Turns a refusal with 404, which a server in plain HTTP answers for a resource that it
+    /// doesn't hold, into `error`, which says what was not found.
     fn not_found_as(self, error: Self) -> Self {
         if self.has_status_of(404) {
             error
@@ -1169,6 +1204,98 @@ mod tests {
         response
     }
 
+    /// A refusal with the status `status` and the problem detail `problem`.
+    fn problem_body_response(status: u16, problem: &Problem) -> Vec<u8> {
+        let body = cbor::to_vec(problem).unwrap();
+        let mut response = format!(
+            "HTTP/1.1 {status} Refused\r\nContent-Type: application/problem+cbor\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend(body);
+        response
+    }
+
+    /// A refusal with a problem of the type `problem_type`, with its status.
+    fn problem_response(problem_type: &problem::ProblemType) -> Vec<u8> {
+        problem_body_response(problem_type.status, &problem_type.problem("refused"))
+    }
+
+    #[tokio::test]
+    async fn test_decides_on_the_type_of_problems() {
+        // Over TLS, the type of a problem says what a refusal means, whatever its status. A
+        // problem of another type, about:blank included, is reported as it is, and a refusal
+        // without a problem by its status alone.
+        let server_key = KeyPair::generate();
+        let peer = listed_peer();
+        let mut odd_status = problem::NO_SUCH_PEER.problem("gone");
+        odd_status.status = Some(400);
+        let blank = Problem::about_blank(404, Some("Not Found"));
+        let unknown = Problem {
+            problem_type: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
+            ..problem::PEER_CHANGED.problem("later")
+        };
+        let (addr, _requests) = tls_server_recording(
+            &server_key,
+            vec![
+                problem_body_response(400, &odd_status),
+                problem_body_response(404, &blank),
+                problem_body_response(409, &unknown),
+                "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into(),
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        let error = client.get_tagged_peer(&peer).await.unwrap_err();
+        assert!(matches!(error, RestError::NoSuchPeer), "{error:?}");
+        match client.get_tagged_peer(&peer).await.unwrap_err() {
+            RestError::Problem { status, problem } => {
+                assert_eq!((status, *problem), (404, blank));
+            },
+            error => panic!("{error:?}"),
+        }
+        match client.get_tagged_peer(&peer).await.unwrap_err() {
+            RestError::Problem { status, problem } => {
+                assert_eq!((status, *problem), (409, unknown));
+            },
+            error => panic!("{error:?}"),
+        }
+        let error = client.get_tagged_peer(&peer).await.unwrap_err();
+        assert!(matches!(error, RestError::Status(409)), "{error:?}");
+
+        // The detail, the title and the type of a problem are escaped, which leaves the type of
+        // a problem of innernet's own as it is.
+        let refused = problem::DELEGATION_REFUSED.problem("\x1b[31mrefused\nfor now\x07");
+        let problem = read_problem_of(&problem_response_of(&refused)).await;
+        assert_eq!(
+            problem.detail.as_deref(),
+            Some(r"\u{1b}[31mrefused\nfor now\u{7}")
+        );
+        assert!(problem.is(&problem::DELEGATION_REFUSED));
+        let mut untitled = Problem::about_blank(500, None);
+        untitled.problem_type = "urn:\x1b[2J".to_string();
+        let problem = read_problem_of(&problem_response_of(&untitled)).await;
+        assert_eq!(problem.to_string(), r"urn:\u{1b}[2J");
+    }
+
+    /// A refusal with the problem `problem`, with its status.
+    fn problem_response_of(problem: &Problem) -> Vec<u8> {
+        problem_body_response(problem.status.unwrap(), problem)
+    }
+
+    /// The problem that the client reads of `response`, a refusal over TLS.
+    async fn read_problem_of(response: &[u8]) -> Problem {
+        let server_key = KeyPair::generate();
+        let addr = tls_server_answering(&server_key, 1, response.to_vec());
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        match client.http::<()>("GET", "/user/state").await.unwrap_err() {
+            RestError::Problem { problem, .. } => *problem,
+            error => panic!("{error:?}"),
+        }
+    }
+
     const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
 
     /// [`NO_CONTENT`], for a server that closes each connection after its answer.
@@ -1278,8 +1405,8 @@ mod tests {
             is_admin: true,
             ..peer.clone()
         };
-        let not_found: Vec<u8> = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into();
-        let conflict: Vec<u8> = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into();
+        let not_found = problem_response(&problem::NO_SUCH_PEER);
+        let conflict = problem_response(&problem::PEER_CHANGED);
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
@@ -1501,7 +1628,8 @@ mod tests {
             .http_form::<_, ()>("PUT", "/user/candidates", Vec::<String>::new())
             .await
             .unwrap();
-        let accept = Some("application/vnd.innernet+cbor; version=1".to_string());
+        let accept =
+            Some("application/vnd.innernet+cbor; version=1, application/problem+cbor".to_string());
         let get = requests.recv().unwrap();
         assert_eq!(get.header("accept"), accept, "{get}");
         assert_eq!(get.header("content-type"), None, "{get}");
@@ -1575,16 +1703,15 @@ mod tests {
     #[tokio::test]
     async fn test_cidrs_and_associations_by_prefix_over_tls() {
         let server_key = KeyPair::generate();
-        let not_found: Vec<u8> = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into();
         let users = users_cidr();
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
                 tagged_cidr_response(&users, "ab"),
                 NO_CONTENT.into(),
-                not_found.clone(),
+                problem_response(&problem::NO_SUCH_CIDR),
                 NO_CONTENT.into(),
-                not_found,
+                problem_response(&problem::NO_SUCH_ASSOCIATION),
             ],
         );
         let config = config(addr, &server_key);
@@ -1595,8 +1722,8 @@ mod tests {
         };
 
         // A CIDR is named by its prefix, and an association by the prefixes of its CIDRs, and
-        // the server's 404 says which is gone. The client reads a CIDR with its tag, and renames
-        // it with the tag it read.
+        // the type of the server's problem says which is gone. The client reads a CIDR with its
+        // tag, and renames it with the tag it read.
         client.rename_cidr(&users, "people").await.unwrap();
         let get = requests.recv().unwrap();
         assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
@@ -1682,8 +1809,9 @@ mod tests {
             name: "people".into(),
             ..users.clone()
         };
-        let conflict: Vec<u8> = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into();
-        let bad_request: Vec<u8> = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".into();
+        let conflict = problem_response(&problem::CIDR_CHANGED);
+        let bad_request =
+            problem_body_response(400, &Problem::about_blank(400, Some("Bad Request")));
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
@@ -1711,7 +1839,14 @@ mod tests {
         let error = client.delete_cidr(&users).await.unwrap_err();
         assert!(matches!(error, RestError::CidrChanged), "{error:?}");
         let error = client.rename_cidr(&users, "people").await.unwrap_err();
-        assert!(error.has_status_of(400), "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                RestError::Problem { status: 400, problem }
+                    if problem.problem_type == "about:blank"
+            ),
+            "{error:?}"
+        );
         let methods: Vec<_> = requests
             .iter()
             .map(|request| request.split(' ').next().unwrap().to_string())
@@ -1904,7 +2039,7 @@ mod tests {
         let client = RestClient::new(&config, false).unwrap();
         match client.http::<()>("GET", "/user/state").await.unwrap_err() {
             RestError::Refused { status, message } => {
-                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(status, 401);
                 let shown = "x".repeat(MAX_EXPLANATION_LEN - text.len());
                 assert_eq!(
                     message,

@@ -7,7 +7,11 @@ use crate::{
 use anyhow::anyhow;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_node::Store;
-use innernet_shared::{cbor, Error, LegacyPeerContents, PeerContents, Prefix};
+use innernet_shared::{
+    cbor,
+    problem::{self, Problem, ProblemType},
+    Error, LegacyPeerContents, PeerContents, Prefix,
+};
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
@@ -370,6 +374,45 @@ pub async fn cbor_body<T: DeserializeOwned>(res: Response<Body>) -> Result<T, Er
     assert_eq!(res.headers().get("Content-Type").unwrap(), &content_type());
     let body = hyper::body::to_bytes(res.into_body()).await?;
     Ok(cbor::from_slice(&body)?)
+}
+
+/// The problem detail of `res`, the refusal of a request of a TLS session, which must be of the
+/// type `problem_type`, with its status.
+pub async fn problem(res: Response<Body>, problem_type: &ProblemType) -> Result<Problem, Error> {
+    assert_eq!(
+        res.headers().get("Content-Type").unwrap(),
+        problem::CONTENT_TYPE
+    );
+    assert_eq!(res.status().as_u16(), problem_type.status);
+    let body = hyper::body::to_bytes(res.into_body()).await?;
+    let problem: Problem = cbor::from_slice(&body)?;
+    assert!(problem.is(problem_type), "{problem:?}");
+    assert_eq!(problem.status, Some(problem_type.status));
+    Ok(problem)
+}
+
+/// Checks that `res`, the refusal of a request of a TLS session, is a problem of the type
+/// `about:blank` with the status `status`, and nothing else.
+pub async fn blank_problem(res: Response<Body>, status: http::StatusCode) -> Result<(), Error> {
+    assert_eq!(res.status(), status);
+    assert_eq!(
+        res.headers().get("Content-Type").unwrap(),
+        problem::CONTENT_TYPE
+    );
+    let body = hyper::body::to_bytes(res.into_body()).await?;
+    assert_eq!(
+        cbor::from_slice::<Problem>(&body)?,
+        Problem::about_blank(status.as_u16(), status.canonical_reason())
+    );
+    Ok(())
+}
+
+/// The detail of the problem of `res`, as [`problem`] reads it.
+pub async fn problem_detail(
+    res: Response<Body>,
+    problem_type: &ProblemType,
+) -> Result<String, Error> {
+    Ok(problem(res, problem_type).await?.detail.unwrap())
 }
 
 /// The body of `res`, a response to a plain-HTTP session, decoded from JSON, which its content type

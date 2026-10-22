@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 use crate::{
     db::DatabaseCidr,
-    util::{form_body, form_response, status_response},
+    util::{form_body, form_response, status_response, tagged_form_body},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -23,20 +23,27 @@ pub async fn routes(
     if !components.is_empty() {
         return Err(ServerError::NotFound);
     }
+    // A prefix that no CIDR has is refused as such, apart from a path that the server has no
+    // route for.
+    let no_such_cidr = |e: ServerError| e.not_found_as(ServerError::NoSuchCidr);
     match (req.method(), prefix) {
         (&Method::GET, None) => handlers::list(session).await,
         (&Method::POST, None) => {
             let form = form_body(req, &session).await?;
             handlers::create(form, session).await
         },
-        (&Method::GET, Some(prefix)) => handlers::get(prefix, session).await,
+        (&Method::GET, Some(prefix)) => handlers::get(prefix, session).await.map_err(no_such_cidr),
         (&Method::PUT, Some(prefix)) => {
-            let form = form_body(req, &session).await?;
-            handlers::update(prefix, form, session).await
+            let form = tagged_form_body(req, &session).await?;
+            handlers::update(prefix, form, session)
+                .await
+                .map_err(no_such_cidr)
         },
         (&Method::DELETE, Some(prefix)) => {
-            let form = form_body(req, &session).await?;
-            handlers::delete(prefix, form, session).await
+            let form = tagged_form_body(req, &session).await?;
+            handlers::delete(prefix, form, session)
+                .await
+                .map_err(no_such_cidr)
         },
         _ => Err(ServerError::NotFound),
     }
@@ -128,7 +135,7 @@ mod tests {
     use super::*;
     use crate::{test, DatabasePeer};
     use anyhow::Result;
-    use innernet_shared::{cbor, Error, LegacyCidr};
+    use innernet_shared::{cbor, problem, Error, LegacyCidr};
     use serde::de::IgnoredAny;
     use std::collections::BTreeMap;
 
@@ -341,15 +348,14 @@ mod tests {
         // rename must carry a tag.
         let stale = rename("devs2", test::DEVELOPER_CIDR, &seen.tag)?;
         let res = put(&server, &developer_path, &stale).await;
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("changed"));
+        let detail = test::problem_detail(res, &problem::CIDR_CHANGED).await?;
+        assert!(detail.contains("changed"), "{detail}");
         for untagged in [
             serde_json::to_value(&stale.cidr)?,
             serde_json::json!({ "cidr": stale.cidr }),
         ] {
             let res = put(&server, &developer_path, untagged).await;
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            test::problem(res, &problem::TAG_MISSING).await?;
         }
         assert_eq!(get_tagged(&server, test::DEVELOPER_CIDR).await?, current);
 
@@ -365,21 +371,25 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         // A CIDR is never moved, and one that doesn't exist is not found, as is a path that names
-        // no prefix in the canonical form.
+        // no prefix in the canonical form, which is no route of the server.
         let moved = rename("devs", test::EXPERIMENTAL_CIDR, &current.tag)?;
         let res = put(&server, &developer_path, &moved).await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        test::blank_problem(res, StatusCode::BAD_REQUEST).await?;
         let res = put(&server, &path(test::EXPERIMENTAL_CIDR)?, &moved).await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &problem::NO_SUCH_CIDR).await?;
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", &path(test::EXPERIMENTAL_CIDR)?)
+            .await;
+        test::problem(res, &problem::NO_SUCH_CIDR).await?;
         for path in [
             format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR_ID),
             format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR),
             format!("/v1/admin/cidrs/{}", test::DEVELOPER_CIDR.replace('/', "-")),
         ] {
             let res = put(&server, &path, &current).await;
-            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            test::blank_problem(res, StatusCode::NOT_FOUND).await?;
             let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
-            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            test::blank_problem(res, StatusCode::NOT_FOUND).await?;
         }
         Ok(())
     }
@@ -425,7 +435,7 @@ mod tests {
         let res = server
             .request(test::ADMIN_PEER_IP, "DELETE", &experimental_path)
             .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        test::problem(res, &problem::TAG_MISSING).await?;
         let res = server
             .form_request(
                 test::ADMIN_PEER_IP,
@@ -434,7 +444,7 @@ mod tests {
                 serde_json::json!({}),
             )
             .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        test::problem(res, &problem::TAG_MISSING).await?;
         let res = server
             .form_request(
                 test::DEVELOPER1_PEER_IP,
@@ -445,7 +455,7 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        test::blank_problem(res, StatusCode::UNAUTHORIZED).await?;
         assert!(DatabaseCidr::get(&server.db.lock(), &prefix).is_ok());
 
         // With the current tag, the CIDR is deleted, and is then not found.
@@ -454,10 +464,15 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(DatabaseCidr::get(&server.db.lock(), &prefix).is_err());
-        assert_eq!(
-            delete_tagged(&server, test::EXPERIMENTAL_CIDR, &current.tag).await?,
-            StatusCode::NOT_FOUND
-        );
+        let res = server
+            .form_request(
+                test::ADMIN_PEER_IP,
+                "DELETE",
+                &experimental_path,
+                CidrDeletion { tag: current.tag },
+            )
+            .await;
+        test::problem(res, &problem::NO_SUCH_CIDR).await?;
         Ok(())
     }
 

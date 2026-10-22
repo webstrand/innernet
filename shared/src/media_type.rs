@@ -41,9 +41,13 @@ pub fn content_type(version: u32) -> String {
 }
 
 /// The value of `Accept` that a client sends with every request: the media type of the newest
-/// version of the API.
+/// version of the API, and that of problem details, which carry no version.
 pub fn accept() -> String {
-    content_type(VERSION)
+    format!(
+        "{}, {}",
+        content_type(VERSION),
+        crate::problem::CONTENT_TYPE
+    )
 }
 
 /// The media type of the debug view of the version `version`, with its version.

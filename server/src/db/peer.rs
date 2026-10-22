@@ -465,19 +465,37 @@ pub(crate) fn check_new_delegations(
         ])?;
         while let Some(row) = rows.next()? {
             let prefix = prefix_from_row(row.get(0)?, row.get(1)?)?;
+            let public_key = row_key(row, 2)?;
             let holder = match row.get::<_, Option<String>>(3)? {
                 Some(name) => format!("peer {name}"),
-                None => format!("the peer with public key {}", row_key(row, 2)?),
+                None => format!("the peer with public key {public_key}"),
             };
-            others.push((prefix, holder));
+            others.push((prefix, holder, public_key));
         }
     }
-    let others = others
+    let named = others
         .iter()
-        .map(|(prefix, holder)| (prefix, holder.as_str()));
-    check_delegations(delegations, &cidrs, others).map_err(|e| {
+        .map(|(prefix, holder, _)| (prefix, holder.as_str()));
+    check_delegations(delegations, &cidrs, named).map_err(|e| {
         log::warn!("refusing delegations {delegations:?}: {e}");
-        ServerError::Delegation(e.to_string())
+        let reason = e.to_string();
+        // Delegations that are refused only for those of other peers overlap one of them, which
+        // the error names, as check_delegations finds it.
+        if check_delegations(delegations, &cidrs, []).is_err() {
+            return ServerError::Delegation(reason);
+        }
+        others
+            .iter()
+            .find_map(|(held, _, holder)| {
+                let prefix = delegations.iter().find(|prefix| prefix.overlaps(held))?;
+                Some(ServerError::DelegationTaken {
+                    reason: reason.clone(),
+                    prefix: *prefix,
+                    held: *held,
+                    holder: holder.clone(),
+                })
+            })
+            .unwrap_or(ServerError::Delegation(reason))
     })
 }
 

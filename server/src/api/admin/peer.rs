@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::DatabasePeer,
-    util::{decode, form_body, form_response, form_status_response, read_body, status_response},
+    util::{
+        decode, form_response, form_status_response, read_body, status_response, tagged_form_body,
+    },
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -29,26 +31,41 @@ pub async fn routes(
         return Err(ServerError::NotFound);
     }
     let key = peer.as_deref().map(parse_path_key).transpose()?;
+    // A key that no peer has is refused as such, apart from a path that the server has no route
+    // for.
+    let no_such_peer = |e: ServerError| e.not_found_as(ServerError::NoSuchPeer);
     match (req.method(), key, resource.as_deref()) {
         (&Method::GET, None, None) => handlers::list(session).await,
         (&Method::POST, None, None) => {
             let form = peer_form_body(req, &session).await?;
             handlers::create(form, session).await
         },
-        (&Method::GET, Some(key), None) => handlers::get_by_key(key, session).await,
+        (&Method::GET, Some(key), None) => handlers::get_by_key(key, session)
+            .await
+            .map_err(no_such_peer),
         (&Method::PUT, Some(key), None) => {
-            let form = form_body(req, &session).await?;
-            handlers::update_by_key(key, form, session).await
+            let form = tagged_form_body(req, &session).await?;
+            handlers::update_by_key(key, form, session)
+                .await
+                .map_err(no_such_peer)
         },
-        (&Method::GET, Some(key), Some("endpoints")) => handlers::endpoints(key, session).await,
+        (&Method::GET, Some(key), Some("endpoints")) => handlers::endpoints(key, session)
+            .await
+            .map_err(no_such_peer),
         (&Method::PUT, Some(key), Some("endpoints")) => {
-            let form = form_body(req, &session).await?;
-            handlers::set_endpoints(key, form, session).await
+            let form = tagged_form_body(req, &session).await?;
+            handlers::set_endpoints(key, form, session)
+                .await
+                .map_err(no_such_peer)
         },
-        (&Method::GET, Some(key), Some("delegations")) => handlers::delegations(key, session).await,
+        (&Method::GET, Some(key), Some("delegations")) => handlers::delegations(key, session)
+            .await
+            .map_err(no_such_peer),
         (&Method::PUT, Some(key), Some("delegations")) => {
-            let form = form_body(req, &session).await?;
-            handlers::set_delegations(key, form, session).await
+            let form = tagged_form_body(req, &session).await?;
+            handlers::set_delegations(key, form, session)
+                .await
+                .map_err(no_such_peer)
         },
         _ => Err(ServerError::NotFound),
     }
@@ -290,7 +307,7 @@ mod handlers {
 mod tests {
     use super::*;
     use crate::{db::DatabaseCidr, test};
-    use innernet_shared::{Endpoint, Error, LegacyPeer, Prefix, State};
+    use innernet_shared::{problem, Endpoint, Error, LegacyPeer, Prefix, State};
     use wireguard_control::KeyPair;
 
     #[tokio::test]
@@ -393,16 +410,23 @@ mod tests {
 
         let old_peers = DatabasePeer::list(&server.db().lock())?;
 
-        // Try to add a peer with an IP that is already taken, which the server explains.
+        // Try to add a peer with an IP that is already taken, which the server explains, and
+        // names the delegation that it overlaps, and its holder.
         let peer = test::developer_peer_contents("developer3", test::DEVELOPER2_PEER_IP)?;
 
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
 
-        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("delegated to peer developer2"));
+        let problem = test::problem(res, &problem::DELEGATION_REFUSED).await?;
+        assert!(problem
+            .detail
+            .unwrap()
+            .contains("delegated to peer developer2"));
+        let developer2 = test::peer(&server.db.lock(), test::DEVELOPER2_PEER_ID);
+        assert_eq!(problem.prefix, Some(peer.delegations[0]));
+        assert_eq!(problem.held, Some(developer2.delegations[0]));
+        assert_eq!(problem.holder, Some(developer2.public_key.clone()));
 
         // The number of peer entries in the database should not change.
         let new_peers = DatabasePeer::list(&server.db().lock())?;
@@ -439,9 +463,9 @@ mod tests {
             let res = server
                 .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
                 .await;
-            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-            let body = hyper::body::to_bytes(res.into_body()).await?;
-            assert!(String::from_utf8_lossy(&body).contains(reason), "{ip}");
+            let problem = test::problem(res, &problem::DELEGATION_REFUSED).await?;
+            assert!(problem.detail.unwrap().contains(reason), "{ip}");
+            assert_eq!((problem.prefix, problem.holder), (None, None));
         }
 
         // The number of peer entries in the database should not change.
@@ -467,9 +491,8 @@ mod tests {
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
-        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("child CIDR"));
+        let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
+        assert!(detail.contains("child CIDR"), "{detail}");
 
         // The number of peer entries in the database should not change.
         let new_peers = DatabasePeer::list(&server.db().lock())?;
@@ -575,20 +598,21 @@ mod tests {
                 &change,
             )
             .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::blank_problem(res, StatusCode::NOT_FOUND).await?;
 
-        // An unknown key is not found, even with the tag of a peer that exists.
+        // An unknown key is not found, even with the tag of a peer that exists, and the problem
+        // says so, unlike that of a path that the server has no route for.
         let unknown = PeerContents {
             public_key: KeyPair::generate().public.to_base64(),
             ..new_peer.inner.clone()
         };
         let path = format!("/v1/admin/peers/{}", unknown.api_path_segment());
         let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &problem::NO_SUCH_PEER).await?;
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
             .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &problem::NO_SUCH_PEER).await?;
         Ok(())
     }
 
@@ -655,9 +679,8 @@ mod tests {
                     with(&delegations)?,
                 )
                 .await;
-            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-            let body = hyper::body::to_bytes(res.into_body()).await?;
-            assert!(String::from_utf8_lossy(&body).contains(reason), "{reason}");
+            let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
+            assert!(detail.contains(reason), "{reason}");
         }
 
         // A peer is created with every delegation it is offered.
@@ -715,9 +738,8 @@ mod tests {
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, rename("second"))
             .await;
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("changed"));
+        let detail = test::problem_detail(res, &problem::PEER_CHANGED).await?;
+        assert!(detail.contains("changed"), "{detail}");
         assert_eq!(
             peer(&server, test::DEVELOPER1_PEER_ID).name.as_deref(),
             Some("first")
@@ -733,7 +755,7 @@ mod tests {
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
             .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        test::problem(res, &problem::TAG_MISSING).await?;
         assert_eq!(
             peer(&server, test::DEVELOPER1_PEER_ID).name.as_deref(),
             Some("first")
@@ -849,19 +871,15 @@ mod tests {
         // A change based on delegations read before is refused, as is one without a tag or with
         // a misaligned prefix, and delegations that break the rules are refused with an
         // explanation.
-        assert_eq!(
-            put(&path, &[&own], &seen.tag).await.status(),
-            StatusCode::CONFLICT
-        );
+        let res = put(&path, &[&own], &seen.tag).await;
+        test::problem(res, &problem::PEER_CHANGED).await?;
         let untagged = serde_json::json!({ "delegations": [own] });
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
             .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            put(&path, &[&misaligned], &current.tag).await.status(),
-            StatusCode::BAD_REQUEST
-        );
+        test::problem(res, &problem::TAG_MISSING).await?;
+        let res = put(&path, &[&misaligned], &current.tag).await;
+        test::blank_problem(res, StatusCode::BAD_REQUEST).await?;
         // A prefix of the user CIDR, another than the peer's.
         let other_cidr = if cfg!(feature = "v6-test") {
             "fd00:1337::3:0:1:0/112"
@@ -878,9 +896,8 @@ mod tests {
             ),
         ] {
             let res = put(&path, &delegations, &current.tag).await;
-            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-            let body = hyper::body::to_bytes(res.into_body()).await?;
-            assert!(String::from_utf8_lossy(&body).contains(reason), "{reason}");
+            let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
+            assert!(detail.contains(reason), "{reason}");
         }
         assert_eq!(get(path.clone()).await, current);
 
@@ -895,9 +912,8 @@ mod tests {
         let other = get(other_path.clone()).await;
         let other_own = other.delegations[0].to_string();
         let res = put(&other_path, &[&other_own, &wider], &other.tag).await;
-        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("pinned"));
+        let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
+        assert!(detail.contains("pinned"), "{detail}");
         assert_eq!(get(other_path).await, other);
 
         // A peer may be left without a delegation, which leaves it out of the legacy view.
@@ -934,7 +950,7 @@ mod tests {
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", &unknown_path)
             .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &problem::NO_SUCH_PEER).await?;
         Ok(())
     }
 
@@ -956,9 +972,8 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        assert!(String::from_utf8_lossy(&body).contains("internal address"));
+        let detail = test::problem_detail(res, &problem::DELEGATION_REFUSED).await?;
+        assert!(detail.contains("internal address"), "{detail}");
         assert_eq!(
             peer(&server, test::SERVER_PEER_ID).delegations,
             seen.delegations
@@ -1041,7 +1056,7 @@ mod tests {
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
             .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        test::problem(res, &problem::TAG_MISSING).await?;
         assert_eq!(get().await, current);
 
         // Any other path under a peer is not found, rather than routed to the peer itself, and
@@ -1056,7 +1071,7 @@ mod tests {
                 let res = server
                     .form_request(test::ADMIN_PEER_IP, method, &path, &current)
                     .await;
-                assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {path}");
+                test::blank_problem(res, StatusCode::NOT_FOUND).await?;
             }
         }
         server.predate_tls(test::ADMIN_PEER_ID);
@@ -1100,7 +1115,7 @@ mod tests {
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
             .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &problem::NO_SUCH_PEER).await?;
         let invitee = DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?;
         assert_eq!(invitee.name.as_deref(), Some("invitee"));
         Ok(())

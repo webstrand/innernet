@@ -248,9 +248,19 @@ pub(crate) async fn hyper_service(
         .map(String::from)
         .collect();
 
+    // A client that connects over TLS is told of errors in problem details, in the debug view if
+    // it chose it, and one in plain HTTP as clients that predate TLS expect.
+    let over_tls = client_key.is_some();
+    let debug_view = util::debug_view(&req);
     routes(req, context, remote_addr, client_key, components)
         .await
-        .or_else(TryInto::try_into)
+        .or_else(|e| {
+            if over_tls {
+                e.problem_response(debug_view)
+            } else {
+                e.try_into()
+            }
+        })
 }
 
 async fn routes(
@@ -388,6 +398,95 @@ mod tests {
             .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
             .await;
         assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_errors_by_transport() -> Result<(), Error> {
+        let server = test::Server::new()?;
+
+        // A TLS session is told of errors in problem details, in deterministic CBOR. An error
+        // without a meaning of innernet's own is of the type about:blank.
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/nothing")
+            .await;
+        assert_eq!(
+            res.headers()[hyper::header::CONTENT_TYPE],
+            "application/problem+cbor"
+        );
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let problem: innernet_shared::problem::Problem = innernet_shared::cbor::from_slice(&body)?;
+        assert_eq!(innernet_shared::cbor::to_vec(&problem)?, body);
+        assert_eq!(
+            problem,
+            innernet_shared::problem::Problem::about_blank(404, Some("Not Found"))
+        );
+        for (ip, path, status) in [
+            (test::ADMIN_PEER_IP, "/user/state", StatusCode::NOT_FOUND),
+            (
+                test::USER1_PEER_IP,
+                "/v1/admin/peers",
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let res = server.request(ip, "GET", path).await;
+            test::blank_problem(res, status).await?;
+        }
+
+        // A request that chooses the debug view is told of errors in the debug view too, even a
+        // change, which the debug view doesn't answer.
+        for (method, path, status) in [
+            ("GET", "/v1/admin/nothing", StatusCode::NOT_FOUND),
+            ("PUT", "/v1/user/candidates", StatusCode::NOT_ACCEPTABLE),
+        ] {
+            let mut req = server.body_request(method, path, &test::content_type(), vec![0x80]);
+            req.headers_mut()
+                .insert(hyper::header::ACCEPT, "*/*".parse().unwrap());
+            let res = server.raw_request(test::ADMIN_PEER_IP, req).await;
+            assert_eq!(res.status(), status);
+            assert_eq!(
+                res.headers()[hyper::header::CONTENT_TYPE],
+                "application/problem+cbor-diagnostic"
+            );
+            let body = hyper::body::to_bytes(res.into_body()).await?;
+            let text = String::from_utf8(body.to_vec())?;
+            assert!(
+                text.starts_with(
+                    "# unstable debug view; use Accept: application/vnd.innernet+cbor; \
+                     version=1\n{"
+                ),
+                "{text}"
+            );
+            assert!(text.contains("\"type\": \"about:blank\""), "{text}");
+        }
+
+        // A request that accepts no version is told so in CBOR.
+        let mut req = server.body_request("GET", "/v1/user/state", "", vec![]);
+        req.headers_mut().remove(hyper::header::CONTENT_TYPE);
+        req.headers_mut().insert(
+            hyper::header::ACCEPT,
+            "application/vnd.innernet+cbor; version=2".parse().unwrap(),
+        );
+        let res = server.raw_request(test::ADMIN_PEER_IP, req).await;
+        test::blank_problem(res, StatusCode::NOT_ACCEPTABLE).await?;
+
+        // A plain-HTTP session is told of errors as before: with an explanation in plain text
+        // for those that clients that predate TLS can't make sense of, and an empty body
+        // otherwise, without a content type.
+        server.predate_tls(test::USER1_PEER_ID);
+        let res = server
+            .plain_request(test::USER1_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().get(hyper::header::CONTENT_TYPE).is_none());
+        assert!(hyper::body::to_bytes(res.into_body()).await?.is_empty());
+        let res = server
+            .plain_request(test::USER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(hyper::header::CONTENT_TYPE).is_none());
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        assert_eq!(body, ServerError::TlsRequired.to_string());
         Ok(())
     }
 

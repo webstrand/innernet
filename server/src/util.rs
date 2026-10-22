@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use hyper::{body::HttpBody, header, Body, Method, Request, Response, StatusCode};
 use innernet_shared::cbor;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{
+    de::{DeserializeOwned, IgnoredAny},
+    Deserialize, Serialize,
+};
 
 use crate::{ServerError, Session};
 use innernet_shared::media_type::{self, Representation};
@@ -15,6 +18,32 @@ pub async fn form_body<F: DeserializeOwned>(
     session: &Session,
 ) -> Result<F, ServerError> {
     let body = read_body(req, session).await?;
+    decode(session, &body)
+}
+
+/// Reads the body of `req`, a change of a tagged resource in `session`, as [`form_body`] does. A
+/// change without a body, or whose body has no tag, is refused as [`ServerError::TagMissing`].
+pub async fn tagged_form_body<F: DeserializeOwned>(
+    req: Request<Body>,
+    session: &Session,
+) -> Result<F, ServerError> {
+    #[derive(Deserialize)]
+    struct Tagged {
+        #[serde(default)]
+        tag: Option<IgnoredAny>,
+    }
+
+    let has_body = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .is_some_and(|length| length != "0");
+    if !has_body {
+        return Err(ServerError::TagMissing);
+    }
+    let body = read_body(req, session).await?;
+    if decode::<Tagged>(session, &body)?.tag.is_none() {
+        return Err(ServerError::TagMissing);
+    }
     decode(session, &body)
 }
 
@@ -75,6 +104,17 @@ pub fn negotiate(req: &Request<Body>) -> Result<Representation, ServerError> {
         Some(Representation::Diagnostic(_)) if changes_state => Err(ServerError::NotAcceptable),
         Some(representation) => Ok(representation),
         None => Err(ServerError::NotAcceptable),
+    }
+}
+
+/// The version of the debug view that `req`, a request of a TLS session, chooses with its
+/// `Accept`, as [`media_type::negotiate`] chooses it, or `None` if it chooses no debug view. The
+/// problems of such a request are answered in the debug view too, even for a change, which the
+/// debug view never answers otherwise.
+pub fn debug_view(req: &Request<Body>) -> Option<u32> {
+    match media_type::negotiate(accept(req).as_deref(), media_type::VERSIONS) {
+        Some(Representation::Diagnostic(version)) => Some(version),
+        _ => None,
     }
 }
 

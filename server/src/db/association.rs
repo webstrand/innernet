@@ -139,7 +139,7 @@ mod tests {
         let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = server.request(test::ADMIN_PEER_IP, "DELETE", &path).await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        test::problem(res, &innernet_shared::problem::NO_SUCH_ASSOCIATION).await?;
         // A path that names no pair of prefixes is no route of the server.
         for path in [
             "/v1/admin/associations/1",
@@ -151,8 +151,14 @@ mod tests {
             ),
         ] {
             let res = server.request(test::ADMIN_PEER_IP, "DELETE", path).await;
-            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            test::blank_problem(res, StatusCode::NOT_FOUND).await?;
         }
+
+        // A deletion carries no body, and a content type that announces one is a malformed
+        // request.
+        let req = server.body_request("DELETE", &path, &test::content_type(), vec![]);
+        let res = server.raw_request(test::ADMIN_PEER_IP, req).await;
+        test::blank_problem(res, StatusCode::BAD_REQUEST).await?;
         Ok(())
     }
 

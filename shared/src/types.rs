@@ -960,7 +960,9 @@ pub struct TaggedPeerDelegations {
 
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
 /// canonical base64 encoding, so that public keys can be compared as strings.
-fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+pub(crate) fn deserialize_public_key<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
     let public_key = String::deserialize(deserializer)?;
     Key::from_base64(&public_key)
         .map(|key| key.to_base64())

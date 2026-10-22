@@ -30,7 +30,11 @@ pub async fn routes(
             let form = form_body(req, &session).await?;
             handlers::create(form, session).await
         },
-        (&Method::DELETE, [a, b]) => handlers::delete(a, b, session).await,
+        // A pair of prefixes that no association joins is refused as such, apart from a path
+        // that the server has no route for.
+        (&Method::DELETE, [a, b]) => handlers::delete(a, b, session)
+            .await
+            .map_err(|e| e.not_found_as(ServerError::NoSuchAssociation)),
         _ => Err(ServerError::NotFound),
     }
 }

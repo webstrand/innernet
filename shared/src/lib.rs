@@ -18,6 +18,7 @@ pub mod media_type;
 mod netlink;
 pub mod peer;
 pub mod prefix;
+pub mod problem;
 pub mod prompts;
 pub mod tls;
 pub mod types;
