@@ -612,14 +612,15 @@ step "the server is upgraded"
 names=$(osrv_db "SELECT name FROM peers ORDER BY name")
 cidr_names=$(osrv_db "SELECT name FROM cidrs ORDER BY name")
 stop_osrv
-# Nothing writes the config: the upgraded server refuses the config of innernet-server 2.0.0,
-# which states no QUIC port, and suggests a free one. The operator adds a UDP port that it finds
-# free itself. innernet-server 2.0.0 ignores the key.
+# Nothing writes the config: the upgraded server refuses the config of innernet-server 2.0.0, and
+# names the config in its own layout, with a QUIC port to add. The operator writes the config so,
+# with a UDP port that it finds free itself.
+cp "$work/osrv/conf/e2o.conf" "$work/e2o.v2.conf"
 if ns osrv "$E2E_BIN/innernet-server" -c "$work/osrv/conf" -d "$work/osrv/data" serve e2o \
     --no-write-hosts >"$work/osrv.refusal.log" 2>&1; then
-    fail "the upgraded server started without a QUIC port"
+    fail "the upgraded server started with the config of innernet-server 2.0.0"
 fi
-grep -q "states no quic-port" "$work/osrv.refusal.log" ||
+grep -q "layout of innernet-server 2.0.0" "$work/osrv.refusal.log" ||
     fail "the upgraded server doesn't explain its refusal: $(cat "$work/osrv.refusal.log")"
 chosen_port=$(ns osrv python3 -I -c '
 import socket
@@ -630,9 +631,25 @@ while True:
     if port != 51820:
         print(port)
         break')
-echo "quic-port = $chosen_port" >>"$work/osrv/conf/e2o.conf"
-pass "the upgraded server refuses a config without a QUIC port, and the operator adds one"
+python3 -I - "$work/e2o.v2.conf" "$work/osrv/conf/e2o.conf" "$chosen_port" <<'EOF'
+import sys, tomllib
+source, target, port = sys.argv[1:]
+v2 = tomllib.load(open(source, "rb"))
+open(target, "w").write(f"""[interface]
+network-name = "e2o"
+address = "{v2['address']}/{v2['network-cidr-prefix']}"
+private-key = "{v2['private-key']}"
+listen-port = {v2['listen-port']}
+
+[coordinator]
+quic-port = {port}
+bootstrap-endpoint = "198.18.0.6:51820"
+""")
+EOF
+pass "the upgraded server refuses the config of 2.0.0, and the operator writes it anew"
 serve_osrv "$E2E_BIN"
+[ -f "$work/osrv/data/e2o.db.v2.0.0" ] || fail "the upgraded server didn't back up its database"
+pass "the upgraded server backed up its database before rebuilding it"
 [ "$(osrv_db "SELECT name FROM offered_names ORDER BY name")" = "$names" ] ||
     fail "the upgraded server didn't keep every peer"
 pass "the upgraded server keeps every peer"
@@ -641,13 +658,12 @@ pass "the upgraded server keeps every peer"
 pass "the upgraded server keeps every CIDR"
 # Prints the QUIC port of osrv's config.
 osrv_quic_port() { sed -n 's/^quic-port = //p' "$work/osrv/conf/e2o.conf"; }
+[ "$(osrv_quic_port)" = "$chosen_port" ] || fail "the config lost its QUIC port"
 client c fetch e2o || fail "fetch as c from the upgraded server"
 [ "$(client_latched c)" = 1 ] || fail "c didn't latch the upgraded server"
 pass "c fetches over TLS, and latched the server"
 [ "$(recorded_port c e2o)" = "$(osrv_quic_port)" ] || fail "c didn't record the QUIC port"
 pass "c learned the QUIC port from the capabilities, and recorded it"
-[ -f "$work/osrv/data/e2o.db.v2.0.0" ] || fail "the upgraded server didn't back up its database"
-pass "the upgraded server backed up its database before rebuilding it"
 # The upgraded server's database offers each peer its name apart.
 d_peer() {
     osrv_db "SELECT o.name, p.is_disabled FROM peers p LEFT JOIN offered_names o USING (public_key)
@@ -670,9 +686,11 @@ pass "c renames and deletes a CIDR and an association by prefix over TLS"
 
 step "the server is downgraded"
 stop_osrv
-# The server that predates TLS can't read the rebuilt database, so the operator restores the copy
-# that the upgrade made. It ignores the QUIC port of the config.
+# The server that predates TLS can't read the rebuilt database nor the config, so the operator
+# restores the copy of the database that the upgrade made, and the config of 2.0.0.
+cp "$work/osrv/conf/e2o.conf" "$work/e2o.upgraded.conf"
 cp "$work/osrv/data/e2o.db.v2.0.0" "$work/osrv/data/e2o.db"
+cp "$work/e2o.v2.conf" "$work/osrv/conf/e2o.conf"
 serve_osrv "$E2E_ORIGIN_BIN"
 if client c fetch e2o; then
     fail "c fell back to plain HTTP for a server that it knows speaks TLS"
@@ -682,7 +700,8 @@ pass "c refuses the downgraded server"
 
 step "the server is upgraded again, with another QUIC port"
 stop_osrv
-# The operator moves the QUIC port, which c has recorded.
+# The operator puts back the upgraded config, and moves the QUIC port, which c has recorded.
+cp "$work/e2o.upgraded.conf" "$work/osrv/conf/e2o.conf"
 old_port=$(osrv_quic_port)
 new_port=$((old_port == 4433 ? 4434 : 4433))
 sed -i "s/^quic-port = .*/quic-port = $new_port/" "$work/osrv/conf/e2o.conf"

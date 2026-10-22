@@ -24,6 +24,9 @@ pub struct LocalLink {
     pub db: Db,
     /// The public key of the server's own peer, the node's.
     pub server_key: Key,
+    /// The endpoint at which peers first reach the coordinator, which the node announces as its
+    /// own when it states none, since nothing observes it.
+    pub bootstrap: Option<Endpoint>,
 }
 
 impl LocalLink {
@@ -59,10 +62,12 @@ impl Link for LocalLink {
         Some(accept::all_claim_types())
     }
 
-    /// Nothing observes the server's node, so its observed endpoint is the endpoint recorded at
-    /// initialization until the node first announces, and the preferred endpoint that it last
-    /// announced after.
+    /// The bootstrap endpoint, or, without one, the endpoint recorded at initialization until
+    /// the node first announces, and the preferred endpoint that it last announced after.
     fn observed_endpoint(&self) -> Option<Endpoint> {
+        if self.bootstrap.is_some() {
+            return self.bootstrap.clone();
+        }
         let me = self.coordinator().ok()?;
         match me.signed_announcement() {
             Some(announced) => announced.endpoints.first().cloned(),

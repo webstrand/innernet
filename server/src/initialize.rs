@@ -1,4 +1,5 @@
 use crate::{
+    config::CoordinatorTable,
     db::{self, DatabaseCidr, DatabasePeer},
     ConfigFile, Interface, Path, ServerConfig,
 };
@@ -10,7 +11,8 @@ use indoc::printdoc;
 use innernet_node::Store;
 use innernet_publicip::Preference;
 use innernet_shared::{
-    prompts, Endpoint, IpNetExt, PeerContents, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    interface_config::InterfaceInfo, prompts, Endpoint, IpNetExt, PeerContents, Prefix,
+    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
 use std::{
@@ -215,15 +217,21 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
     let config_path = conf.config_path(&name);
     let our_keypair = KeyPair::generate();
 
-    let config = ConfigFile {
-        private_key: our_keypair.private.to_base64(),
-        listen_port,
-        address: our_ip,
-        network_cidr_prefix: root_cidr.prefix_len(),
-        quic_port: Some(quic_port),
-        legacy_api: true,
-        dns: None,
-    };
+    let network_name = name.to_string().parse()?;
+    let mut interface = InterfaceInfo::new(
+        &network_name,
+        &our_keypair,
+        IpNet::new(our_ip, root_cidr.prefix_len())?,
+    );
+    interface.listen_port = Some(listen_port);
+    let config = ConfigFile::new(
+        interface,
+        CoordinatorTable {
+            quic_port: Some(quic_port),
+            legacy_api: true,
+            bootstrap_endpoint: Some(endpoint.clone()),
+        },
+    );
     config.write_to_path(config_path)?;
 
     let db_init_data = DbInitData {

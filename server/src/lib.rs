@@ -13,27 +13,24 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    interface_config::{DnsInfo, InterfaceConfig, InterfaceInfo, ServerInfo, FEATURE_TLS},
+    interface_config::{InterfaceConfig, ServerInfo, FEATURE_TLS},
     prompts, wg, Error, HostsOpts, Interface, IoErrorContext, NatOpts, NetworkOpts,
 };
-use ipnet::IpNet;
 use node::LocalLink;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
-    fs::{File, OpenOptions},
-    io::prelude::*,
+    fs::File,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use wireguard_control::{InterfaceName, Key, KeyPair};
+use wireguard_control::{InterfaceName, Key};
 
 mod api;
+pub mod config;
 mod coordinator;
 mod db;
 mod error;
@@ -44,102 +41,12 @@ mod quic;
 mod test;
 mod util;
 
-pub use error::ServerError;
-
+pub use config::{ConfigFile, V2Layout};
 pub(crate) use coordinator::{hyper_service, ConnectionMode, Db, Endpoints};
 pub use coordinator::{Context, Session};
+pub use error::ServerError;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(rename_all = "kebab-case")]
-pub struct ConfigFile {
-    /// The server's WireGuard key
-    pub private_key: String,
-
-    /// The listen port of the server
-    pub listen_port: u16,
-
-    /// The internal WireGuard IP address assigned to the server
-    pub address: IpAddr,
-
-    /// The CIDR prefix of the WireGuard network
-    pub network_cidr_prefix: u8,
-
-    /// The UDP port of the TLS API, which runs over QUIC at the server's internal address. The
-    /// kernel's WireGuard holds `listen_port` on every address, so the API needs a port of its
-    /// own. The server refuses to start without it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic_port: Option<u16>,
-
-    /// Whether the server serves the legacy API, in plain HTTP over TCP on the listen port, to
-    /// clients that predate TLS, which it identifies by their source address, and to clients
-    /// upgraded from v2.0.0, which ask it for the QUIC port. On unless the config turns it off.
-    #[serde(default = "yes", skip_serializing_if = "is_yes")]
-    pub legacy_api: bool,
-
-    /// The DNS server that the server runs, as every node runs it, at the address of the
-    /// table, or `None` if the server runs none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsInfo>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-fn is_yes(value: &bool) -> bool {
-    *value
-}
-
-impl ConfigFile {
-    /// The prefix of the whole network.
-    pub fn network(&self) -> IpNet {
-        IpNet::new(self.address, self.network_cidr_prefix)
-            .map(|net| net.trunc())
-            .unwrap_or_else(|_| IpNet::from(self.address))
-    }
-
-    /// The server's node of `interface` as the config of a client's interface describes it: its
-    /// address, with the prefix of the network, its private key and its listen port.
-    pub fn interface_info(&self, interface: &InterfaceName) -> Result<InterfaceInfo, Error> {
-        let keypair = KeyPair::from_private(Key::from_base64(&self.private_key)?);
-        let address = IpNet::new(self.address, self.network_cidr_prefix)?;
-        let mut info = InterfaceInfo::new(interface, &keypair, address);
-        info.listen_port = Some(self.listen_port);
-        Ok(info)
-    }
-
-    pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
-        let mut invitation_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_path(&path)?;
-        innernet_shared::chmod(&invitation_file, 0o600)?;
-        invitation_file
-            .write_all(toml::to_string(self).unwrap().as_bytes())
-            .with_path(path)?;
-        Ok(())
-    }
-
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let mut file = File::open(path).with_path(path)?;
-        if innernet_shared::chmod(&file, 0o600)? {
-            println!(
-                "{} updated permissions for {} to 0600.",
-                "[!]".yellow(),
-                path.display()
-            );
-        }
-        let mut toml = String::new();
-        file.read_to_string(&mut toml).with_path(path)?;
-        Ok(toml::from_str(&toml)?)
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -178,11 +85,12 @@ impl ServerConfig {
     }
 }
 
-/// Opens the database of `interface`, for the network of its config, migrating a database of
-/// 2.0.0, whose coordinator is the peer with the public key of the config's private key.
+/// Opens the database of `interface`, for the network of `config`, migrating a database of
+/// v2.0.0, whose coordinator is the peer with the public key of the config's private key.
 fn open_database_connection(
     interface: &InterfaceName,
     conf: &ServerConfig,
+    config: &ConfigFile,
 ) -> Result<Store, Error> {
     let database_path = conf.database_path(interface);
     if !Path::new(&database_path).exists() {
@@ -191,8 +99,7 @@ fn open_database_connection(
             database_path.to_string_lossy()
         );
     }
-    let config = ConfigFile::from_file(conf.config_path(interface))?;
-    let server_key = Key::from_base64(&config.private_key)?.get_public();
+    let server_key = Key::from_base64(&config.interface.private_key)?.get_public();
 
     let file = File::open(&database_path).with_path(&database_path)?;
     innernet_shared::warn_on_dangerous_mode(&file, &database_path).with_path(&database_path)?;
@@ -205,9 +112,9 @@ fn open_database_connection(
 }
 
 /// The admin client of the coordinator of a network, which the running server serves: the
-/// server's own peer, an admin, over TLS, at the primary IP and the API port of its config. Every
-/// change of the network goes through the coordinator, so a command fails if the server isn't
-/// running.
+/// server's own peer, an admin, over TLS, at the primary IP and the QUIC port of its config, with
+/// the coordinator named as invitations name it, at the bootstrap endpoint. Every change of the
+/// network goes through the coordinator, so a command fails if the server isn't running.
 pub struct AdminClient {
     interface: InterfaceName,
     config: InterfaceConfig,
@@ -222,21 +129,22 @@ impl AdminClient {
                 interface.as_str_lossy()
             )
         };
-        let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
         let server = ServerInfo {
-            public_key: Key::from_base64(&config.private_key)?
+            public_key: Key::from_base64(&config.interface.private_key)?
                 .get_public()
                 .to_base64(),
-            // Invitations name the coordinator at the endpoint of the server's own peer, which
-            // `new` records and the coordinator lists, in place of this one.
-            external_endpoint: internal_endpoint.into(),
-            internal_endpoint,
+            external_endpoint: config
+                .coordinator
+                .bootstrap_endpoint
+                .clone()
+                .ok_or_else(incomplete)?,
+            internal_endpoint: SocketAddr::new(config.address(), config.listen_port()),
             features: vec![FEATURE_TLS.to_string()],
-            quic_port: Some(config.quic_port.ok_or_else(incomplete)?),
+            quic_port: Some(config.coordinator.quic_port.ok_or_else(incomplete)?),
         };
         Ok(Self {
             interface: *interface,
-            config: InterfaceConfig::new(config.interface_info(interface)?, server),
+            config: InterfaceConfig::new(config.interface, server),
         })
     }
 
@@ -309,22 +217,50 @@ pub async fn serve(
 ) -> Result<(), Error> {
     hosts_opts.warn_of_hosts_file_options();
     let config_path = conf.config_path(&interface);
-    let config = ConfigFile::from_file(&config_path)?;
-    let quic_port = quic_port(&config, &config_path)?;
+    let (config, v2) = match ConfigFile::from_file(&config_path) {
+        Ok(config) => (config, false),
+        Err(e) => match e.downcast::<V2Layout>() {
+            Ok(V2Layout(config)) => (config, true),
+            Err(e) => return Err(e),
+        },
+    };
     log::debug!("opening database connection...");
-    let store = open_database_connection(&interface, conf)?;
+    let store = open_database_connection(&interface, conf, &config)?;
     let public_key = check_database_matches_config(&store, &config)?;
-    check_internal_address(
-        &DatabasePeer::get_from_public_key(&store, &public_key)?,
-        config.address,
-    )?;
+    let myself = DatabasePeer::get_from_public_key(&store, &public_key)?;
+    check_internal_address(&myself, config.address())?;
+    // Nothing writes the config, so a config that lacks what the server needs, or one in the
+    // layout of v2.0.0, is refused with the config that the operator must write in its place.
+    let (completed, missing) = complete(&config, &myself)?;
+    if v2 || !missing.is_empty() {
+        let refusal = if v2 {
+            format!(
+                "{} is in the layout of innernet-server 2.0.0, which this version doesn't read",
+                config_path.display()
+            )
+        } else {
+            format!(
+                "{} states no {} in [coordinator]",
+                config_path.display(),
+                missing.join(" nor ")
+            )
+        };
+        bail!(
+            "{refusal}; nothing writes the config, so the operator must replace it with:\n\n{}",
+            completed.to_toml()?
+        );
+    }
+    let quic_port = config
+        .coordinator
+        .quic_port
+        .expect("a complete config states the QUIC port");
 
     log::info!("bringing up interface.");
     wg::up(
         &interface,
-        &config.private_key,
-        IpNet::new(config.address, config.network_cidr_prefix)?,
-        Some(config.listen_port),
+        &config.interface.private_key,
+        config.interface.address,
+        Some(config.listen_port()),
         None,
         &network,
     )?;
@@ -339,14 +275,14 @@ pub async fn serve(
     // QUIC never completes a handshake over an interface whose MTU can't carry its datagrams.
     tunnel
         .capabilities()
-        .check_quic_mtu(&interface, config.address)?;
+        .check_quic_mtu(&interface, config.address())?;
     log::info!("the TLS API's QUIC port is {quic_port}.");
     let db = Arc::new(Mutex::new(store));
     let changed = StoreChanged::default();
     let mut node = Node {
         interface,
-        info: config.interface_info(&interface)?,
-        listen_port: config.listen_port,
+        info: config.interface.clone(),
+        listen_port: config.listen_port(),
         nat: NatOpts {
             no_nat_traversal: false,
             exclude_nat_candidates: vec![],
@@ -361,6 +297,7 @@ pub async fn serve(
     let mut link = LocalLink {
         db: db.clone(),
         server_key: public_key,
+        bootstrap: config.coordinator.bootstrap_endpoint.clone(),
     };
     let triggers = Triggers {
         changed: Some(changed.clone()),
@@ -378,20 +315,21 @@ pub async fn serve(
     log::info!("innernet-server {} starting.", VERSION);
     // The TLS API runs over QUIC, at the primary IP, on a port of its own.
     let sockets = Sockets {
-        quic: get_udp_socket((config.address, quic_port).into(), &interface)?,
+        quic: get_udp_socket((config.address(), quic_port).into(), &interface)?,
         legacy: config
+            .coordinator
             .legacy_api
-            .then(|| get_listener((config.address, config.listen_port).into(), &interface))
+            .then(|| get_listener((config.address(), config.listen_port()).into(), &interface))
             .transpose()?,
     };
     let coordinator = Coordinator::spawn(
         CoordinatorConfig {
             network_name: interface,
-            address: config.address,
+            address: config.address(),
             quic_port,
             network: config.network(),
         },
-        &config.private_key,
+        &config.interface.private_key,
         db,
         sockets,
         Hooks { changed, endpoints },
@@ -425,22 +363,39 @@ fn follow_endpoints(mut events: TunnelEvents) -> Endpoints {
     endpoints
 }
 
-/// The QUIC port of `config`, the config at `path`. Nothing writes the config, so a config that
-/// states none, such as one of v2.0.0, is refused with a free UDP port for the operator to add.
-fn quic_port(config: &ConfigFile, path: &Path) -> Result<u16, Error> {
-    if let Some(port) = config.quic_port {
-        return Ok(port);
+/// `config` with the keys of `[coordinator]` that the server needs to start, and the keys that it
+/// lacks, each with a value to add: a free UDP port as the QUIC port, and as the bootstrap
+/// endpoint the endpoint that `myself`, the server's own peer, last announced first, or, before
+/// its first announcement, the endpoint that the server was initialized with.
+fn complete(
+    config: &ConfigFile,
+    myself: &DatabasePeer,
+) -> Result<(ConfigFile, Vec<&'static str>), Error> {
+    let mut completed = config.clone();
+    let mut missing = vec![];
+    if completed.coordinator.quic_port.is_none() {
+        let unspecified = match config.address() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        completed.coordinator.quic_port = Some(free_udp_port(unspecified, config.listen_port())?);
+        missing.push("quic-port");
     }
-    let unspecified = match config.address {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    };
-    bail!(
-        "{} states no quic-port; nothing writes the config, so the operator must add one, such \
-         as this free UDP port:\n\nquic-port = {}\n",
-        path.display(),
-        free_udp_port(unspecified, config.listen_port)?
-    )
+    if completed.coordinator.bootstrap_endpoint.is_none() {
+        let endpoint = match myself.signed_announcement() {
+            Some(announced) => announced.endpoints.first().cloned(),
+            None => myself.endpoint.clone(),
+        };
+        completed.coordinator.bootstrap_endpoint = Some(endpoint.ok_or_else(|| {
+            anyhow!(
+                "the config states no bootstrap-endpoint in [coordinator], and the server knows \
+                 none to suggest; the operator must add the endpoint at which invitees reach the \
+                 server"
+            )
+        })?);
+        missing.push("bootstrap-endpoint");
+    }
+    Ok((completed, missing))
 }
 
 /// A UDP port that is free at `address`, other than `listen_port`, the port of WireGuard, which
@@ -460,7 +415,7 @@ pub(crate) fn free_udp_port(address: IpAddr, listen_port: u16) -> Result<u16, Er
 /// one with the public key of the config's private key, and returns that key. Without it, the
 /// database and the config belong to different networks, or one of them was edited by hand.
 fn check_database_matches_config(store: &Store, config: &ConfigFile) -> Result<Key, Error> {
-    let public_key = Key::from_base64(&config.private_key)?.get_public();
+    let public_key = Key::from_base64(&config.interface.private_key)?.get_public();
     if DatabasePeer::get_from_public_key(store, &public_key).is_err() {
         bail!(
             "the database and the config don't match: the database holds no peer with the key \
@@ -549,10 +504,10 @@ mod tests {
 
         assert!(Path::new(&server.wg_conf_path()).exists());
         let config = ConfigFile::from_file(server.wg_conf_path())?;
-        assert_eq!(config.quic_port, Some(54322));
+        assert_eq!(config.coordinator.quic_port, Some(54322));
 
         // The server's own peer has the key of the config.
-        let key = Key::from_base64(&config.private_key)?.get_public();
+        let key = Key::from_base64(&config.interface.private_key)?.get_public();
         let own = DatabasePeer::get_from_public_key(&server.db().lock(), &key)?;
         assert_eq!(own.name.as_deref(), Some("innernet-server"));
 
@@ -561,32 +516,91 @@ mod tests {
             check_database_matches_config(&server.db().lock(), &config)?,
             key
         );
-        let other = ConfigFile {
-            private_key: Key::generate_private().to_base64(),
-            ..config
-        };
+        let mut other = config;
+        other.interface.private_key = Key::generate_private().to_base64();
         assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
         Ok(())
     }
 
-    #[test]
-    fn test_config_without_quic_port_is_refused() -> Result<(), Error> {
-        // A config without the QUIC port gets a free one suggested, and nothing writes it.
+    #[tokio::test]
+    async fn test_server_announces_itself() -> Result<(), Error> {
+        // The server signs the announcement of its own peer, as every peer signs its own: its
+        // primary IP is the internal address, and its preferred endpoint the one that it was
+        // initialized with, which it keeps, before its local candidates.
         let server = test::Server::new()?;
-        let path = server.wg_conf_path();
-        let mut config = ConfigFile::from_file(&path)?;
-        assert_eq!(quic_port(&config, &path)?, 54322);
-        config.quic_port = None;
-        let error = quic_port(&config, &path).unwrap_err().to_string();
-        assert!(error.contains("states no quic-port"), "{error}");
-        let suggested: u16 = error
-            .rsplit("quic-port = ")
-            .next()
-            .and_then(|port| port.trim().parse().ok())
-            .expect("a suggested port");
-        assert_ne!(suggested, config.listen_port);
-        assert_eq!(ConfigFile::from_file(&path)?.quic_port, Some(54322));
+        let config = ConfigFile::from_file(server.wg_conf_path())?;
+        let public_key = Key::from_base64(&config.interface.private_key)?.get_public();
+        let db = server.db();
+        let initialized_endpoint = DatabasePeer::get_from_public_key(&db.lock(), &public_key)?
+            .endpoint
+            .clone()
+            .expect("the endpoint that the server was initialized with");
+
+        let interface: InterfaceName = "test".parse()?;
+        let node = Node {
+            interface,
+            info: config.interface.clone(),
+            listen_port: config.listen_port(),
+            nat: NatOpts::all_disabled(),
+            snapshot_config: SnapshotConfig::default(),
+            tunnel: Box::new(WireGuard {
+                interface,
+                backend: wireguard_control::Backend::Userspace,
+                endpoint_overrides: BTreeMap::new(),
+                events: EventSource::default(),
+            }),
+        };
+        let mut link = LocalLink {
+            db: db.clone(),
+            server_key: public_key.clone(),
+            bootstrap: None,
+        };
+        node.announce(&mut link).await?;
+        let announced = DatabasePeer::get_from_public_key(&db.lock(), &public_key)?;
+        assert!(announced.announcement.as_ref().unwrap().is_signed());
+        let announcement = announced.announced.clone().unwrap();
+        assert_eq!(announcement.primary_ip, Some(config.address()));
+        assert_eq!(
+            announcement.endpoints,
+            std::slice::from_ref(&initialized_endpoint)
+        );
+        assert_eq!(announcement.claims.delegation, announced.delegations);
+        assert_eq!(
+            announced.effective().endpoint,
+            Some(initialized_endpoint.clone())
+        );
+
+        // Announcing again changes nothing, so no announcement is made, and the endpoint stays
+        // the one that it last announced.
+        node.announce(&mut link).await?;
+        let again = DatabasePeer::get_from_public_key(&db.lock(), &public_key)?
+            .announced
+            .unwrap();
+        assert_eq!(again, announcement);
+        Ok(())
+    }
+
+    #[test]
+    fn test_incomplete_config_is_completed() -> Result<(), Error> {
+        // A config without the QUIC port or the bootstrap endpoint gets both suggested, and
+        // nothing writes them.
+        let server = test::Server::new()?;
+        let mut config = ConfigFile::from_file(server.wg_conf_path())?;
+        let myself = DatabasePeer::get_from_public_key(&server.db.lock(), server.public_key())?;
+        assert!(complete(&config, &myself)?.1.is_empty());
+        config.coordinator.quic_port = None;
+        config.coordinator.bootstrap_endpoint = None;
+        let (completed, missing) = complete(&config, &myself)?;
+        assert_eq!(missing, ["quic-port", "bootstrap-endpoint"]);
+        assert_ne!(completed.coordinator.quic_port, Some(config.listen_port()));
+        assert_eq!(completed.coordinator.bootstrap_endpoint, myself.endpoint);
+        assert_eq!(
+            ConfigFile::from_file(server.wg_conf_path())?
+                .coordinator
+                .quic_port,
+            Some(54322)
+        );
         Ok(())
     }
 
@@ -771,9 +785,8 @@ mod tests {
         let server = test::Server::new()?;
         let config = ConfigFile::from_file(server.wg_conf_path())?;
         let store = server.db.lock();
-        let key = Key::from_base64(&config.private_key)?.get_public();
-        let myself = DatabasePeer::get_from_public_key(&store, &key)?;
-        check_internal_address(&myself, config.address)?;
+        let myself = DatabasePeer::get_from_public_key(&store, server.public_key())?;
+        check_internal_address(&myself, config.address())?;
         let error = check_internal_address(&myself, test::ADMIN_PEER_IP.parse()?).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
         Ok(())

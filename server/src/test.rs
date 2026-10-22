@@ -159,7 +159,7 @@ impl Server {
         let interface = interface.parse().unwrap();
         // Add developer CIDR and user CIDR and some peers for testing.
         let config = crate::ConfigFile::from_file(conf.config_path(&interface))?;
-        let public_key = Key::from_base64(&config.private_key)?.get_public();
+        let public_key = Key::from_base64(&config.interface.private_key)?.get_public();
         let db = crate::db::open(
             &conf.database_path(&interface),
             &public_key,
@@ -209,7 +209,7 @@ impl Server {
             endpoints,
             interface,
             public_key,
-            internal_address: config.address,
+            internal_address: config.address(),
             _test_dir: test_dir,
         })
     }
