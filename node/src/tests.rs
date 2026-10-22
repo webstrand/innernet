@@ -3,7 +3,7 @@ use crate::{
     store::{self, key_to_bytes, EndpointKind, PinKind},
     Store,
 };
-use innernet_shared::PeerContents;
+use innernet_shared::{PeerContents, Prefix};
 use wireguard_control::KeyPair;
 
 fn network() -> ipnet::IpNet {
@@ -36,23 +36,24 @@ fn test_pins() {
     let a = peer("a", "10.0.0.2");
     assert_eq!(accept(&store, &[&a]), [Ok(())]);
 
-    // The key can't move to another address, nor another key take the address.
+    // The key may move to another address, but its old address stays pinned to it, so that no
+    // other key may take it.
     let moved = PeerContents {
         ip: "10.0.0.3".parse().unwrap(),
         ..a.clone()
     };
-    assert_eq!(
-        accept(&store, &[&moved]),
-        [Err(Refusal::KeyPinned { pinned: a.ip })]
-    );
-    let impostor = PeerContents {
-        name: Some("b".parse().unwrap()),
-        ..peer("b", "10.0.0.2")
-    };
+    assert_eq!(accept(&store, &[&moved]), [Ok(())]);
+    let impostor = peer("b", "10.0.0.2");
     assert_eq!(
         accept(&store, &[&impostor]),
-        [Err(Refusal::AddressPinned { ip: a.ip })]
+        [Err(Refusal::Pinned {
+            prefix: Prefix::host(a.ip)
+        })]
     );
+    let pins: i64 = store
+        .query_row("SELECT count(*) FROM prefix_pins", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pins, 2);
 
     // Anything else of a pinned peer changes in place.
     let renamed = PeerContents {
@@ -71,7 +72,7 @@ fn test_network() {
     assert_eq!(
         accept(&store, &[&outside]),
         [Err(Refusal::OutsideNetwork {
-            ip: outside.ip,
+            prefix: Prefix::host(outside.ip),
             network: network()
         })]
     );

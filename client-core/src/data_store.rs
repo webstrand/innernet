@@ -14,6 +14,7 @@ use serde::Deserialize;
 use std::{
     fs::OpenOptions,
     io,
+    net::IpAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,13 +22,40 @@ use std::{
 use wireguard_control::{InterfaceName, Key};
 
 /// The peers and CIDRs that the coordinator reported, kept in the node's database, with the
-/// address of each peer pinned to its public key.
+/// delegations of each peer pinned to its public key.
 ///
 /// The database is stored at [`Self::get_path()`]. A data store from before SQLite, at
 /// [`Self::get_legacy_path()`], is imported when the database is created, and left untouched.
 #[derive(Debug)]
 pub struct DataStore {
     store: Store,
+    /// The network of the interface, from its config. It is not persisted.
+    network: Network,
+}
+
+/// The network of a data store, as the interface config describes it, against which the data
+/// store checks the peers that the coordinator reports.
+#[derive(Clone, Debug)]
+struct Network {
+    /// The prefix of the network, outside which no peer lies.
+    prefix: IpNet,
+    /// The public key of this client, and the source address of its interface, which its
+    /// delegations should hold.
+    own: Option<(String, IpAddr)>,
+}
+
+impl Network {
+    /// The network that `config` describes. Public keys are in their canonical encoding, as a
+    /// state's are deserialized.
+    fn from_config(config: &InterfaceConfig) -> Result<Self, Error> {
+        let own_key = Key::from_base64(&config.interface.private_key)?
+            .get_public()
+            .to_base64();
+        Ok(Self {
+            prefix: config.interface.address.trunc(),
+            own: Some((own_key, config.interface.address.addr())),
+        })
+    }
 }
 
 /// Server IDs aren't stored, so the CIDR of a peer outside every CIDR has this ID. The CIDRs are
@@ -49,7 +77,7 @@ impl DataStore {
     fn open_with_paths(
         path: &Path,
         legacy_path: &Path,
-        network: IpNet,
+        network: Network,
         create: bool,
     ) -> Result<Self, Error> {
         // A legacy data store is imported into a new database, so the database is created for it.
@@ -69,9 +97,9 @@ impl DataStore {
 
         let legacy_path = legacy_path.to_owned();
         let import: CreateHook = Arc::new(move |scope| import_legacy(scope, &legacy_path));
-        let store = Store::open(path, network, Some(import))
+        let store = Store::open(path, network.prefix, Some(import))
             .with_context(|| format!("failed to open the data store {}", path.display()))?;
-        Ok(Self { store })
+        Ok(Self { store, network })
     }
 
     /// Produce the path "`data_dir`/`interface`.db".
@@ -117,7 +145,7 @@ impl DataStore {
         Self::open_with_paths(
             &Self::get_path(data_dir, interface),
             &Self::get_legacy_path(data_dir, interface),
-            config.interface.address,
+            Network::from_config(config)?,
             create,
         )
     }
@@ -151,8 +179,9 @@ impl DataStore {
     /// invitation is redeemed, so the data store must be new.
     ///
     /// The interface config, which the invitation produced, is the authority on both, so their
-    /// addresses are pinned to their keys before the coordinator reports anything. Each record has
-    /// no name until a fetch replaces it with the coordinator's record.
+    /// delegations are pinned to their keys before the coordinator reports anything: the
+    /// coordinator's internal address, and the address of this client. Each record has no name
+    /// until a fetch replaces it with the coordinator's record.
     pub fn introduce(&mut self, config: &InterfaceConfig) -> Result<(), Error> {
         let [coordinator, own] = introduced_peers(config)?;
         let tx = self.store.transaction()?;
@@ -168,10 +197,11 @@ impl DataStore {
 
     /// Merges the peers of `state` into the data store and replaces its CIDRs with those of
     /// `state`, in one transaction. Returns the peers of `state` that were dropped, each with the
-    /// reason that the node refused it.
+    /// reason that the node refused it, and warns if the record of this client no longer holds the
+    /// source address of its interface.
     ///
-    /// A peer that is absent from `state` is disabled rather than deleted, so that its address
-    /// stays pinned: the coordinator leaves disabled peers out of the state. A dropped peer was
+    /// A peer that is absent from `state` is disabled rather than deleted, so that its delegations
+    /// stay pinned: the coordinator leaves disabled peers out of the state. A dropped peer was
     /// reported, so the stored peer with its key keeps its record unchanged, as does one whose
     /// record failed to deserialize.
     pub fn update<'a>(
@@ -213,7 +243,24 @@ impl DataStore {
             .collect();
         store::replace_cidrs(&tx, &cidrs)?;
         tx.commit()?;
+        self.warn_if_own_address_lost()?;
         Ok(dropped)
+    }
+
+    /// Warns if the record of this client no longer holds the source address of its interface,
+    /// which the coordinator has then withdrawn.
+    fn warn_if_own_address_lost(&self) -> Result<(), Error> {
+        let Some((own_key, address)) = &self.network.own else {
+            return Ok(());
+        };
+        let own = store::load_peer(&self.store, &store::key_to_bytes(own_key)?)?;
+        if own.is_some_and(|own| !own.holds(*address)) {
+            log::warn!(
+                "the coordinator no longer delegates this client's address {address} to it, so \
+                 other peers no longer route traffic for that address here."
+            );
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -439,8 +486,12 @@ mod tests {
         dir.join("wg0.json")
     }
 
+    fn network(prefix: IpNet) -> Network {
+        Network { prefix, own: None }
+    }
+
     fn open(dir: &Path, create: bool) -> Result<DataStore, Error> {
-        DataStore::open_with_paths(&db_path(dir), &legacy_path(dir), *NETWORK, create)
+        DataStore::open_with_paths(&db_path(dir), &legacy_path(dir), network(*NETWORK), create)
     }
 
     /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it, with the
@@ -518,25 +569,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pinning_public_key_to_ip() {
+    fn test_pins_accumulate() {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
         let mut store = open(dir.path(), false).unwrap();
 
-        // The same public key reported at another IP is dropped from the update, and the pinned
-        // peer, which was reported, keeps its record unchanged.
+        // The same public key reported at another IP moves there, and its old IP stays pinned to
+        // it.
         let mut moved = BASE_PEERS.clone();
         moved[0].ip = "10.0.0.2".parse().unwrap();
-        assert_eq!(store.update_peers(&moved).len(), 1);
-        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
+        assert!(store.update_peers(&moved).is_empty());
+        assert_eq!(store.peers().unwrap(), moved);
+        let mut impostor = BASE_PEERS.clone();
+        impostor[0].public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        assert_eq!(store.update_peers(&impostor).len(), 1);
 
         // Other changes to a pinned peer are applied in place, and new peers are added.
         let mut updated = BASE_PEERS.clone();
         updated[0].name = Some("renamed".parse().unwrap());
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.name = Some("new".parse().unwrap());
-        new_peer.ip = "10.0.0.2".parse().unwrap();
-        new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        new_peer.ip = "10.0.0.3".parse().unwrap();
+        new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         updated.push(new_peer);
         assert!(store.update_peers(&updated).is_empty());
         assert_eq!(store.peers().unwrap(), updated);
@@ -859,10 +913,7 @@ mod tests {
         assert_eq!(peers[1].public_key, own_key.public.to_base64());
         assert_eq!(peers[1].name, None);
 
-        // The coordinator can't be reported at another IP, nor another key at its IP.
-        let mut moved = [COORDINATOR.clone()];
-        moved[0].ip = "10.0.0.3".parse().unwrap();
-        assert_eq!(store.update_peers(&moved).len(), 1);
+        // No other key can be reported at the coordinator's internal address.
         let mut replaced = [COORDINATOR.clone()];
         replaced[0].public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         assert_eq!(store.update_peers(&replaced).len(), 1);
@@ -968,7 +1019,7 @@ mod tests {
         let mut store = DataStore::open_with_paths(
             &db_path(dir.path()),
             &legacy_path(dir.path()),
-            network,
+            self::network(network),
             true,
         )
         .unwrap();

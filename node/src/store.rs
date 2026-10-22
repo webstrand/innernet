@@ -39,13 +39,13 @@ impl EndpointKind {
 /// The kinds of the pins of `prefix_pins`, as the `pin_kinds` table names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinKind {
-    /// The address of a peer.
-    Address = 0,
+    /// A delegation of a peer.
+    Delegation = 1,
 }
 
 impl PinKind {
     /// Every kind, with its name in `pin_kinds`.
-    pub const ALL: &'static [(Self, &'static str)] = &[(Self::Address, "address")];
+    pub const ALL: &'static [(Self, &'static str)] = &[(Self::Delegation, "delegation")];
 }
 
 /// The 32 bytes of the WireGuard public key `public_key` in base64.
@@ -177,39 +177,54 @@ pub fn load_endpoints(
     Ok(endpoints)
 }
 
-/// The address pinned to the key `key`, if any.
-pub fn pinned_address(
+/// The pins that overlap `prefix`, each as the key that it is pinned to, in bytes, and its prefix,
+/// found through the index of the last addresses of the pins.
+pub fn pinned_overlapping(
     conn: &Connection,
-    key: &[u8; 32],
-) -> Result<Option<IpAddr>, rusqlite::Error> {
-    conn.query_row(
-        "SELECT address FROM prefix_pins WHERE public_key = ?1 AND kind = ?2",
-        params![key, PinKind::Address as i64],
-        |row| row_ip(row, 0),
-    )
-    .optional()
-    .map(Option::flatten)
-}
-
-/// The keys to which a prefix that holds `ip` is pinned, found through the index of the last
-/// addresses of the pins.
-pub fn holders_of(conn: &Connection, ip: IpAddr) -> Result<Vec<[u8; 32]>, rusqlite::Error> {
-    let address = ip_to_bytes(ip);
+    prefix: &Prefix,
+) -> Result<Vec<([u8; 32], Prefix)>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(
-        "SELECT public_key FROM prefix_pins
-         WHERE last >= ?1 AND address <= ?1 AND length(address) = length(?1)",
+        "SELECT public_key, address, prefix_len FROM prefix_pins
+         WHERE last >= ?1 AND address <= ?2 AND length(address) = length(?1)",
     )?;
-    let mut rows = stmt.query(params![address])?;
-    let mut holders = vec![];
+    let mut rows = stmt.query(params![
+        ip_to_bytes(prefix.first()),
+        ip_to_bytes(prefix.last())
+    ])?;
+    let mut overlapping = vec![];
     while let Some(row) = rows.next()? {
         let key: Vec<u8> = row.get(0)?;
-        holders.push(
-            key.try_into().map_err(|_| {
-                rusqlite::Error::InvalidColumnType(0, "public key".into(), Type::Blob)
-            })?,
-        );
+        let key: [u8; 32] = key
+            .try_into()
+            .map_err(|_| rusqlite::Error::InvalidColumnType(0, "public key".into(), Type::Blob))?;
+        overlapping.push((key, prefix_from_row(row.get(1)?, row.get(2)?)?));
     }
-    Ok(holders)
+    Ok(overlapping)
+}
+
+/// Pins `delegations` to the key `key`, each unless it is pinned to the key already. The pins of a
+/// key accumulate: none is released when a delegation is withdrawn. The caller must have checked
+/// that no prefix overlaps one pinned to another key.
+pub fn pin_delegations(
+    conn: &Connection,
+    key: &[u8; 32],
+    delegations: &[Prefix],
+) -> Result<(), rusqlite::Error> {
+    for delegation in delegations {
+        conn.execute(
+            "INSERT INTO prefix_pins (address, prefix_len, last, public_key, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (address, prefix_len) DO NOTHING",
+            params![
+                ip_to_bytes(delegation.first()),
+                delegation.prefix_len(),
+                ip_to_bytes(delegation.last()),
+                key,
+                PinKind::Delegation as i64
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// The public key of the peer that has the name `name`, if any.
@@ -228,8 +243,8 @@ pub fn name_holder(conn: &Connection, name: &str) -> Result<Option<[u8; 32]>, ru
 }
 
 /// Writes `peer`, keyed by `key`, the bytes of its public key: its record, in place of the stored
-/// one, its address as its only delegation, its endpoint and candidates, and its address, pinned
-/// to its key if no address is. A peer without a name is stored with a NULL name.
+/// one, its address as its only delegation, pinned to its key as [`pin_delegations`] pins it, and
+/// its endpoint and candidates. A peer without a name is stored with a NULL name.
 pub fn write_peer(
     conn: &Connection,
     key: &[u8; 32],
@@ -260,15 +275,9 @@ pub fn write_peer(
             invite_expires,
         ],
     )?;
-    if pinned_address(conn, key)?.is_none() {
-        let address = ip_to_bytes(peer.ip);
-        conn.execute(
-            "INSERT INTO prefix_pins (address, prefix_len, last, public_key, kind)
-             VALUES (?1, ?2, ?1, ?3, ?4)",
-            params![address, address.len() * 8, key, PinKind::Address as i64],
-        )?;
-    }
-    write_delegations(conn, key, &[Prefix::host(peer.ip)])?;
+    let delegations = [Prefix::host(peer.ip)];
+    pin_delegations(conn, key, &delegations)?;
+    write_delegations(conn, key, &delegations)?;
     write_endpoints(conn, key, EndpointKind::Endpoint, &peer.endpoint)?;
     write_endpoints(conn, key, EndpointKind::Candidate, &peer.candidates)
 }

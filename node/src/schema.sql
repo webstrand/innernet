@@ -70,11 +70,12 @@ CREATE TABLE pin_kinds (
   name TEXT NOT NULL UNIQUE
 ) STRICT;
 
-INSERT INTO pin_kinds VALUES (0, 'address');
+INSERT INTO pin_kinds VALUES (1, 'delegation');
 
--- Prefixes pinned to a public key: the address of each peer, a /32 or /128. Each pin holds the
--- last address of its prefix, so that pins that overlap are found by comparing addresses of the
--- same length.
+-- Prefixes pinned to a public key: every delegation that the node has accepted for a peer, aligned
+-- prefixes of which a lone address is a /32 or /128. The pins of a key accumulate and may nest, so
+-- that a delegation that the coordinator withdraws stays pinned. Each pin holds the last address of
+-- its prefix, so that pins that overlap are found by comparing addresses of the same length.
 CREATE TABLE prefix_pins (
   address    BLOB NOT NULL CHECK (length(address) IN (4, 16)),  -- host bits zero
   prefix_len INTEGER NOT NULL CHECK (prefix_len BETWEEN 0 AND length(address) * 8),
@@ -82,13 +83,10 @@ CREATE TABLE prefix_pins (
   public_key BLOB NOT NULL CHECK (length(public_key) = 32)
              REFERENCES peers ON DELETE RESTRICT,
   kind       INTEGER NOT NULL REFERENCES pin_kinds,
-  PRIMARY KEY (address, prefix_len),
-  -- A peer's address is a single address.
-  CHECK (kind <> 0 OR prefix_len = length(address) * 8)
+  PRIMARY KEY (address, prefix_len)
 ) STRICT, WITHOUT ROWID;
 
--- Each peer has one address.
-CREATE UNIQUE INDEX one_address_per_key ON prefix_pins (public_key) WHERE kind = 0;
+CREATE INDEX prefix_pins_by_key ON prefix_pins (public_key);
 CREATE INDEX prefix_pins_by_last ON prefix_pins (last);
 
 CREATE TABLE endpoint_kinds (
