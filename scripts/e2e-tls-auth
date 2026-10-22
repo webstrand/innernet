@@ -14,13 +14,20 @@
 #     new     198.18.0.5   admin invitation redeemed by a client that predates TLS
 #     osrv    198.18.0.6   a server that predates TLS, upgraded and downgraded midway
 #     c       198.18.0.7   admin of osrv with a current client
+#     probe   198.18.0.8   peer that requests the TLS API with wg(8) and curl(1) over HTTP/3,
+#                          without a client key
 #
-# Clients that predate TLS are played by wg(8) and curl(1) speaking plain HTTP, which is also
-# what anything else on a peer's machine can do from the peer's innernet IP. The server that
-# predates TLS is innernet-server 2.0.0, from the directory that E2E_ORIGIN_BIN names; without it,
-# the steps that need it are skipped.
+# The TLS API runs in HTTP/3 over QUIC, at the server's internal address, on the QUIC port of the
+# server's config; the legacy API runs in plain HTTP over TCP, on the listen port. Clients that
+# predate TLS are played by wg(8) and curl(1) speaking plain HTTP, which is also what anything
+# else on a peer's machine can do from the peer's innernet IP. The server that predates TLS is
+# innernet-server 2.0.0, from the directory that E2E_ORIGIN_BIN names; without it, the steps that
+# need it are skipped. The probe connects without a client key, as curl presents none, pins the
+# server's key with --pinnedpubkey, and inspects the CBOR of the TLS API with Python's cbor2
+# module.
 #
-# Requires: unshare, ip, wg, curl, sqlite3, python3 (3.11+), and the kernel WireGuard module.
+# Requires: unshare, ip, wg, curl (with HTTP3), sqlite3, python3 (3.11+) with cbor2, and the
+# kernel WireGuard module.
 set -euo pipefail
 
 if [ -z "${E2E_INSIDE:-}" ]; then
@@ -86,9 +93,14 @@ print(c.get("coordinator", c).get("quic-port", ""))' "$2")
 
 db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
 
+# Prints the public key in base64 as hex, as sqlite3 prints a blob.
+key_hex() { python3 -I -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).hex().upper())' "$1"; }
+# Prints the condition that selects the peer with a public key, which a database holds as raw
+# bytes, or, in the database of a server that predates the rebuild of its peers table, in base64.
+by_key() { echo "(public_key = '$1' OR hex(public_key) = '$(key_hex "$1")')"; }
+
 # Serves a network in the background, recording the server's PID in $served. The server is
-# started directly, not through a function, so that the PID is the server's own. The server that
-# predates TLS writes the hosts file unless it is told not to; this version ignores the option.
+# started directly, not through a function, so that the PID is the server's own.
 serve() { # <namespace> <innernet-server> <directory> <network> <log>
     ip netns exec "$1" "$2" -c "$3/conf" -d "$3/data" serve "$4" --no-write-hosts >>"$5" 2>&1 &
     served=$!
@@ -123,12 +135,6 @@ else:
     print(f"{lowest}/{network.prefixlen}")
 EOF
 }
-
-# Prints the bytes of a base64 key in hex.
-key_hex() { python3 -I -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).hex().upper())' "$1"; }
-# Prints the condition that selects the peer with a public key, which a database holds as raw
-# bytes, or, in the database of a server that predates the rebuild of its peers table, in base64.
-by_key() { echo "(public_key = '$1' OR hex(public_key) = '$(key_hex "$1")')"; }
 
 # Requests the API in plain HTTP from a namespace, printing the status and body.
 plain() { # <namespace> <method> <path> [json body]
@@ -166,12 +172,73 @@ old_style_redeem() { # <namespace> <invitation>
     plain "$peer" POST /v1/user/redeem "{\"public_key\": \"$(wg pubkey <"$work/$peer.key")\"}"
 }
 
+# Prints the pin of a server's key for curl's --pinnedpubkey: the SHA-256, in base64, of the
+# SubjectPublicKeyInfo of the Ed25519 form of the server's WireGuard key, with sign bit 0, which
+# the server presents in its certificate.
+pin() { # <WireGuard public key>
+    python3 -I - "$1" <<'EOF'
+import base64, hashlib, sys
+p = 2**255 - 19
+u = int.from_bytes(base64.b64decode(sys.argv[1]), "little")
+y = (u - 1) * pow(u + 1, p - 2, p) % p
+spki = bytes.fromhex("302a300506032b6570032100") + y.to_bytes(32, "little")
+print(base64.b64encode(hashlib.sha256(spki).digest()).decode())
+EOF
+}
+
+# The media type of version 1 of the TLS API, and the Accept that innernet sends.
+v1='application/vnd.innernet+cbor; version=1'
+accept_v1="$v1, application/problem+cbor"
+
+# The problem type of a request that the server refuses without a client key.
+client_key_required=urn:uuid:305a37cb-49a7-43e6-ac4e-999d31323fff
+
+# Requests the TLS API over HTTP/3 from the probe, with curl, which presents no client key, so
+# that the connection is anonymous, and which pins the server's key, with -k, since the pin
+# replaces the verification of the self-signed certificate: sends <body file>, if any, as
+# <content type>, with $accept as Accept, or no Accept if it is -, prints the status and the
+# content type of the response, or - if it has none, and writes its body to $work/probe.body.
+accept=$accept_v1
+h3() { # <method> <path> [<content type> <body file>]
+    local args=(-sS --http3-only -k --pinnedpubkey "sha256//$server_pin" -X "$1"
+        -o "$work/probe.body" -w '%{http_code} %{content_type}')
+    if [ "$accept" = - ]; then args+=(-H 'Accept:'); else args+=(-H "Accept: $accept"); fi
+    [ -n "${3:-}" ] && args+=(-H "Content-Type: $3" --data-binary "@$4")
+    local response
+    response=$(ns probe curl "${args[@]}" "https://$quic$2") || return 1
+    local status=${response%% *} content_type=${response#* }
+    echo "$status ${content_type:--}"
+}
+
+expect_h3() { # <expected status> <expected content type> <method> <path> [...]
+    local status=$1 content_type=$2 response
+    shift 2
+    response=$(h3 "$@") || fail "HTTP/3 $1 $2 from probe failed"
+    [ "$response" = "$status $content_type" ] ||
+        fail "HTTP/3 $1 $2 from probe got '$response', expected $status $content_type"
+    pass "HTTP/3 $1 $2 from probe got $status $content_type"
+}
+
+# Checks that the body of the last response over HTTP/3 is a problem detail of a type, with a
+# status, in deterministic CBOR.
+expect_problem() { # <type> <status>
+    python3 -I - "$work/probe.body" "$@" <<'EOF' || fail "the problem detail is not of type $1"
+import cbor2, sys
+body, problem_type, status = open(sys.argv[1], "rb").read(), sys.argv[2], int(sys.argv[3])
+problem = cbor2.loads(body)
+assert cbor2.dumps(problem, canonical=True) == body, "not in the deterministic encoding"
+assert problem.get("type", "about:blank") == problem_type, problem
+assert problem["status"] == status, problem
+EOF
+    pass "the problem detail is of type $1"
+}
+
 step "network"
 ip link set lo up
 ip link add br0 type bridge
 ip link set br0 up
 address=1
-for name in srv a adm old new osrv c; do
+for name in srv a adm old new osrv c probe; do
     ip netns add "$name"
     ns "$name" ip link set lo up
     ip link add "v-$name" type veth peer name eth0 netns "$name"
@@ -189,26 +256,30 @@ server new --network-name e2e --network-cidr 10.66.0.0/16 \
 serve srv "$E2E_BIN/innernet-server" "$work/srv" e2e "$work/srv.log"
 await_coordinator srv "$work/srv/conf/e2e.conf"
 server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
-for peer in a adm old new; do
+for peer in a adm old new probe; do
     admin=false
     case $peer in adm | new) admin=true ;; esac
     server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin "$admin" \
         --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
 done
 # The server issued old's invitation before it spoke TLS, in the format of v2.0.0, which names the
-# peer's address rather than offering delegations, and states no features. The server latched the
-# invitation, and the operator cleared the latch, so that a client that predates TLS can redeem it.
+# peer's address rather than offering delegations, and states neither features nor a QUIC port.
+# The server latched the invitation, and the operator cleared the latch, so that a client that
+# predates TLS can redeem it.
 db "UPDATE peers SET tls = 0 WHERE name = 'old'"
 python3 -I - "$work/old.toml" "$(invitation_address "$work/old.toml")" <<'EOF'
 import re, sys
 path, address = sys.argv[1:]
 text = open(path).read()
-text = re.sub(r'(?m)^(network-cidr|delegations|features) = .*\n', '', text)
+text = re.sub(r'(?m)^(network-cidr|delegations|features|quic-port) = .*\n', '', text)
 text = text.replace('[interface]\n', f'[interface]\naddress = "{address}"\n', 1)
 open(path, "w").write(text)
 EOF
 server_key=$(invitation "$work/a.toml" server public-key)
+server_pin=$(pin "$server_key")
 api=$(invitation "$work/a.toml" server internal-endpoint)
+quic_port=$(invitation "$work/a.toml" server quic-port)
+quic="${api%:*}:$quic_port"
 
 # Every peer that the server creates is latched from creation.
 expect_requires_tls a 1
@@ -218,8 +289,17 @@ expect_requires_tls old 0
 [ "$(invitation "$work/a.toml" server features)" = "['tls']" ] ||
     fail "the invitation doesn't state that the server speaks TLS"
 pass "the invitation states that the server speaks TLS"
+grep -qx "quic-port = $quic_port" "$work/srv/conf/e2e.conf" ||
+    fail "the invitation doesn't state the QUIC port of the server's config"
+[ "$quic_port" != 51820 ] || fail "the QUIC port is the listen port"
+pass "the invitation states the QUIC port of the server's config, $quic_port"
 
-step "current clients install over TLS"
+# Prints the QUIC port that a client's data store records for the coordinator.
+recorded_port() { # <peer> <network>
+    sqlite3 "$work/$1/data/$2.db" "SELECT quic_port FROM peers WHERE quic_port IS NOT NULL"
+}
+
+step "current clients install over QUIC"
 for peer in a adm; do
     mkdir -p "$work/$peer"
     client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 \
@@ -227,10 +307,94 @@ for peer in a adm; do
 done
 pass "a and adm installed"
 expect_requires_tls a 1
+[ "$(recorded_port a e2e)" = "$quic_port" ] || fail "a didn't record the QUIC port"
+pass "a recorded the QUIC port of its invitation"
 client a fetch e2e || fail "fetch as a"
 pass "a fetches"
 client adm list-associations e2e || fail "list associations as adm"
 pass "adm uses the admin API"
+
+step "anonymous connections use the public routes of the TLS API, in deterministic CBOR"
+# The probe has the key of its invitation, which the server's interface knows, but no client
+# for it: curl, which presents no client key, connects anonymously.
+ns probe ip link add wg0 type wireguard
+invitation "$work/probe.toml" interface private-key |
+    ns probe wg set wg0 private-key /dev/fd/0 listen-port 51820 peer "$server_key" \
+        endpoint 198.18.0.1:51820 allowed-ips "${api%:*}/32" persistent-keepalive 1
+ns probe ip addr add "$(invitation_address "$work/probe.toml")" dev wg0
+ns probe ip link set wg0 up
+probe_key=$(invitation "$work/probe.toml" interface private-key | wg pubkey)
+expect_h3 200 "$v1" GET /server
+python3 -I - "$work/probe.body" "$server_key" <<'EOF' || fail "/server isn't as expected"
+import cbor2, sys
+body, key = open(sys.argv[1], "rb").read(), sys.argv[2]
+server = cbor2.loads(body)
+assert cbor2.dumps(server, canonical=True) == body, "not in the deterministic encoding"
+assert server == {"public_key": key, "network_name": "e2e", "network_cidr": "10.66.0.0/16"}, server
+EOF
+pass "/server names the server's key, the network and its CIDR, as text"
+expect_h3 200 "$v1" GET /whoami
+probe_ip=$(invitation_address "$work/probe.toml")
+python3 -I - "$work/probe.body" "$probe_key" "${probe_ip%/*}" <<'EOF' || fail "/whoami is wrong"
+import cbor2, sys
+body, key, address = open(sys.argv[1], "rb").read(), sys.argv[2], sys.argv[3]
+whoami = cbor2.loads(body)
+assert whoami == {"address": address, "authenticated": False, "public_key": key,
+                  "name": "probe"}, whoami
+EOF
+pass "/whoami names the peer whose delegation holds the probe's address, unauthenticated"
+expect_h3 200 "$v1" GET /capabilities
+python3 -I - "$work/probe.body" "$quic_port" <<'EOF' || fail "/capabilities isn't as expected"
+import cbor2, sys
+body, port = open(sys.argv[1], "rb").read(), int(sys.argv[2])
+capabilities = cbor2.loads(body)
+assert capabilities["quic_port"] == port, capabilities
+assert "unspecified_ip_in_override_endpoint" not in capabilities, capabilities
+assert isinstance(capabilities["version"], str), capabilities
+EOF
+pass "/capabilities states the QUIC port and the server's version"
+
+step "anonymous connections are refused every other route, before any other check"
+python3 -I -c 'import cbor2, sys; sys.stdout.buffer.write(cbor2.dumps(["198.51.100.7:51820"]))' \
+    >"$work/candidates.cbor"
+for path in /user/state /admin/peers /v1/user/state /nothing; do
+    expect_h3 403 application/problem+cbor GET "$path"
+    expect_problem "$client_key_required" 403
+done
+expect_h3 403 application/problem+cbor PUT /user/candidates application/json \
+    "$work/candidates.cbor"
+expect_problem "$client_key_required" 403
+expect_h3 403 application/problem+cbor PUT /server "$v1" "$work/candidates.cbor"
+expect_problem "$client_key_required" 403
+[ "$(db "SELECT count(*) FROM endpoints WHERE $(by_key "$probe_key")")" = 0 ] ||
+    fail "the server stored the probe's candidate"
+pass "the routes that need a client key, and unknown paths, are refused alike"
+
+step "the TLS API answers in the version that the request accepts, or in a debug view"
+printf '{}' >"$work/empty.json"
+expect_h3 415 application/problem+cbor GET /server application/json "$work/empty.json"
+expect_problem about:blank 415
+accept='application/vnd.innernet+cbor; version=2, application/problem+cbor'
+expect_h3 406 application/problem+cbor GET /server
+expect_problem about:blank 406
+accept="application/vnd.innernet+cbor; version=2, $v1; q=0.5, */*; q=0.1"
+expect_h3 200 "$v1" GET /server
+for accept in - '*/*' 'application/*'; do
+    expect_h3 200 'application/vnd.innernet+cbor-diagnostic; version=1' GET /server
+    [ "$(head -n 1 "$work/probe.body")" = "# unstable debug view; use Accept: $v1" ] ||
+        fail "the debug view doesn't name the media type to ask for"
+    grep -q '"network_name": "e2e"' "$work/probe.body" ||
+        fail "the debug view doesn't show the network"
+done
+pass "the debug view answers the public routes"
+accept=$accept_v1
+
+step "curl refuses a server that presents another key than the pinned one"
+if ns probe curl -sS --http3-only -k --pinnedpubkey "sha256//$(pin "$(wg genkey | wg pubkey)")" \
+    -o /dev/null "https://$quic/server" 2>"$work/pin.log"; then
+    fail "curl accepted a server key that it didn't pin"
+fi
+pass "curl refuses another key: $(head -n 1 "$work/pin.log")"
 
 step "a current admin client addresses peers by public key over TLS"
 client adm add-peer e2e --name x --auto-ip --cidr peers --admin false \
@@ -331,6 +495,10 @@ case $last_body in *TLS*) pass "the refusal explains TLS is required" ;;
 # The admin API exists only over TLS.
 expect_plain adm GET /v1/admin/peers 404
 expect_plain adm POST /v1/admin/peers 404 '{}'
+# Only the capabilities, which state the QUIC port, are information enough to answer.
+expect_plain a GET /v1/user/capabilities 200
+case $last_body in *"\"quic_port\":$quic_port"*) pass "the capabilities state the QUIC port" ;;
+    *) fail "the capabilities don't state the QUIC port: $last_body" ;; esac
 
 step "a client that predates TLS can't redeem an invitation that the server issued since"
 response=$(old_style_redeem new "$work/new.toml")
@@ -364,6 +532,10 @@ open(config, "w").write(text)
 EOF
 client old up e2e || fail "up as the upgraded old"
 pass "the upgraded old fetches"
+# Its invitation states no QUIC port, so it asked the server for it, in plain HTTP.
+[ "$(recorded_port old e2e)" = "$quic_port" ] ||
+    fail "the upgraded old didn't record the QUIC port that the server states"
+pass "the upgraded old learned the QUIC port from the capabilities, and recorded it"
 expect_requires_tls old 1
 expect_plain old GET /v1/user/state 401
 client old fetch e2e || fail "fetch as the upgraded old"
@@ -403,8 +575,8 @@ osrv_db() { sqlite3 "$work/osrv/data/e2o.db" "$@"; }
 d_peer() { osrv_db "SELECT name, is_disabled FROM peers WHERE $(by_key "$d_key")"; }
 serve_osrv "$E2E_ORIGIN_BIN"
 mkdir -p "$work/c"
-client c install "$work/c.toml" --default-name --listen-port 51820 --delete-invite \
-    || fail "install c with the server that predates TLS"
+client c install "$work/c.toml" --default-name --listen-port 51820 --delete-invite ||
+    fail "install c with the server that predates TLS"
 grep -q "predates TLS" "$work/c.log" || fail "c didn't warn that it uses plain HTTP"
 pass "c installed in plain HTTP, with a warning"
 client c fetch e2o || fail "fetch as c"
@@ -464,9 +636,13 @@ serve_osrv "$E2E_BIN"
 [ "$(osrv_db "SELECT name FROM cidrs ORDER BY name")" = "$cidr_names" ] ||
     fail "the upgraded server didn't keep every CIDR"
 pass "the upgraded server keeps every CIDR"
+# Prints the QUIC port of osrv's config.
+osrv_quic_port() { sed -n 's/^quic-port = //p' "$work/osrv/conf/e2o.conf"; }
 client c fetch e2o || fail "fetch as c from the upgraded server"
 [ "$(client_latched c)" = 1 ] || fail "c didn't latch the upgraded server"
 pass "c fetches over TLS, and latched the server"
+[ "$(recorded_port c e2o)" = "$(osrv_quic_port)" ] || fail "c didn't record the QUIC port"
+pass "c learned the QUIC port from the capabilities, and recorded it"
 [ -f "$work/osrv/data/e2o.db.v2.0.0" ] || fail "the upgraded server didn't back up its database"
 pass "the upgraded server backed up its database before rebuilding it"
 [ "$(osrv_db "SELECT tls FROM peers WHERE name = 'c'")" = 1 ] ||
@@ -487,7 +663,7 @@ pass "c renames and deletes a CIDR and an association by prefix over TLS"
 step "the server is downgraded"
 stop_osrv
 # The server that predates TLS can't read the rebuilt database, so the operator restores the copy
-# that the upgrade made.
+# that the upgrade made. It ignores the QUIC port of the config.
 cp "$work/osrv/data/e2o.db.v2.0.0" "$work/osrv/data/e2o.db"
 serve_osrv "$E2E_ORIGIN_BIN"
 if client c fetch e2o; then
@@ -496,13 +672,30 @@ fi
 grep -q "known to speak TLS" "$work/c.log" || fail "c's refusal doesn't explain the latch"
 pass "c refuses the downgraded server"
 
-step "the server is upgraded again"
+step "the server is upgraded again, with another QUIC port"
 stop_osrv
+# The operator moves the QUIC port, which c has recorded.
+old_port=$(osrv_quic_port)
+new_port=$((old_port == 4433 ? 4434 : 4433))
+sed -i "s/^quic-port = .*/quic-port = $new_port/" "$work/osrv/conf/e2o.conf"
 serve_osrv "$E2E_BIN"
 client c fetch e2o || fail "fetch as c from the server upgraded again"
 pass "the server upgraded again rebuilds the restored database, and c fetches over TLS"
+[ "$(recorded_port c e2o)" = "$new_port" ] || fail "c didn't learn the new QUIC port"
+pass "c found nothing at $old_port, asked the server for the port again, and recorded $new_port"
 [ -f "$work/osrv/data/e2o.db.v2.0.0.1" ] ||
     fail "the server upgraded again didn't back up its database next to the first backup"
 pass "the server upgraded again keeps the first backup, and makes another"
+
+step "the legacy API is turned off"
+stop_osrv
+echo "legacy-api = false" >>"$work/osrv/conf/e2o.conf"
+serve_osrv "$E2E_BIN"
+client c fetch e2o || fail "fetch as c without the legacy API"
+pass "c fetches over QUIC"
+api=$(invitation "$work/c/conf/e2o.conf" server internal-endpoint) \
+    server_key=$(invitation "$work/c/conf/e2o.conf" server public-key) \
+    expect_plain c GET /v1/user/capabilities 000
+pass "nothing serves plain HTTP"
 
 step "all passed"
