@@ -32,7 +32,10 @@ CREATE TABLE peers (
   -- Whether the peer speaks TLS, which the node sets on authenticated evidence and never clears:
   -- a client never falls back to plain HTTP with a coordinator that has answered over TLS, and a
   -- coordinator never again identifies a peer that has authenticated over TLS by its address.
-  tls                           INTEGER NOT NULL DEFAULT 0 CHECK (tls IN (0, 1))
+  tls                           INTEGER NOT NULL DEFAULT 0 CHECK (tls IN (0, 1)),
+  -- The UDP port of the TLS API of the coordinator's peer, which runs over QUIC at its primary IP,
+  -- or NULL while it is unknown or for any other peer.
+  quic_port                     INTEGER CHECK (quic_port BETWEEN 1 AND 65535)
 ) STRICT, WITHOUT ROWID;
 
 -- No name belongs to two peers.

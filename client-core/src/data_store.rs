@@ -302,6 +302,34 @@ impl DataStore {
         Ok(())
     }
 
+    /// The UDP port of the TLS API of the peer with `public_key`, the coordinator, which runs over
+    /// QUIC at its internal address, or `None` if it is unknown.
+    pub fn quic_port(&self, public_key: &str) -> Result<Option<u16>, Error> {
+        let port = self
+            .store
+            .query_row(
+                "SELECT quic_port FROM peers WHERE public_key = ?1",
+                [store::key_to_bytes(public_key)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(port.flatten())
+    }
+
+    /// Records `port` as the UDP port of the TLS API of the peer with `public_key`, in place of
+    /// any it had. The peer must be recorded.
+    pub fn set_quic_port(&mut self, public_key: &str, port: u16) -> Result<(), Error> {
+        let updated = self.store.execute(
+            "UPDATE peers SET quic_port = ?2 WHERE public_key = ?1",
+            params![store::key_to_bytes(public_key)?, port],
+        )?;
+        ensure!(
+            updated == 1,
+            "no peer with the public key {public_key} is recorded"
+        );
+        Ok(())
+    }
+
     /// The CIDRs, ordered by prefix.
     pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
         Ok(store::load_cidrs(&self.store)?)
@@ -950,6 +978,34 @@ mod tests {
         assert!(store.update_peers(&BASE_PEERS).is_empty());
         let store = open(dir.path(), false).unwrap();
         assert!(store.speaks_tls(key).unwrap());
+    }
+
+    #[test]
+    fn test_quic_port() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+        let key = &BASE_PEERS[0].public_key;
+        let unknown = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=";
+
+        // The port is unknown until it is recorded, which only a recorded peer can be, and a
+        // port recorded later replaces it.
+        assert_eq!(store.quic_port(key).unwrap(), None);
+        assert_eq!(store.quic_port(unknown).unwrap(), None);
+        assert!(store.set_quic_port(unknown, 4433).is_err());
+        store.set_quic_port(key, 4433).unwrap();
+        assert_eq!(store.quic_port(key).unwrap(), Some(4433));
+        store.set_quic_port(key, 4434).unwrap();
+
+        // The port survives updates of the peer and reopening the data store, and the database
+        // refuses a port that isn't one.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        let store = open(dir.path(), false).unwrap();
+        assert_eq!(store.quic_port(key).unwrap(), Some(4434));
+        assert!(store
+            .store
+            .execute("UPDATE peers SET quic_port = 0", [])
+            .is_err());
     }
 
     #[test]
