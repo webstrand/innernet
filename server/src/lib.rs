@@ -207,7 +207,9 @@ pub fn uninstall(
     Ok(())
 }
 
-/// Runs the server's node and, beside it, the coordinator of the network of `interface`.
+/// Runs the server: its node, which configures the tunnel and the DNS server from the database
+/// and announces the server's own peer, and the coordinator beside it, which serves the API and
+/// tells the node of every change that it makes.
 pub async fn serve(
     interface: InterfaceName,
     conf: &ServerConfig,
@@ -292,8 +294,13 @@ pub async fn serve(
             route_primary_ip: true,
         },
         tunnel: Box::new(tunnel),
+        names: config.dns.clone().map(|dns| {
+            (
+                DnsService::new(interface, hosts_opts.host_suffix.clone()),
+                dns,
+            )
+        }),
     };
-    let mut dns = DnsService::new(interface, hosts_opts.host_suffix.clone());
     let mut link = LocalLink {
         db: db.clone(),
         server_key: public_key,
@@ -306,11 +313,7 @@ pub async fn serve(
             .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
             .ok(),
     };
-    let node_loop = runtime::run(triggers, async || {
-        let round = node.round(&mut link).await?;
-        dns.update(config.dns.as_ref(), &round.snapshot).await;
-        Ok(round)
-    });
+    let node_loop = runtime::run(triggers, async || node.round(&mut link).await);
 
     log::info!("innernet-server {} starting.", VERSION);
     // The TLS API runs over QUIC, at the primary IP, on a port of its own.
@@ -547,6 +550,7 @@ mod tests {
                 endpoint_overrides: BTreeMap::new(),
                 events: EventSource::default(),
             }),
+            names: None,
         };
         let mut link = LocalLink {
             db: db.clone(),

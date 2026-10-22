@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_node::{
     events::EventSource,
-    realize::{DnsService, Realized, WireGuard},
+    realize::{Realized, WireGuard},
     runtime::{self, Link, Node, Round},
     snapshot::{Own, Snapshot, SnapshotConfig},
 };
@@ -250,9 +250,12 @@ fn discard_data_store(store: DataStore, data_dir: &Path, interface: &InterfaceNa
     }
 }
 
-/// Fetches the state of `interface` from the coordinator, configures the interface from it, and
-/// takes the steps of the NAT traversal of the peers that changed, as one round of the node does,
-/// bringing the interface up first if `bring_up_interface` allows it.
+/// Runs a round of the node of `interface`: reads its config, brings the interface up if
+/// `bring_up_interface` allows it and it isn't up, and runs the round of the node through its link
+/// to the coordinator. It returns what the round configured, with the NAT traversal that it
+/// starts, which the caller runs. The tunnel reports its events through `events`, which a caller
+/// that runs rounds keeps across them, so that what produces the events runs on.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch(
     config_dir: &Path,
     data_dir: &Path,
@@ -261,45 +264,7 @@ pub async fn fetch(
     nat: &NatOpts,
     interface: &InterfaceName,
     bring_up_interface: bool,
-) -> Result<(), Error> {
-    let round = round(
-        config_dir,
-        data_dir,
-        network_opts,
-        hosts_opts,
-        nat,
-        interface,
-        bring_up_interface,
-        &mut NodeState::default(),
-    )
-    .await?;
-    runtime::settle(round).await
-}
-
-/// What the node of an interface keeps from one round to the next.
-#[derive(Default)]
-pub struct NodeState {
-    /// The source of the events of the interface.
-    pub events: EventSource,
-    /// The DNS server of the interface, which a node that runs rounds runs while the config has a
-    /// `[dns]` table, and a node that runs one round doesn't.
-    pub dns: Option<DnsService>,
-}
-
-/// Runs a round of the node of `interface`: reads its config, brings the interface up if
-/// `bring_up_interface` allows it and it isn't up, runs the round of the node through its link to
-/// the coordinator, and publishes the names of the round's snapshot to the DNS server of `state`,
-/// what the node keeps from one round to the next.
-#[allow(clippy::too_many_arguments)]
-pub async fn round(
-    config_dir: &Path,
-    data_dir: &Path,
-    network_opts: &NetworkOpts,
-    hosts_opts: &HostsOpts,
-    nat: &NatOpts,
-    interface: &InterfaceName,
-    bring_up_interface: bool,
-    state: &mut NodeState,
+    events: &EventSource,
 ) -> Result<Round, Error> {
     hosts_opts.warn_of_hosts_file_options();
     // The client never writes the config after installation, and reads it anew on every fetch, so
@@ -381,8 +346,9 @@ pub async fn round(
             interface: *interface,
             backend: network_opts.backend,
             endpoint_overrides: config.peer_endpoint_overrides().clone(),
-            events: state.events.clone(),
+            events: events.clone(),
         }),
+        names: None,
     };
     let mut link = RemoteLink {
         store,
@@ -393,9 +359,6 @@ pub async fn round(
         claim_types: None,
     };
     let round = node.round(&mut link).await?;
-    if let Some(dns) = &mut state.dns {
-        dns.update(config.dns.as_ref(), &round.snapshot).await;
-    }
 
     let peers = link.store.peers()?;
     for realized in &round.realized {

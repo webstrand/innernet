@@ -1,7 +1,7 @@
 //! The runtime of a node: the rounds that every node runs, whatever its role, and the loop that
 //! runs them. A round brings the node's store up to date through its [`Link`] to the coordinator,
-//! configures the tunnel from what the store holds, announces the node itself, and starts the NAT
-//! traversal of the peers that it changed. The host publishes the names of the round's snapshot.
+//! configures the tunnel and publishes the names of what the store holds, announces the node
+//! itself, and starts the NAT traversal of the peers that it changed.
 //!
 //! A round runs when the coordinator signals a change of the store through [`StoreChanged`], when
 //! the host's addresses change, and, for a node that polls its coordinator, at its interval. The
@@ -15,14 +15,14 @@ use crate::{
     events::{TunnelEvent, TunnelEvents},
     nat::{NatTraverse, STEP_INTERVAL},
     own,
-    realize::{Realized, TunnelBackend},
+    realize::{DnsService, Realized, TunnelBackend},
     snapshot::{Own, Snapshot, SnapshotConfig},
 };
 use anyhow::{Context as _, Error};
 use innernet_shared::{
     announcement::{self, Announcement, SignedAnnouncement},
     get_local_addrs,
-    interface_config::InterfaceInfo,
+    interface_config::{DnsInfo, InterfaceInfo},
     Endpoint, NatOpts, PeerContents, Prefix,
 };
 use std::{future::pending, net::SocketAddr, sync::Arc, time::Duration};
@@ -94,6 +94,8 @@ pub struct Node {
     pub nat: NatOpts,
     pub snapshot_config: SnapshotConfig,
     pub tunnel: Box<dyn TunnelBackend + Send>,
+    /// The DNS server of the node, if the node runs one, as `dns` configures it.
+    pub names: Option<(DnsService, DnsInfo)>,
 }
 
 pub struct Round {
@@ -106,10 +108,10 @@ pub struct Round {
 }
 
 impl Node {
-    /// Runs a round through `link`: brings the store up to date, configures the tunnel from its
-    /// snapshot, announces the node, and starts the NAT traversal of the peers that it changed. A
-    /// failure to announce is logged and fails nothing, so that the node keeps what it has
-    /// configured.
+    /// Runs a round through `link`: brings the store up to date, configures the tunnel and the
+    /// DNS server from its snapshot, announces the node, and starts the NAT traversal of the peers
+    /// that it changed. A failure to announce is logged and fails nothing, so that the node keeps
+    /// what it has configured.
     pub async fn round(&mut self, link: &mut impl Link) -> Result<Round, Error> {
         link.sync().await?;
         let own_key = self.public_key()?;
@@ -131,6 +133,9 @@ impl Node {
         }
         let events = self.tunnel.events();
         let realized = self.tunnel.realize(&snapshot)?;
+        if let Some((names, dns)) = &mut self.names {
+            names.update(Some(dns), &snapshot).await;
+        }
         if let Err(e) = self.announce(link).await {
             log::warn!("failed to announce this node: {e:#}");
         }

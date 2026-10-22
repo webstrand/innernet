@@ -7,7 +7,8 @@ use indoc::eprintdoc;
 use innernet_client_core::{
     admin,
     data_store::DataStore,
-    interface::{fetch, redeem_invite, round, NodeState},
+    dns::Servers,
+    interface::{fetch, redeem_invite},
     peer::coordinator_info,
     rest_client::RestClient,
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
@@ -15,7 +16,6 @@ use innernet_client_core::{
 use innernet_node::{
     addresses,
     events::EventSource,
-    realize::DnsService,
     runtime::{self, Triggers},
 };
 use innernet_shared::{
@@ -27,7 +27,7 @@ use innernet_shared::{
     PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts, WrappedIoError,
 };
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fs::File,
     io,
     path::{Path, PathBuf},
@@ -337,7 +337,7 @@ async fn install(
 
     let mut fetch_success = false;
     for _ in 0..3 {
-        if fetch(
+        let fetched = fetch(
             &opts.config_dir,
             &opts.data_dir,
             &opts.network,
@@ -345,10 +345,11 @@ async fn install(
             nat_opts,
             &interface_name,
             true,
+            &EventSource::default(),
         )
-        .await
-        .is_ok()
-        {
+        .await;
+        if let Ok(round) = fetched {
+            runtime::settle(round).await?;
             fetch_success = true;
             break;
         }
@@ -432,107 +433,133 @@ async fn up(
     hosts_opts: HostsOpts,
     nat_opts: &NatOpts,
 ) -> Result<(), Error> {
-    let installed = || -> Result<Vec<Interface>, Error> {
+    let list_interfaces = || -> Result<Vec<Interface>, Error> {
         Ok(match &specific_interface {
             Some(iface) => vec![iface.clone()],
             None => all_installed(&opts.config_dir)?,
         })
     };
-    let Some(interval) = loop_interval else {
-        for interface in installed()? {
-            fetch(
-                &opts.config_dir,
-                &opts.data_dir,
-                &opts.network,
-                &hosts_opts,
-                nat_opts,
-                &interface,
-                true,
-            )
-            .await?;
-        }
-        return Ok(());
-    };
 
-    // An endpoint override keyed by IP does not resolve itself, so it is fatal at startup.
-    for interface in installed()? {
-        let config = InterfaceConfig::from_interface(&opts.config_dir, &interface)
+    // A missing or malformed configuration does not resolve itself, so it is fatal at startup.
+    let mut interfaces = list_interfaces()?;
+    for interface in &interfaces {
+        let config = InterfaceConfig::from_interface(&opts.config_dir, interface)
             .with_context(|| interface.to_string())?;
-        let peers = if DataStore::exists(&opts.data_dir, &interface)? {
-            DataStore::open(&opts.data_dir, &interface, &config)?.peers()?
+        let peers = if DataStore::exists(&opts.data_dir, interface)? {
+            DataStore::open(&opts.data_dir, interface, &config)?.peers()?
         } else {
             vec![]
         };
         config.refuse_ip_keyed_endpoint_overrides(&peers)?;
     }
 
+    let Some(interval) = loop_interval else {
+        for interface in &interfaces {
+            let round = fetch(
+                &opts.config_dir,
+                &opts.data_dir,
+                &opts.network,
+                &hosts_opts,
+                nat_opts,
+                interface,
+                true,
+                &EventSource::default(),
+            )
+            .await?;
+            runtime::settle(round).await?;
+        }
+        return Ok(());
+    };
+
     // Each interface runs its node's rounds in a task of its own, at the interval, whenever the
-    // host's addresses change, and on the timers of NAT traversal. The interfaces are listed again
-    // at each interval, so that one installed or uninstalled meanwhile starts or stops.
-    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-    let mut ticker = tokio::time::interval(interval);
+    // host's addresses change, and on the timers of NAT traversal. The DNS servers follow the
+    // configs and the data stores of the interfaces apart from the rounds, so that they keep
+    // answering, and follow the `[dns]` tables, while fetches fail. The interfaces are listed
+    // again, and the DNS servers brought up to date, at each interval, so that an interface
+    // installed or uninstalled meanwhile starts or stops.
+    let mut running: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+    let mut dns_servers = Servers::default();
     loop {
-        ticker.tick().await;
-        let interfaces = match installed() {
-            Ok(interfaces) => interfaces,
-            Err(e) => {
-                log::error!("failed to list the installed interfaces: {e:#}");
-                continue;
-            },
-        };
+        let names: Vec<InterfaceName> = interfaces.iter().map(|interface| **interface).collect();
         running.retain(|name, task| {
-            let installed = interfaces
-                .iter()
-                .any(|interface| interface.to_string() == *name);
+            let installed = names.iter().any(|interface| &interface.to_string() == name);
             if !installed {
                 task.abort();
             }
             installed
         });
-        for interface in interfaces {
-            if running.contains_key(&interface.to_string()) {
-                continue;
-            }
-            let (config_dir, data_dir, network) =
-                (opts.config_dir.clone(), opts.data_dir.clone(), opts.network);
-            let (hosts, nat) = (hosts_opts.clone(), nat_opts.clone());
-            let name = interface.to_string();
-            let task = tokio::task::spawn_local(async move {
-                let mut state = NodeState {
-                    events: EventSource::default(),
-                    dns: Some(DnsService::new(*interface, hosts.host_suffix.clone())),
-                };
-                // The watcher waits as the config read when the loop starts says; every round
-                // reads the rest of the config anew.
-                let settle = InterfaceConfig::from_interface(&config_dir, &interface)
-                    .map_or(DEFAULT_ADDRESS_SETTLE, |config| {
-                        config.interface.address_settle()
-                    });
-                let triggers = Triggers {
-                    changed: None,
-                    interval: Some(interval),
-                    addresses: addresses::Watcher::new(settle)
-                        .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
-                        .ok(),
-                };
-                runtime::run(triggers, async || {
-                    round(
-                        &config_dir,
-                        &data_dir,
-                        &network,
-                        &hosts,
-                        &nat,
-                        &interface,
-                        true,
-                        &mut state,
-                    )
-                    .await
-                })
-                .await
+        for interface in &names {
+            running.entry(interface.to_string()).or_insert_with(|| {
+                tokio::task::spawn_local(run_interface(
+                    *interface,
+                    opts.config_dir.clone(),
+                    opts.data_dir.clone(),
+                    opts.network,
+                    hosts_opts.clone(),
+                    nat_opts.clone(),
+                    interval,
+                ))
             });
-            running.insert(name, task);
+        }
+        dns_servers
+            .update(
+                &names,
+                &opts.config_dir,
+                &opts.data_dir,
+                hosts_opts.host_suffix.as_deref(),
+            )
+            .await;
+
+        tokio::time::sleep(interval).await;
+        match list_interfaces() {
+            Ok(list) => interfaces = list,
+            Err(e) => log::error!("failed to list installed interfaces: {:#}", e),
         }
     }
+}
+
+/// Runs the loop of the node of `interface`, whose rounds fetch from its coordinator at
+/// `interval`, and whenever the host's addresses change.
+async fn run_interface(
+    interface: InterfaceName,
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    network: NetworkOpts,
+    hosts_opts: HostsOpts,
+    nat_opts: NatOpts,
+    interval: Duration,
+) {
+    // The watcher waits as the config read when the loop starts says; every round reads the rest
+    // of the config anew.
+    let settle = InterfaceConfig::from_interface(&config_dir, &interface)
+        .map_or(DEFAULT_ADDRESS_SETTLE, |config| {
+            config.interface.address_settle()
+        });
+    let addresses = addresses::Watcher::new(settle)
+        .inspect_err(|e| log::warn!("can't watch the host's addresses: {e}"))
+        .ok();
+    let triggers = Triggers {
+        changed: None,
+        interval: Some(interval),
+        addresses,
+    };
+    // One source of the tunnel's events serves every round, so that its poller runs on.
+    let events = EventSource::default();
+    runtime::run(triggers, async || {
+        fetch(
+            &config_dir,
+            &data_dir,
+            &network,
+            &hosts_opts,
+            &nat_opts,
+            &interface,
+            true,
+            &events,
+        )
+        .await
+        .with_context(|| format!("failed to fetch {}", interface.as_str_lossy()))
+    })
+    .await
 }
 
 fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Error> {
@@ -974,7 +1001,7 @@ async fn run(opts: &Opts) -> Result<(), Error> {
             hosts,
             nat,
         } => {
-            fetch(
+            let round = fetch(
                 &opts.config_dir,
                 &opts.data_dir,
                 &opts.network,
@@ -982,8 +1009,10 @@ async fn run(opts: &Opts) -> Result<(), Error> {
                 &nat,
                 &interface,
                 false,
+                &EventSource::default(),
             )
             .await?;
+            runtime::settle(round).await?;
         },
         Command::Up {
             interface,

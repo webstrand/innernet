@@ -10,6 +10,7 @@ pub use wireguard_control::Backend;
 
 pub mod admin;
 pub mod data_store;
+pub mod dns;
 pub mod interface;
 pub mod peer;
 pub mod rest_client;
