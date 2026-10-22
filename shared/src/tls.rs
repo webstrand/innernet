@@ -39,8 +39,8 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
-/// The first byte of a TLS handshake record, which no HTTP request line starts with.
-pub const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+/// The protocol of the TLS API, as ALPN names it: HTTP/3, over QUIC.
+const ALPN_HTTP3: &[u8] = b"h3";
 
 pub(crate) fn ed25519_spki(point: &CompressedEdwardsY) -> Vec<u8> {
     let mut spki = ED25519_SPKI_PREFIX.to_vec();
@@ -362,8 +362,8 @@ impl ClientCertVerifier for PeerKeyVerifier {
 
 /// The server's TLS configuration: TLS 1.3 only, authenticating with the server's WireGuard
 /// private key, in its self-signed certificate, and requiring the client to authenticate with its
-/// own, as a raw public key. Sessions are never resumed and early data is refused, so every
-/// connection is authenticated afresh.
+/// own, as a raw public key, for HTTP/3 over QUIC. Sessions are never resumed and early data is
+/// refused, so every connection is authenticated afresh.
 pub fn server_config(private_key: &str) -> Result<Arc<ServerConfig>, Error> {
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -374,11 +374,12 @@ pub fn server_config(private_key: &str) -> Result<Arc<ServerConfig>, Error> {
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
     config.max_early_data_size = 0;
+    config.alpn_protocols = vec![ALPN_HTTP3.to_vec()];
     Ok(Arc::new(config))
 }
 
 /// A peer's TLS configuration: TLS 1.3 only, authenticating with the peer's WireGuard private
-/// key and accepting only the server's pinned public key.
+/// key and accepting only the server's pinned public key, for HTTP/3 over QUIC.
 pub fn client_config(
     private_key: &str,
     server_public_key: &str,
@@ -396,6 +397,7 @@ pub fn client_config(
     config.resumption = Resumption::disabled();
     config.enable_sni = false;
     config.enable_early_data = false;
+    config.alpn_protocols = vec![ALPN_HTTP3.to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -519,11 +521,12 @@ mod tests {
         let verifier = ServerKeyVerifier {
             server_public_key: server_public_key.clone(),
         };
-        let config = ClientConfig::builder_with_provider(provider())
+        let mut config = ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(key)));
+        config.alpn_protocols = vec![ALPN_HTTP3.to_vec()];
         Ok(Arc::new(config))
     }
 
@@ -583,10 +586,11 @@ mod tests {
         let mislabeled = MislabeledKey(XEdDsaKey::new(&private(&server))?);
         let certificate = CertificateDer::from(server_certificate(&mislabeled.0.private_key));
         let key = Arc::new(CertifiedKey::new(vec![certificate], Arc::new(mislabeled)));
-        let config = ServerConfig::builder_with_provider(provider())
+        let mut config = ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(Arc::new(PeerKeyVerifier))
             .with_cert_resolver(Arc::new(ServerCertificate(key)));
+        config.alpn_protocols = vec![ALPN_HTTP3.to_vec()];
         let result = handshake(
             client_config(&private(&client), &server.public.to_base64())?,
             Arc::new(config),

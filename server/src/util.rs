@@ -10,7 +10,7 @@ use crate::{ServerError, Session};
 use innernet_shared::media_type::{self, Representation};
 
 /// The longest body of a request that the server reads.
-const MAX_BODY_LEN: usize = 16 * 1024;
+pub const MAX_BODY_LEN: usize = 16 * 1024;
 
 /// Reads the body of `req`, a request of `session`, and decodes it as [`decode`] does.
 pub async fn form_body<F: DeserializeOwned>(

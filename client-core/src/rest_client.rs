@@ -1,5 +1,5 @@
 use crate::data_store::DataStore;
-use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response};
+use bytes::{Buf, Bytes};
 use innernet_shared::{
     cbor,
     interface_config::{InterfaceConfig, ServerInfo},
@@ -7,87 +7,139 @@ use innernet_shared::{
     problem::{self, Problem},
     smallest_cidr_holding, tls, Association, Cidr, CidrDeletion, LegacyAssociation,
     LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
-    LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr, TaggedPeer,
-    TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
+    LegacyState, PeerContents, PeerUpdate, Prefix, ServerCapabilities, State, TaggedCidr,
+    TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
+use quinn::crypto::rustls::QuicClientConfig;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{cell::Cell, io, path::Path, time::Duration};
+use std::{
+    cell::Cell,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
-use tokio::net::TcpStream;
-use tokio_rustls::{rustls, TlsConnector};
 use wireguard_control::InterfaceName;
 
-/// How long a request may take. Some platforms, such as OpenBSD, can take longer to complete the
-/// first WireGuard handshake, so a lower timeout could fail a request that would succeed.
+/// How long the client waits for the server, in plain HTTP and over QUIC. Some platforms, such as
+/// OpenBSD, can take longer to complete the first WireGuard handshake, so a lower timeout could
+/// fail a request that would succeed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Records something that the client learned about the server in the data store.
-type Recorder<'a> = Box<dyn Fn() -> Result<(), anyhow::Error> + 'a>;
+type Recorder<'a, T> = Box<dyn Fn(T) -> Result<(), anyhow::Error> + 'a>;
 
 /// A REST client that can be used to communicate with an innernet REST server.
 ///
-/// Requests are made over TLS, authenticated with the interface's WireGuard key. A server that
-/// answers the TLS handshake in plain HTTP, as servers that predate TLS do, is sent the request in
-/// plain HTTP instead, unless the server is known to speak TLS. The server becomes known to speak
-/// TLS when it first answers over TLS, and from then on the client refuses plain HTTP.
+/// Requests are made to the TLS API, in HTTP/3 over QUIC at the server's internal address,
+/// authenticated with the interface's WireGuard key. The client needs the QUIC port of the API,
+/// which the invitation states, or the data store records; without one, the client asks the
+/// server for it in plain HTTP. A server that states no port, as servers that predate TLS do, is
+/// sent the requests in plain HTTP instead, unless the server is known to speak TLS. The server
+/// becomes known to speak TLS when it first answers over QUIC, and from then on the client refuses
+/// plain HTTP for its requests, and asks for the port only. When the server doesn't answer at the
+/// port, the client asks it for the port once more, since the operator may have moved it.
 ///
 /// We recommend to use the high level API (like [`Self::create_peer()`]) when possible and fall
 /// back on the low level [`Self::http()`] and [`Self::http_form()`] otherwise.
 pub struct RestClient<'a> {
-    plain_client: Client<HttpConnector>,
-    tls_connector: TlsConnector,
+    plain_client: hyper::Client<hyper::client::HttpConnector>,
+    tls_config: Arc<quinn::rustls::ClientConfig>,
     server: &'a ServerInfo,
+    /// The server's internal address, at which the client reaches its API.
+    address: IpAddr,
+    /// The QUIC port of the server's TLS API, if known.
+    quic_port: Cell<Option<u16>>,
+    /// Whether the client has asked the server for the QUIC port, which it does at most once.
+    asked_port: Cell<bool>,
     /// Whether the server is known to speak TLS, in which case the client never falls back to
     /// plain HTTP.
     speaks_tls: Cell<bool>,
-    /// Whether the server answered a TLS handshake in plain HTTP, after which the client makes its
-    /// requests in plain HTTP.
+    /// Whether the server stated no QUIC port, as servers that predate TLS do, after which the
+    /// client makes its requests in plain HTTP.
     predates_tls: Cell<bool>,
-    /// Records for good that the server speaks TLS, when it first answers over TLS.
-    latch: Option<Recorder<'a>>,
+    /// Records for good that the server speaks TLS, when it first answers over QUIC.
+    latch: Option<Recorder<'a, ()>>,
+    /// Records the QUIC port that the server stated, when the client asked it for the port.
+    record_port: Option<Recorder<'a, u16>>,
+    /// How long the client waits for the server.
+    timeout: Duration,
 }
 
 impl<'a> RestClient<'a> {
     /// Create a [`Self`] to communicate with the innernet server of an interface, as the
     /// interface's peer. `speaks_tls` is whether the server is known to speak TLS. Nothing
-    /// records it if the server answers over TLS; [`Self::speaks_tls`] tells whether it did.
+    /// records it if the server answers over QUIC; [`Self::speaks_tls`] tells whether it did. The
+    /// QUIC port is the one that the interface config states, if any.
     pub fn new(config: &'a InterfaceConfig, speaks_tls: bool) -> Result<Self, RestError> {
         let tls_config =
             tls::client_config(&config.interface.private_key, &config.server.public_key)
                 .map_err(RestError::TlsConfig)?;
         Ok(Self {
-            plain_client: Client::new(),
-            tls_connector: TlsConnector::from(tls_config),
+            plain_client: hyper::Client::builder().build_http(),
+            tls_config,
             server: &config.server,
+            address: config.server.internal_endpoint.ip(),
+            quic_port: Cell::new(config.server.quic_port),
+            asked_port: Cell::new(false),
             speaks_tls: Cell::new(speaks_tls),
             predates_tls: Cell::new(false),
             latch: None,
+            record_port: None,
+            timeout: TIMEOUT,
         })
     }
 
     /// Create a [`Self`] to communicate with the innernet server of `interface`, whose data store
-    /// records whether the server is known to speak TLS, and records it when the server first
-    /// answers over TLS.
+    /// records whether the server is known to speak TLS, and the QUIC port of its TLS API, if the
+    /// client has learned it from the server. The data store records that the server speaks TLS
+    /// when the server first answers over QUIC, and the port when the server states one.
     pub fn for_interface(
         config: &'a InterfaceConfig,
         data_dir: &'a Path,
         interface: &'a InterfaceName,
     ) -> Result<Self, RestError> {
-        let speaks_tls = DataStore::open(data_dir, interface, config)
-            .and_then(|store| store.speaks_tls(&config.server.public_key))
+        let server_key = &config.server.public_key;
+        let (speaks_tls, quic_port) = DataStore::open(data_dir, interface, config)
+            .and_then(|store| Ok((store.speaks_tls(server_key)?, store.quic_port(server_key)?)))
             .map_err(RestError::DataStore)?;
+        let client = Self::new(config, speaks_tls)?;
+        client.quic_port.set(quic_port.or(config.server.quic_port));
+        // A data store that the client first made without an invitation records the coordinator
+        // only once the server reports it, after which `fetch` records what the client learned.
+        let open = move || -> Result<Option<DataStore>, anyhow::Error> {
+            let store = DataStore::open(data_dir, interface, config)?;
+            Ok(store.records_peer(server_key)?.then_some(store))
+        };
         Ok(Self {
-            latch: Some(Box::new(move || {
-                DataStore::open(data_dir, interface, config)?.latch_tls(&config.server.public_key)
+            latch: Some(Box::new(move |()| match open()? {
+                Some(mut store) => store.latch_tls(server_key),
+                None => Ok(()),
             })),
-            ..Self::new(config, speaks_tls)?
+            record_port: Some(Box::new(move |port| match open()? {
+                Some(mut store) => store.set_quic_port(server_key, port),
+                None => Ok(()),
+            })),
+            ..client
         })
     }
 
     /// Whether the server is known to speak TLS, either from the start or because it has
-    /// answered this client over TLS.
+    /// answered this client over QUIC.
     pub fn speaks_tls(&self) -> bool {
         self.speaks_tls.get()
+    }
+
+    /// The QUIC port of the server's TLS API, if the client knows it.
+    pub fn quic_port(&self) -> Option<u16> {
+        self.quic_port.get()
+    }
+
+    /// The server's internal address, at which the client reaches its API.
+    pub fn address(&self) -> IpAddr {
+        self.address
     }
 
     /// Creates the CIDR `cidr`, under the parent that its prefix gives it, and returns it as the
@@ -349,21 +401,12 @@ impl<'a> RestClient<'a> {
         self.http("GET", "/admin/peers").await
     }
 
-    /// The admin API that the server offers this client. Unless an earlier request has settled
-    /// whether the client speaks TLS or plain HTTP to the server, a request to
-    /// `/user/capabilities` settles it.
+    /// The admin API that the server offers this client. Unless the client knows that the server
+    /// speaks TLS, or knows the QUIC port of its TLS API, it asks the server for the port, which
+    /// settles whether the client speaks TLS or plain HTTP to the server.
     pub async fn admin_api(&self) -> Result<AdminApi, RestError> {
         if !self.speaks_tls.get() && !self.predates_tls.get() {
-            match self
-                .http::<serde::de::IgnoredAny>("GET", "/user/capabilities")
-                .await
-            {
-                Ok(_)
-                | Err(
-                    RestError::Status(_) | RestError::Refused { .. } | RestError::Problem { .. },
-                ) => {},
-                Err(e) => return Err(e),
-            }
+            self.tls_port().await?;
         }
         Ok(if self.predates_tls.get() {
             AdminApi::Legacy
@@ -514,122 +557,191 @@ impl<'a> RestClient<'a> {
         endpoint: &str,
         form: Option<S>,
     ) -> Result<(Transport, Vec<u8>), RestError> {
-        let method = Method::from_bytes(verb.as_bytes()).map_err(|_| RestError::Method)?;
-        // The body is encoded for each attempt, since a request that falls back to plain HTTP is
-        // sent again in JSON.
-        let request = |uri: String, transport: Transport| {
-            let mut request = Request::builder()
-                .method(method.clone())
-                .uri(uri)
-                .header(header::HOST, self.server.internal_endpoint.to_string())
-                .header(INNERNET_PUBKEY_HEADER, &self.server.public_key);
-            let body = match transport {
-                // Every request names the version that it reads in Accept, which the server
-                // requires of every change, so that it never takes a change for one of another
-                // version. A body states its version, and a request without a form carries
-                // neither a body nor a content type.
-                Transport::Tls => {
-                    request = request.header(header::ACCEPT, media_type::accept());
-                    let body = form
-                        .as_ref()
-                        .map(cbor::to_vec)
-                        .transpose()
-                        .map_err(|e| RestError::RequestSerialize(e.into()))?;
-                    if body.is_some() {
-                        request = request.header(
-                            header::CONTENT_TYPE,
-                            media_type::content_type(media_type::VERSION),
-                        );
-                    }
-                    body
-                },
-                Transport::Plain => {
-                    let body = form
-                        .as_ref()
-                        .map(serde_json::to_vec)
-                        .transpose()
-                        .map_err(|e| RestError::RequestSerialize(e.into()))?;
-                    if body.is_some() {
-                        request = request.header(header::CONTENT_TYPE, "application/json");
-                    }
-                    body
-                },
-            };
-            request
-                .body(body.map_or_else(Body::empty, Body::from))
-                .map_err(|_| RestError::Method)
-        };
-
         loop {
             if self.predates_tls.get() {
-                let uri = format!("http://{}/v1{endpoint}", self.server.internal_endpoint);
-                let answer = timed(self.plain_exchange(request(uri, Transport::Plain)?)).await?;
-                return answer
-                    .into_plain_body()
-                    .map(|body| (Transport::Plain, body));
+                let body = self.plain_request(verb, endpoint, form.as_ref()).await?;
+                return Ok((Transport::Plain, body));
             }
-            let request = request(endpoint.to_string(), Transport::Tls)?;
-            match timed(self.tls_exchange(request)).await {
-                // The server authenticated with its key and answered over TLS.
+            // Without a port, the server predates TLS, and the request goes in plain HTTP.
+            let Some(port) = self.tls_port().await? else {
+                continue;
+            };
+            let body = form
+                .as_ref()
+                .map(cbor::to_vec)
+                .transpose()
+                .map_err(|e| RestError::RequestSerialize(e.into()))?;
+            match self.quic_request(port, verb, endpoint, body).await {
                 Ok(answer) => {
+                    // The server authenticated with its key and answered over QUIC.
                     self.record_tls();
                     return answer.into_tls_body().map(|body| (Transport::Tls, body));
                 },
-                // The server answered the handshake without reading the request, so the request
-                // is sent again in plain HTTP, unless the server is known to speak TLS.
-                Err(RestError::Handshake(e)) if is_plain_http_server(&e) => {
-                    if self.speaks_tls.get() {
-                        return Err(RestError::ServerDowngraded);
-                    }
-                    log::warn!(
-                        "the innernet server predates TLS, so requests to it are made in plain \
-                         HTTP, in which anything on this machine that sends from its innernet IP \
-                         can act as this peer, until the server is upgraded."
+                // Nothing answered at the port, which the operator may have moved, so the client
+                // asks the server for the port, once, and tries again at the port it states.
+                Err(e) if e.is_connection_failure() && !self.asked_port.get() => {
+                    log::info!(
+                        "the TLS API of the innernet server didn't answer at port {port} ({e}), \
+                         so the client asks the server for the port."
                     );
-                    self.predates_tls.set(true);
+                    match self.ask_port().await {
+                        Ok(Some(asked)) if asked != port => {},
+                        Ok(None) => {},
+                        Ok(Some(_)) => return Err(e.into()),
+                        Err(RestError::ServerDowngraded) => {
+                            return Err(RestError::ServerDowngraded)
+                        },
+                        Err(_) => return Err(e.into()),
+                    }
                 },
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
     }
 
-    /// Exchanges `request` for an answer in plain HTTP.
-    async fn plain_exchange(&self, request: Request<Body>) -> Result<Answer, RestError> {
-        let response = self
-            .plain_client
-            .request(request)
-            .await
-            .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-        read_answer(response).await
+    /// The QUIC port of the server's TLS API, which the client asks the server for if it doesn't
+    /// know it, or `None` if the server predates TLS.
+    async fn tls_port(&self) -> Result<Option<u16>, RestError> {
+        match self.quic_port.get() {
+            Some(port) => Ok(Some(port)),
+            None => self.ask_port().await,
+        }
     }
 
-    /// Exchanges `request` for an answer over TLS, on a connection of its own to the server.
-    async fn tls_exchange(&self, request: Request<Body>) -> Result<Answer, RestError> {
-        let address = self.server.internal_endpoint;
-        let stream = TcpStream::connect(address)
+    /// Asks the server for the QUIC port of its TLS API, in plain HTTP, which the server answers
+    /// even once it requires TLS of this client, and records the port that it states. A server
+    /// that states none predates TLS: from then on, the client makes its requests in plain HTTP,
+    /// unless the server is known to speak TLS, in which case the client refuses to. WireGuard
+    /// authenticates the server's internal address, so the client can trust the answer.
+    async fn ask_port(&self) -> Result<Option<u16>, RestError> {
+        self.asked_port.set(true);
+        // A server that predates capabilities answers 404.
+        let port = match self
+            .plain_request::<()>("GET", "/user/capabilities", None)
             .await
-            .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-        // The name is the server's address, which the client doesn't check: it pins the key.
-        let name = rustls::pki_types::ServerName::IpAddress(address.ip().into());
-        let stream = self
-            .tls_connector
-            .connect(name, stream)
-            .await
-            .map_err(RestError::Handshake)?;
-        let (mut sender, connection) = hyper::client::conn::handshake(stream)
-            .await
-            .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-        let connection = tokio::spawn(connection);
-        let answer = async {
-            let response = sender
-                .send_request(request)
+        {
+            Ok(body) => decode::<Option<ServerCapabilities>>(Transport::Plain, &body)?
+                .and_then(|capabilities| capabilities.quic_port),
+            Err(e) if e.has_status_of(404) => None,
+            Err(e) => return Err(e),
+        };
+        let Some(port) = port else {
+            if self.speaks_tls.get() {
+                return Err(RestError::ServerDowngraded);
+            }
+            log::warn!(
+                "the innernet server predates TLS, so requests to it are made in plain HTTP, in \
+                 which anything on this machine that sends from its innernet IP can act as this \
+                 peer, until the server is upgraded."
+            );
+            self.predates_tls.set(true);
+            return Ok(None);
+        };
+        if self.quic_port.replace(Some(port)) != Some(port) {
+            log::info!("the TLS API of the innernet server is at QUIC port {port}.");
+            if let Some(record_port) = &self.record_port {
+                if let Err(e) = record_port(port) {
+                    log::warn!("failed to record the QUIC port of the innernet server: {e:#}");
+                }
+            }
+        }
+        Ok(Some(port))
+    }
+
+    /// Performs a `verb` request at `endpoint` in plain HTTP, in the API of servers that predate
+    /// TLS, with `form` as its JSON body, and returns the body of the answer.
+    async fn plain_request<S: Serialize>(
+        &self,
+        verb: &str,
+        endpoint: &str,
+        form: Option<&S>,
+    ) -> Result<Vec<u8>, RestError> {
+        // The API of servers that predate TLS is versioned by the prefix of its paths.
+        let server = SocketAddr::new(self.address, self.server.internal_endpoint.port());
+        let url = format!("http://{server}/v1{endpoint}");
+        let body = form
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| RestError::RequestSerialize(e.into()))?;
+        let mut request = hyper::Request::builder()
+            .method(verb)
+            .uri(url)
+            .header(INNERNET_PUBKEY_HEADER, &self.server.public_key);
+        if body.is_some() {
+            request = request.header(hyper::header::CONTENT_TYPE, "application/json");
+        }
+        let request = request
+            .body(body.map_or_else(hyper::Body::empty, hyper::Body::from))
+            .map_err(|e| RestError::RequestSerialize(e.into()))?;
+        let exchange = async {
+            let response = self
+                .plain_client
+                .request(request)
                 .await
                 .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-            read_answer(response).await
+            let status = response.status().as_u16();
+            if status >= 400 {
+                // The server explains refusals that an outdated client can't make sense of.
+                let explained = read_limited(response.into_body(), MAX_EXPLANATION_LEN).await;
+                let message = explanation(&explained.unwrap_or_default());
+                return Err(if message.is_empty() {
+                    RestError::Status(status)
+                } else {
+                    RestError::Refused { status, message }
+                });
+            }
+            let body = read_limited(response.into_body(), MAX_RESPONSE_LEN + 1)
+                .await
+                .map_err(RestError::ResponseRead)?;
+            check_length(&body)?;
+            Ok(body)
+        };
+        tokio::time::timeout(self.timeout, exchange)
+            .await
+            .map_err(|elapsed| RestError::RequestSend(Box::new(elapsed)))?
+    }
+
+    /// Performs a `verb` request at `endpoint` over QUIC, at `port` of the server's internal
+    /// address, with `body`, in CBOR, if any, and returns the answer, whatever its status.
+    async fn quic_request(
+        &self,
+        port: u16,
+        verb: &str,
+        endpoint: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<Answer, QuicError> {
+        let server = SocketAddr::new(self.address, port);
+        // Every request names the version that it reads in Accept, which the server requires of
+        // every change, so that it never takes a change for one of another version. A body
+        // states its version, and a request without a form carries neither a body nor a content
+        // type.
+        let mut request = http::Request::builder()
+            .method(verb)
+            .uri(format!("https://{server}{endpoint}"))
+            .header(INNERNET_PUBKEY_HEADER, &self.server.public_key)
+            .header(http::header::ACCEPT, media_type::accept());
+        if let Some(body) = &body {
+            request = request
+                .header(
+                    http::header::CONTENT_TYPE,
+                    media_type::content_type(media_type::VERSION),
+                )
+                .header(http::header::CONTENT_LENGTH, body.len());
         }
-        .await;
-        connection.abort();
-        answer
+        let request = request
+            .body(())
+            .map_err(|e| QuicError::Request(e.to_string()))?;
+        let crypto = QuicClientConfig::try_from(self.tls_config.clone())
+            .map_err(|e| QuicError::Request(e.to_string()))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            self.timeout
+                .try_into()
+                .map_err(|_| QuicError::Request("the timeout is too long".into()))?,
+        ));
+        client_config.transport_config(Arc::new(transport));
+        exchange(server, client_config, request, body).await
     }
 
     /// Records that the server speaks TLS, if it isn't known yet.
@@ -638,11 +750,157 @@ impl<'a> RestClient<'a> {
             return;
         }
         if let Some(latch) = &self.latch {
-            if let Err(e) = latch() {
+            if let Err(e) = latch(()) {
                 log::warn!("failed to record that the innernet server speaks TLS: {e:#}");
             }
         }
     }
+}
+
+/// Exchanges `request`, with `body`, if any, for an answer, on a connection of its own to
+/// `server`, which is closed afterwards.
+async fn exchange(
+    server: SocketAddr,
+    client_config: quinn::ClientConfig,
+    request: http::Request<()>,
+    body: Option<Vec<u8>>,
+) -> Result<Answer, QuicError> {
+    let unspecified = match server.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let endpoint =
+        quinn::Endpoint::client(SocketAddr::new(unspecified, 0)).map_err(QuicError::Io)?;
+    // The name is the server's address, which the client doesn't check: it pins the key.
+    let connection = endpoint
+        .connect_with(client_config, server, &server.ip().to_string())?
+        .await?;
+    let answer = async {
+        let (mut driver, mut send_request) =
+            h3::client::new(h3_quinn::Connection::new(connection.clone())).await?;
+        let request = async {
+            let mut stream = send_request.send_request(request).await?;
+            if let Some(body) = body {
+                stream.send_data(Bytes::from(body)).await?;
+            }
+            stream.finish().await?;
+            let response = stream.recv_response().await?;
+            let content_type = response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let mut body = vec![];
+            while let Some(mut chunk) = stream.recv_data().await? {
+                while chunk.has_remaining() && body.len() as u64 <= MAX_RESPONSE_LEN {
+                    let bytes = chunk.chunk();
+                    let take = bytes.len().min(MAX_RESPONSE_LEN as usize + 1 - body.len());
+                    body.extend_from_slice(&bytes[..take]);
+                    chunk.advance(take);
+                }
+                if body.len() as u64 > MAX_RESPONSE_LEN {
+                    break;
+                }
+            }
+            Ok::<_, QuicError>(Answer {
+                status: response.status().as_u16(),
+                content_type,
+                body,
+            })
+        };
+        tokio::select! {
+            answer = request => answer,
+            error = std::future::poll_fn(|cx| driver.poll_close(cx)) => {
+                Err(QuicError::Http3(error.to_string()))
+            },
+        }
+    }
+    .await;
+    connection.close(0u32.into(), b"");
+    // Long enough for the close to leave, but not to drain the connection.
+    let _ = tokio::time::timeout(Duration::from_millis(50), endpoint.wait_idle()).await;
+    answer
+}
+
+/// An answer of the server over QUIC.
+#[derive(Debug)]
+struct Answer {
+    status: u16,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+impl Answer {
+    /// The body of the answer, an answer of the TLS API, or the refusal that it is. The server
+    /// explains every refusal in a problem detail, whose type alone says what the refusal means. A
+    /// body must state the version of the API that the client reads, so that the client never
+    /// reads a body of another version as one of its own.
+    fn into_tls_body(self) -> Result<Vec<u8>, RestError> {
+        let Answer {
+            status,
+            content_type,
+            body,
+        } = self;
+        if status >= 400 {
+            if content_type
+                .as_deref()
+                .is_some_and(problem::is_content_type)
+            {
+                return Err(match read_problem(&body) {
+                    Some(problem) => RestError::from_problem(status, problem),
+                    None => RestError::Status(status),
+                });
+            }
+            // A refusal without a problem detail, which the server never makes, is explained as
+            // one in plain HTTP is.
+            let message = explanation(&body);
+            return Err(if message.is_empty() {
+                RestError::Status(status)
+            } else {
+                RestError::Refused { status, message }
+            });
+        }
+        check_length(&body)?;
+        let version = content_type
+            .as_deref()
+            .and_then(|header| media_type::body_version(header, &[media_type::VERSION]));
+        if !body.is_empty() && version.is_none() {
+            return Err(RestError::ResponseDeserialize(anyhow::anyhow!(
+                "the response is of the content type {content_type:?}, not of version {} of the \
+                 API",
+                media_type::VERSION
+            )));
+        }
+        Ok(body)
+    }
+}
+
+/// At most `limit` bytes of `body`.
+async fn read_limited(mut body: hyper::Body, limit: u64) -> io::Result<Vec<u8>> {
+    use hyper::body::HttpBody as _;
+    let mut bytes = vec![];
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(io::Error::other)?;
+        let take = chunk
+            .len()
+            .min((limit as usize).saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&chunk[..take]);
+        if bytes.len() as u64 >= limit {
+            break;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Refuses a body longer than the client reads.
+fn check_length(body: &[u8]) -> Result<(), RestError> {
+    if body.len() as u64 > MAX_RESPONSE_LEN {
+        return Err(RestError::ResponseRead(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the response is too long",
+        )));
+    }
+    Ok(())
 }
 
 /// Whether the peers `a` and `b` are the same, but for what the server's tag of a peer leaves
@@ -658,15 +916,8 @@ fn same_but_untagged(a: &PeerContents, b: &PeerContents) -> bool {
     tagged(a) == tagged(b)
 }
 
-/// The ID by which a server in plain HTTP names the CIDR `prefix`, among `cidrs` as it lists them,
-/// or [`RestError::NoSuchCidr`] if it lists no CIDR with the prefix.
-fn legacy_cidr_id(cidrs: &[LegacyCidr], prefix: &Prefix) -> Result<i64, RestError> {
-    cidrs
-        .iter()
-        .find(|cidr| cidr.prefix() == *prefix)
-        .map(|cidr| cidr.id)
-        .ok_or(RestError::NoSuchCidr)
-}
+/// The longest answer that the client reads.
+const MAX_RESPONSE_LEN: u64 = 10 * 1024 * 1024;
 
 /// Decodes the body of an answer in `transport`: as CBOR in its deterministic encoding over TLS,
 /// and as JSON in plain HTTP. An empty body decodes as `null`, so that it decodes as `()`.
@@ -681,6 +932,16 @@ fn decode<T: DeserializeOwned>(transport: Transport, body: &[u8]) -> Result<T, R
             serde_json::from_slice(body).map_err(|e| RestError::ResponseDeserialize(e.into()))
         },
     }
+}
+
+/// The ID by which a server in plain HTTP names the CIDR `prefix`, among `cidrs` as it lists them,
+/// or [`RestError::NoSuchCidr`] if it lists no CIDR with the prefix.
+fn legacy_cidr_id(cidrs: &[LegacyCidr], prefix: &Prefix) -> Result<i64, RestError> {
+    cidrs
+        .iter()
+        .find(|cidr| cidr.prefix() == *prefix)
+        .map(|cidr| cidr.id)
+        .ok_or(RestError::NoSuchCidr)
 }
 
 /// The transport that a server answered a request in.
@@ -702,123 +963,12 @@ pub enum AdminApi {
     Legacy,
 }
 
-/// Runs `exchange` for at most [`TIMEOUT`].
-async fn timed<T>(
-    exchange: impl std::future::Future<Output = Result<T, RestError>>,
-) -> Result<T, RestError> {
-    tokio::time::timeout(TIMEOUT, exchange)
-        .await
-        .map_err(|_| RestError::Timeout)?
-}
-
-/// An answer of the server.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    content_type: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Answer {
-    /// The body of the answer, an answer of the TLS API, or the refusal that it is. The server
-    /// explains every refusal in a problem detail, whose type alone says what the refusal means. A
-    /// body must state the version of the API that the client reads, so that the client never
-    /// reads a body of another version as one of its own.
-    fn into_tls_body(self) -> Result<Vec<u8>, RestError> {
-        if self.status >= 400 {
-            if self
-                .content_type
-                .as_deref()
-                .is_some_and(problem::is_content_type)
-            {
-                return Err(match read_problem(&self.body) {
-                    Some(problem) => RestError::from_problem(self.status, problem),
-                    None => RestError::Status(self.status),
-                });
-            }
-            // A refusal without a problem detail, which the server never makes, is explained as
-            // one in plain HTTP is.
-            return Err(self.refusal());
-        }
-        let version = self
-            .content_type
-            .as_deref()
-            .and_then(|header| media_type::body_version(header, &[media_type::VERSION]));
-        if !self.body.is_empty() && version.is_none() {
-            return Err(RestError::ResponseDeserialize(anyhow::anyhow!(
-                "the response is of the content type {:?}, not of version {} of the API",
-                self.content_type,
-                media_type::VERSION
-            )));
-        }
-        Ok(self.body)
-    }
-
-    /// The body of the answer, an answer in plain HTTP, or the refusal that it is.
-    fn into_plain_body(self) -> Result<Vec<u8>, RestError> {
-        if self.status >= 400 {
-            return Err(self.refusal());
-        }
-        Ok(self.body)
-    }
-
-    /// The refusal that the answer is, explained if the server explains it.
-    fn refusal(self) -> RestError {
-        // The server explains refusals that a client can't make sense of on its own.
-        let message = explanation(&self.body);
-        if message.is_empty() {
-            RestError::Status(self.status)
-        } else {
-            RestError::Refused {
-                status: self.status,
-                message,
-            }
-        }
-    }
-}
-
-/// The status, content type and body of `response`, of which at most [`MAX_PROBLEM_LEN`] bytes
-/// and one more are read for a refusal.
-async fn read_answer(response: Response<Body>) -> Result<Answer, RestError> {
-    use hyper::body::HttpBody as _;
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let mut body = response.into_body();
-    if status < 400 {
-        let body = hyper::body::to_bytes(body)
-            .await
-            .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-        return Ok(Answer {
-            status,
-            content_type,
-            body: body.to_vec(),
-        });
-    }
-    let mut refusal = vec![];
-    while refusal.len() <= MAX_PROBLEM_LEN {
-        match body.data().await {
-            Some(Ok(chunk)) => refusal.extend_from_slice(&chunk),
-            _ => break,
-        }
-    }
-    refusal.truncate(MAX_PROBLEM_LEN + 1);
-    Ok(Answer {
-        status,
-        content_type,
-        body: refusal,
-    })
-}
-
 /// How many bytes of the server's explanation of a refusal the client reads.
-const MAX_EXPLANATION_LEN: usize = 1024;
+const MAX_EXPLANATION_LEN: u64 = 1024;
 
 /// The server's explanation of a refusal, in `body`, escaped as [`escape`] escapes it.
 fn explanation(body: &[u8]) -> String {
-    let body = &body[..body.len().min(MAX_EXPLANATION_LEN)];
+    let body = &body[..body.len().min(MAX_EXPLANATION_LEN as usize)];
     escape(&String::from_utf8_lossy(body))
 }
 
@@ -843,24 +993,59 @@ fn read_problem(body: &[u8]) -> Option<Problem> {
 /// At most [`MAX_EXPLANATION_LEN`] bytes of `text`, the server's, trimmed and escaped as
 /// [`str::escape_debug`] escapes it, so that printing it can't affect the terminal.
 fn escape(text: &str) -> String {
-    let mut len = text.len().min(MAX_EXPLANATION_LEN);
+    let mut len = text.len().min(MAX_EXPLANATION_LEN as usize);
     while !text.is_char_boundary(len) {
         len -= 1;
     }
     text[..len].trim().escape_debug().to_string()
 }
 
-/// Whether the TLS handshake failed because the server answered in plain HTTP, as servers that
-/// predate TLS do.
-fn is_plain_http_server(error: &io::Error) -> bool {
-    matches!(
-        error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
-        Some(rustls::Error::InvalidMessage(
-            rustls::InvalidMessage::InvalidContentType
-        ))
-    )
+/// An error of a request over QUIC.
+#[derive(Debug, Error)]
+pub enum QuicError {
+    /// The client failed to start the connection, such as for an address that it can't reach.
+    #[error("{0}")]
+    Connect(#[from] quinn::ConnectError),
+    /// The connection failed, such as when nothing answered, or when the handshake failed, as
+    /// when the server presents another key than the pinned one.
+    #[error("{0}")]
+    Connection(#[from] quinn::ConnectionError),
+    /// HTTP/3 failed on the connection.
+    #[error("HTTP/3 error: {0}")]
+    Http3(String),
+    /// The request could not be made.
+    #[error("{0}")]
+    Request(String),
+    #[error("I/O error: {0}")]
+    Io(io::Error),
+}
+
+impl From<h3::error::ConnectionError> for QuicError {
+    fn from(error: h3::error::ConnectionError) -> Self {
+        QuicError::Http3(error.to_string())
+    }
+}
+
+impl From<h3::error::StreamError> for QuicError {
+    fn from(error: h3::error::StreamError) -> Self {
+        QuicError::Http3(error.to_string())
+    }
+}
+
+impl QuicError {
+    /// Whether the client failed to connect to the TLS API, before any request was made.
+    pub fn is_connection_failure(&self) -> bool {
+        matches!(self, QuicError::Connect(_) | QuicError::Connection(_))
+    }
+
+    /// Whether nothing answered: the server is down, unreachable, or doesn't listen at the port.
+    pub fn is_unanswered(&self) -> bool {
+        matches!(
+            self,
+            QuicError::Connection(quinn::ConnectionError::TimedOut)
+                | QuicError::Connect(quinn::ConnectError::InvalidRemoteAddress(_))
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -868,8 +1053,8 @@ pub enum RestError {
     #[error("Error setting up TLS: {0}")]
     TlsConfig(anyhow::Error),
     #[error(
-        "The innernet server answered in plain HTTP, but it is known to speak TLS, so the client \
-         refuses to fall back to plain HTTP."
+        "The innernet server states no QUIC port, as servers that predate TLS do, but it is \
+         known to speak TLS, so the client refuses to fall back to plain HTTP."
     )]
     ServerDowngraded,
     #[error("Error reading the data store: {0:#}")]
@@ -910,15 +1095,13 @@ pub enum RestError {
          the change was not made. Running the command again lists the associations anew."
     )]
     NoSuchAssociation,
-    /// The request failed to reach the server, or the server failed to answer it.
+    /// A transport error in plain HTTP; error statuses are [`Self::Status`], [`Self::Refused`]
+    /// and [`Self::Problem`].
     #[error("Error sending request: {0}")]
     RequestSend(Box<dyn std::error::Error + Send + Sync>),
-    /// The TLS handshake failed, such as when the server presents another key than the pinned
-    /// one.
-    #[error("The TLS handshake with the server failed: {0}")]
-    Handshake(io::Error),
-    #[error("The request timed out after {}s", TIMEOUT.as_secs())]
-    Timeout,
+    /// An error of a request over QUIC, to the TLS API.
+    #[error("Error over QUIC: {0}")]
+    Quic(#[from] QuicError),
     #[error("The server responded with status {0}")]
     Status(u16),
     #[error("The server refused the request ({status}): {message}")]
@@ -926,12 +1109,12 @@ pub enum RestError {
     /// A refusal over TLS, with a problem detail of a type that has no error of its own.
     #[error("The server refused the request ({status}): {problem}")]
     Problem { status: u16, problem: Box<Problem> },
-    #[error("Invalid request method")]
-    Method,
     #[error("Error serializing request: {0}")]
     RequestSerialize(anyhow::Error),
     #[error("Error deserializing response: {0}")]
     ResponseDeserialize(anyhow::Error),
+    #[error("Error reading response: {0}")]
+    ResponseRead(io::Error),
 }
 
 impl RestError {
@@ -980,7 +1163,11 @@ impl RestError {
     /// unreachable. A failed TLS handshake, such as one in which the server presents another key
     /// than the pinned one, is not: something answered at the server's address.
     pub fn is_transport_error(&self) -> bool {
-        matches!(self, RestError::RequestSend(_) | RestError::Timeout)
+        match self {
+            RestError::RequestSend(_) => true,
+            RestError::Quic(error) => error.is_unanswered(),
+            _ => false,
+        }
     }
 }
 
@@ -989,18 +1176,33 @@ mod tests {
     use super::*;
     use innernet_shared::{RedeemContents, Tag};
     use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::{SocketAddr, TcpListener},
+        io::{Read, Write},
+        net::TcpListener,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc, Arc,
+            mpsc, Arc, Mutex,
         },
         thread,
     };
     use wireguard_control::KeyPair;
 
+    /// The config of a client of the server with the key `server`, whose legacy API is at
+    /// `internal_endpoint`, without a QUIC port, as an invitation of v2.0.0 has none.
     fn config(internal_endpoint: SocketAddr, server: &KeyPair) -> InterfaceConfig {
+        config_with_port(internal_endpoint, None, server)
+    }
+
+    /// The config of a client of the server with the key `server`, whose legacy API is at
+    /// `internal_endpoint`, and whose TLS API is at `quic_port` of its address, if any.
+    fn config_with_port(
+        internal_endpoint: SocketAddr,
+        quic_port: Option<u16>,
+        server: &KeyPair,
+    ) -> InterfaceConfig {
         let client = KeyPair::generate();
+        let quic_port = quic_port
+            .map(|port| format!("quic-port = {port}"))
+            .unwrap_or_default();
         toml::from_str(&format!(
             r#"
             [interface]
@@ -1013,6 +1215,7 @@ mod tests {
             public-key = "{}"
             external-endpoint = "203.0.113.1:51820"
             internal-endpoint = "{internal_endpoint}"
+            {quic_port}
             "#,
             client.private.to_base64(),
             server.public.to_base64(),
@@ -1020,26 +1223,29 @@ mod tests {
         .unwrap()
     }
 
-    /// Answers each connection in plain HTTP, like a server that predates TLS, and returns the
-    /// number of connections that opened with a TLS handshake.
-    fn plain_http_server(connections: usize) -> (SocketAddr, thread::JoinHandle<usize>) {
-        let (addr, server) = plain_http_server_recording(
-            connections,
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
-        let handle = thread::spawn(move || {
-            let requests = server.join().unwrap();
-            requests.iter().filter(|r| *r == TLS_HANDSHAKE).count()
-        });
-        (addr, handle)
+    /// The config of a client of the server with the key `server`, whose TLS API is at `addr`,
+    /// as an invitation states it. Nothing serves the legacy API at the same port of TCP.
+    fn quic_config(addr: SocketAddr, server: &KeyPair) -> InterfaceConfig {
+        config_with_port(addr, Some(addr.port()), server)
     }
 
-    /// What [`plain_http_server_recording`] records of a connection that opens with a TLS
-    /// handshake.
-    const TLS_HANDSHAKE: &str = "TLS handshake";
+    /// The answer of a server that predates TLS to a request for the capabilities: none, so
+    /// no QUIC port.
+    const NO_CAPABILITIES: &str =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+         Connection: close\r\n\r\n{}";
+
+    /// The answer of a server to a request for the capabilities in plain HTTP, which states that
+    /// its TLS API is at QUIC port `port`.
+    fn capabilities_response(port: u16) -> String {
+        json_response(
+            "200 OK",
+            &format!(r#"{{"unspecified_ip_in_override_endpoint": true, "quic_port": {port}}}"#),
+        )
+    }
 
     /// Answers each connection in plain HTTP with `response`, like a server that predates TLS,
-    /// and returns the request line of each request, or [`TLS_HANDSHAKE`].
+    /// and returns the request line of each request.
     fn plain_http_server_recording(
         connections: usize,
         response: &'static str,
@@ -1048,11 +1254,19 @@ mod tests {
     }
 
     /// Answers each connection in plain HTTP with the next of `responses`, like a server that
-    /// predates TLS, and returns the request line of each request, or [`TLS_HANDSHAKE`].
+    /// predates TLS, and returns the request line of each request.
     fn plain_http_server_answering(
         responses: Vec<String>,
     ) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        plain_http_server_at(TcpListener::bind("127.0.0.1:0").unwrap(), responses)
+    }
+
+    /// Answers each connection to `listener` in plain HTTP with the next of `responses`, and
+    /// returns the request line of each request.
+    fn plain_http_server_at(
+        listener: TcpListener,
+        responses: Vec<String>,
+    ) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let mut requests = vec![];
@@ -1060,14 +1274,8 @@ mod tests {
                 let mut stream = stream.unwrap();
                 let mut buffer = [0u8; 4096];
                 let read = stream.read(&mut buffer).unwrap();
-                requests.push(
-                    if buffer[..read].first() == Some(&tls::TLS_HANDSHAKE_RECORD) {
-                        TLS_HANDSHAKE.to_string()
-                    } else {
-                        let request = String::from_utf8_lossy(&buffer[..read]);
-                        request.lines().next().unwrap_or_default().to_string()
-                    },
-                );
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                requests.push(request.lines().next().unwrap_or_default().to_string());
                 stream.write_all(response.as_bytes()).unwrap();
             }
             requests
@@ -1075,7 +1283,7 @@ mod tests {
         (addr, handle)
     }
 
-    /// Answers each connection over TLS, authenticated with `server`'s key, with an empty
+    /// Answers each connection over QUIC, authenticated with `server`'s key, with an empty
     /// response.
     fn tls_server(server: &KeyPair, connections: usize) -> SocketAddr {
         tls_server_answering(
@@ -1086,7 +1294,11 @@ mod tests {
     }
 
     /// Answers each connection over TLS, authenticated with `server`'s key, with `response`.
-    fn tls_server_answering(server: &KeyPair, connections: usize, response: Vec<u8>) -> SocketAddr {
+    fn tls_server_answering(
+        server: &KeyPair,
+        connections: usize,
+        response: Vec<u8>,
+    ) -> std::net::SocketAddr {
         tls_server_recording(server, vec![response; connections]).0
     }
 
@@ -1134,45 +1346,103 @@ mod tests {
         }
     }
 
-    /// Answers each connection over TLS, authenticated with `server`'s key, with the next of
-    /// `responses`, and sends each request, its head and its body, to the receiver.
+    /// Answers each connection over QUIC, in HTTP/3, authenticated with `server`'s key, with the
+    /// next of `responses`, and sends each request, its head and its body, to the receiver. The
+    /// head is that of HTTP/1.1, with the version `HTTP/3`; a response is written as one of
+    /// HTTP/1.1, and sent without its connection-specific fields.
     fn tls_server_recording(
         server: &KeyPair,
         responses: Vec<Vec<u8>>,
     ) -> (SocketAddr, mpsc::Receiver<Recorded>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
         let config = tls::server_config(&server.private.to_base64()).unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            for (response, stream) in responses.into_iter().zip(listener.incoming()) {
-                let connection = rustls::ServerConnection::new(config.clone()).unwrap();
-                let mut stream = rustls::StreamOwned::new(connection, stream.unwrap());
-                let mut reader = BufReader::new(&mut stream);
-                let mut head = String::new();
-                // A client that refuses the handshake ends the connection.
-                while matches!(reader.read_line(&mut head), Ok(read) if read > 0)
-                    && !head.ends_with("\r\n\r\n")
-                {}
-                let content_length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse().ok())?
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; content_length];
-                if reader.read_exact(&mut body).is_err() {
-                    body.clear();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(config).unwrap();
+                let endpoint = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(quinn::ServerConfig::with_crypto(Arc::new(crypto))),
+                    socket,
+                    Arc::new(quinn::TokioRuntime),
+                )
+                .unwrap();
+                for response in responses {
+                    let Some(incoming) = endpoint.accept().await else {
+                        break;
+                    };
+                    // A client that refuses the handshake ends the connection.
+                    let Ok(connection) = incoming.await else {
+                        continue;
+                    };
+                    let mut connection = h3::server::Connection::<_, Bytes>::new(
+                        h3_quinn::Connection::new(connection),
+                    )
+                    .await
+                    .unwrap();
+                    let Ok(Some(resolver)) = connection.accept().await else {
+                        continue;
+                    };
+                    let (request, mut stream) = resolver.resolve_request().await.unwrap();
+                    let mut head = format!(
+                        "{} {} HTTP/3\r\n",
+                        request.method(),
+                        request.uri().path_and_query().unwrap()
+                    );
+                    for (name, value) in request.headers() {
+                        head += &format!("{name}: {}\r\n", value.to_str().unwrap());
+                    }
+                    head += "\r\n";
+                    let mut body = vec![];
+                    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                    }
+                    let _ = sender.send(Recorded { head, body });
+
+                    let (head, body) = split_response(&response);
+                    stream.send_response(head).await.unwrap();
+                    if !body.is_empty() {
+                        stream.send_data(Bytes::from(body)).await.unwrap();
+                    }
+                    stream.finish().await.unwrap();
+                    // The client closes the connection once it has read the response.
+                    let _ = connection.accept().await;
                 }
-                let _ = sender.send(Recorded { head, body });
-                let _ = stream.write_all(&response);
-                stream.conn.send_close_notify();
-                let _ = stream.flush();
-            }
+            });
         });
         (addr, receiver)
+    }
+
+    /// The head and the body of `response`, a response of HTTP/1.1, without the fields that
+    /// HTTP/3 doesn't carry.
+    fn split_response(response: &[u8]) -> (http::Response<()>, Vec<u8>) {
+        let end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = String::from_utf8(response[..end].to_vec()).unwrap();
+        let mut lines = head.lines();
+        let status: u16 = lines
+            .next()
+            .unwrap()
+            .split(' ')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut builder = http::Response::builder().status(status);
+        for line in lines {
+            let (name, value) = line.split_once(':').unwrap();
+            if !["connection", "content-length"].contains(&name.to_lowercase().as_str()) {
+                builder = builder.header(name, value.trim());
+            }
+        }
+        (builder.body(()).unwrap(), response[end + 4..].to_vec())
     }
 
     /// A response with the status `status` and the JSON body `body`.
@@ -1245,7 +1515,7 @@ mod tests {
                 "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into(),
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         let error = client.get_tagged_peer(&peer).await.unwrap_err();
         assert!(matches!(error, RestError::NoSuchPeer), "{error:?}");
@@ -1288,7 +1558,7 @@ mod tests {
     async fn read_problem_of(response: &[u8]) -> Problem {
         let server_key = KeyPair::generate();
         let addr = tls_server_answering(&server_key, 1, response.to_vec());
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         match client.http::<()>("GET", "/user/state").await.unwrap_err() {
             RestError::Problem { problem, .. } => *problem,
@@ -1296,13 +1566,6 @@ mod tests {
         }
     }
 
-    const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
-
-    /// [`NO_CONTENT`], for a server that closes each connection after its answer.
-    const NO_CONTENT_CLOSE: &str =
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-    /// A peer whose key, in standard base64, holds both '+' and '/'.
     fn listed_peer() -> PeerContents {
         let mut bytes = [0u8; 32];
         for chunk in bytes.chunks_mut(3) {
@@ -1322,17 +1585,11 @@ mod tests {
         }
     }
 
-    /// The answer of a server in plain HTTP to a listing of `peers`, each with the ID 7.
-    fn legacy_list_response(peers: &[PeerContents]) -> String {
-        let peers: Vec<_> = peers
-            .iter()
-            .map(|contents| LegacyPeer {
-                id: 7,
-                contents: LegacyPeerContents::from_peer(contents, 1).unwrap(),
-            })
-            .collect();
-        json_response("200 OK", &serde_json::to_string(&peers).unwrap())
-    }
+    const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+
+    /// [`NO_CONTENT`], for a server that closes each connection after its answer.
+    const NO_CONTENT_CLOSE: &str =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     /// The tag whose bytes are those of `text`, as a test server makes up tags.
     fn test_tag(text: &str) -> Tag {
@@ -1348,6 +1605,18 @@ mod tests {
         cbor_response("200 OK", &tagged)
     }
 
+    /// The answer of a server in plain HTTP to a listing of `peers`, each with the ID 7.
+    fn legacy_list_response(peers: &[PeerContents]) -> String {
+        let peers: Vec<_> = peers
+            .iter()
+            .map(|contents| LegacyPeer {
+                id: 7,
+                contents: LegacyPeerContents::from_peer(contents, 1).unwrap(),
+            })
+            .collect();
+        json_response("200 OK", &serde_json::to_string(&peers).unwrap())
+    }
+
     #[tokio::test]
     async fn test_updates_peers_by_key_over_tls() {
         let server_key = KeyPair::generate();
@@ -1359,26 +1628,19 @@ mod tests {
         };
         let (addr, requests) = tls_server_recording(
             &server_key,
-            vec![
-                cbor_response("200 OK", &serde_json::json!({})),
-                tagged_response(&observed, "ab"),
-                NO_CONTENT.into(),
-            ],
+            vec![tagged_response(&observed, "ab"), NO_CONTENT.into()],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
 
-        // Unless a request has settled it, the client asks the server which API it offers.
+        // A client that knows the QUIC port of the TLS API offers the admin API by key, without
+        // asking.
         assert_eq!(client.admin_api().await.unwrap(), AdminApi::ByKey);
         let renamed = PeerContents {
             name: Some("renamed".parse().unwrap()),
             ..peer.clone()
         };
         client.update_peer(&peer, &renamed).await.unwrap();
-        assert!(requests
-            .recv()
-            .unwrap()
-            .starts_with("GET /user/capabilities "));
 
         // The client reads the peer by key, and changes it with the tag it read.
         let segment = peer.api_path_segment();
@@ -1423,7 +1685,7 @@ mod tests {
                 not_found,
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         for _ in 0..2 {
             let error = client.update_peer(&peer, &peer).await.unwrap_err();
@@ -1450,21 +1712,20 @@ mod tests {
         };
         let server_key = KeyPair::generate();
         let (addr, server) = plain_http_server_answering(vec![
-            NO_CONTENT_CLOSE.into(),
-            NO_CONTENT_CLOSE.into(),
+            NO_CAPABILITIES.into(),
             legacy_list_response(&[observed]),
             NO_CONTENT_CLOSE.into(),
         ]);
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
 
-        // The client lists the peers again for the ID of the peer, and changes it by its ID.
+        // The client asks the server for the QUIC port, and the server states none. The client
+        // lists the peers again for the ID of the peer, and changes it by its ID.
         assert_eq!(client.admin_api().await.unwrap(), AdminApi::Legacy);
         client.update_peer(&peer, &peer).await.unwrap();
         assert_eq!(
             server.join().unwrap(),
             [
-                TLS_HANDSHAKE,
                 "GET /v1/user/capabilities HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
                 "PUT /v1/admin/peers/7 HTTP/1.1",
@@ -1483,8 +1744,7 @@ mod tests {
         };
         let server_key = KeyPair::generate();
         let (addr, server) = plain_http_server_answering(vec![
-            NO_CONTENT_CLOSE.into(),
-            NO_CONTENT_CLOSE.into(),
+            NO_CAPABILITIES.into(),
             legacy_list_response(&[promoted]),
             legacy_list_response(&[]),
         ]);
@@ -1497,7 +1757,6 @@ mod tests {
         assert_eq!(
             server.join().unwrap(),
             [
-                TLS_HANDSHAKE,
                 "GET /v1/user/capabilities HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
@@ -1520,7 +1779,7 @@ mod tests {
         );
         let server_key = KeyPair::generate();
         let (addr, server) = plain_http_server_answering(vec![
-            NO_CONTENT_CLOSE.into(),
+            NO_CAPABILITIES.into(),
             json_response("200 OK", &state),
             legacy_list_response(std::slice::from_ref(&peer)),
         ]);
@@ -1553,7 +1812,7 @@ mod tests {
         assert_eq!(
             server.join().unwrap(),
             [
-                TLS_HANDSHAKE,
+                "GET /v1/user/capabilities HTTP/1.1",
                 "GET /v1/user/state HTTP/1.1",
                 "GET /v1/admin/peers HTTP/1.1",
             ]
@@ -1574,7 +1833,7 @@ mod tests {
             &server_key,
             vec![cbor_response("200 OK", &state), NO_CONTENT.into()],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         let received = client.get_state().await.unwrap();
         assert_eq!((received.peers, received.cidrs), (state.peers, state.cidrs));
@@ -1613,7 +1872,7 @@ mod tests {
                 cbor_response_as("200 OK", "application/vnd.innernet+cbor", &state),
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
 
         // Every request accepts the newest version, and every body states it. A change without a
@@ -1675,7 +1934,7 @@ mod tests {
                 tagged(&wider),
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
 
         // The client reads the delegations with their tag, and replaces them with the tag.
@@ -1714,7 +1973,7 @@ mod tests {
                 problem_response(&problem::NO_SUCH_ASSOCIATION),
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         let association = Association {
             cidr_1: users.cidr,
@@ -1780,7 +2039,7 @@ mod tests {
             &server_key,
             vec![tagged_cidr_response(&users, "ab"), NO_CONTENT.into()],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
 
         // The client reads the CIDR by prefix, and deletes it with the tag it read.
@@ -1828,7 +2087,7 @@ mod tests {
                 bad_request,
             ],
         );
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         let error = client.rename_cidr(&users, "people").await.unwrap_err();
         assert!(matches!(error, RestError::CidrChanged), "{error:?}");
@@ -1869,8 +2128,7 @@ mod tests {
         let associations = r#"[{"id": 5, "cidr_id_1": 3, "cidr_id_2": 1}]"#;
         let server_key = KeyPair::generate();
         let (addr, server) = plain_http_server_answering(vec![
-            NO_CONTENT_CLOSE.into(),
-            NO_CONTENT_CLOSE.into(),
+            NO_CAPABILITIES.into(),
             json_response("200 OK", cidrs),
             json_response("201 Created", created),
             json_response("200 OK", cidrs),
@@ -1909,7 +2167,6 @@ mod tests {
         assert_eq!(
             server.join().unwrap(),
             [
-                TLS_HANDSHAKE,
                 "GET /v1/user/capabilities HTTP/1.1",
                 "GET /v1/admin/cidrs HTTP/1.1",
                 "POST /v1/admin/cidrs HTTP/1.1",
@@ -1930,7 +2187,7 @@ mod tests {
     async fn test_no_delegations_in_plain_http() {
         // A server that predates TLS has no delegations, so nothing is sent to it.
         let server_key = KeyPair::generate();
-        let (addr, server) = plain_http_server_recording(2, NO_CONTENT_CLOSE);
+        let (addr, server) = plain_http_server_recording(1, NO_CAPABILITIES);
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
         let error = client
@@ -1943,38 +2200,58 @@ mod tests {
         );
         assert_eq!(
             server.join().unwrap(),
-            [TLS_HANDSHAKE, "GET /v1/user/capabilities HTTP/1.1"]
+            ["GET /v1/user/capabilities HTTP/1.1"]
         );
     }
 
+    const BAD_REQUEST: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
     #[tokio::test]
     async fn test_falls_back_for_servers_that_predate_tls() {
-        let server_key = KeyPair::generate();
-        let (addr, server) = plain_http_server(3);
-        let config = config(addr, &server_key);
-        let client = RestClient::new(&config, false).unwrap();
+        // A server that predates TLS states no QUIC port, or predates the capabilities too.
+        for capabilities in [
+            NO_CAPABILITIES,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ] {
+            let server_key = KeyPair::generate();
+            let (addr, server) = plain_http_server_answering(vec![
+                capabilities.into(),
+                BAD_REQUEST.into(),
+                BAD_REQUEST.into(),
+            ]);
+            let config = config(addr, &server_key);
+            let client = RestClient::new(&config, false).unwrap();
 
-        // The first request tries TLS and is sent again in plain HTTP, and later requests are
-        // only sent in plain HTTP.
-        for _ in 0..2 {
-            let error = client
-                .http::<String>("GET", "/user/state")
-                .await
-                .unwrap_err();
-            assert!(error.has_status_of(400), "{error:?}");
+            // The client asks for the port once, and makes its requests in plain HTTP.
+            for _ in 0..2 {
+                let error = client
+                    .http::<String>("GET", "/user/state")
+                    .await
+                    .unwrap_err();
+                assert!(error.has_status_of(400), "{error:?}");
+            }
+            assert!(!client.speaks_tls());
+            assert_eq!(
+                server.join().unwrap(),
+                [
+                    "GET /v1/user/capabilities HTTP/1.1",
+                    "GET /v1/user/state HTTP/1.1",
+                    "GET /v1/user/state HTTP/1.1",
+                ]
+            );
         }
-        assert!(!client.speaks_tls());
-        assert_eq!(server.join().unwrap(), 1);
     }
 
     #[tokio::test]
     async fn test_refuses_plain_http_from_servers_known_to_speak_tls() {
         let server_key = KeyPair::generate();
-        let (addr, server) = plain_http_server(2);
+        let (addr, server) = plain_http_server_recording(2, NO_CAPABILITIES);
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
 
-        // Every request is refused, and none is sent in plain HTTP.
+        // Every request is refused, and none is sent in plain HTTP: the client only asks for the
+        // QUIC port.
         for _ in 0..2 {
             let error = client
                 .http::<String>("GET", "/user/state")
@@ -1983,19 +2260,114 @@ mod tests {
             assert!(matches!(error, RestError::ServerDowngraded), "{error:?}");
             assert!(!error.is_transport_error());
         }
-        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "GET /v1/user/capabilities HTTP/1.1",
+                "GET /v1/user/capabilities HTTP/1.1"
+            ]
+        );
+    }
+
+    /// A UDP port of the loopback address at which nothing listens, at least for a while.
+    fn unused_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A client of `config`, which records the QUIC ports that it learns in `ports`, and waits
+    /// for the server for a short while only.
+    fn recording_client<'a>(
+        config: &'a InterfaceConfig,
+        speaks_tls: bool,
+        ports: &Arc<Mutex<Vec<u16>>>,
+    ) -> RestClient<'a> {
+        let ports = ports.clone();
+        RestClient {
+            record_port: Some(Box::new(move |port| {
+                ports.lock().unwrap().push(port);
+                Ok(())
+            })),
+            timeout: Duration::from_millis(500),
+            ..RestClient::new(config, speaks_tls).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_learns_the_quic_port_from_the_server() {
+        // A client upgraded from v2.0.0 has no QUIC port, and asks the server for it in plain
+        // HTTP, as the server answers even a client that it requires to connect over TLS.
+        let server_key = KeyPair::generate();
+        let (quic, requests) = tls_server_recording(&server_key, vec![NO_CONTENT.into(); 2]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (addr, server) =
+            plain_http_server_at(listener, vec![capabilities_response(quic.port())]);
+        let config = config(addr, &server_key);
+        let ports = Arc::new(Mutex::new(vec![]));
+        let client = recording_client(&config, true, &ports);
+        for _ in 0..2 {
+            client.http::<()>("GET", "/user/state").await.unwrap();
+        }
+        assert_eq!(client.quic_port(), Some(quic.port()));
+        assert_eq!(*ports.lock().unwrap(), [quic.port()]);
+        assert_eq!(
+            server.join().unwrap(),
+            ["GET /v1/user/capabilities HTTP/1.1"]
+        );
+        for request in requests.iter() {
+            assert!(request.starts_with("GET /user/state "), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_asks_for_the_quic_port_again_when_quic_fails() {
+        // Nothing answers at the port that the client knows, since the operator moved it.
+        let server_key = KeyPair::generate();
+        let (quic, _requests) = tls_server_recording(&server_key, vec![NO_CONTENT.into()]);
+        let (addr, server) = plain_http_server_answering(vec![capabilities_response(quic.port())]);
+        let config = config_with_port(addr, Some(unused_udp_port()), &server_key);
+        let ports = Arc::new(Mutex::new(vec![]));
+        let client = recording_client(&config, true, &ports);
+        client.http::<()>("GET", "/user/state").await.unwrap();
+        assert_eq!(*ports.lock().unwrap(), [quic.port()]);
+        assert_eq!(
+            server.join().unwrap(),
+            ["GET /v1/user/capabilities HTTP/1.1"]
+        );
+
+        // A server downgraded to one that predates TLS states no port, and is refused.
+        let (addr, server) = plain_http_server_recording(1, NO_CAPABILITIES);
+        let config = config_with_port(addr, Some(unused_udp_port()), &server_key);
+        let client = recording_client(&config, true, &ports);
+        let error = client.http::<()>("GET", "/user/state").await.unwrap_err();
+        assert!(matches!(error, RestError::ServerDowngraded), "{error:?}");
+        assert_eq!(
+            server.join().unwrap(),
+            ["GET /v1/user/capabilities HTTP/1.1"]
+        );
+
+        // When the server states the same port, the client gives up, as when the server is down.
+        let (addr, server) = plain_http_server_answering(vec![]);
+        drop(server);
+        let config = config_with_port(addr, Some(unused_udp_port()), &server_key);
+        let client = recording_client(&config, true, &ports);
+        let error = client.http::<()>("GET", "/user/state").await.unwrap_err();
+        assert!(error.is_transport_error(), "{error:?}");
     }
 
     #[tokio::test]
     async fn test_latches_when_answered_over_tls() {
         let server_key = KeyPair::generate();
         let addr = tls_server(&server_key, 2);
-        let config = config(addr, &server_key);
+        let config = quic_config(addr, &server_key);
         let latched = Arc::new(AtomicUsize::new(0));
         let client = RestClient {
             latch: Some(Box::new({
                 let latched = latched.clone();
-                move || {
+                move |()| {
                     latched.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
@@ -2016,7 +2388,7 @@ mod tests {
         // A server that authenticates with another key than the pinned one isn't merely
         // unreachable.
         let addr = tls_server(&KeyPair::generate(), 1);
-        let config = config(addr, &KeyPair::generate());
+        let config = quic_config(addr, &KeyPair::generate());
         let client = RestClient::new(&config, false).unwrap();
         let error = client.http::<()>("GET", "/user/state").await.unwrap_err();
         assert!(!error.is_transport_error(), "{error:?}");
@@ -2034,13 +2406,13 @@ mod tests {
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let addr = tls_server_answering(&server_key, 1, response.into_bytes());
-        let config = config(addr, &server_key);
+        let addr = tls_server_answering(&server_key, 1, response.into());
+        let config = quic_config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
         match client.http::<()>("GET", "/user/state").await.unwrap_err() {
             RestError::Refused { status, message } => {
                 assert_eq!(status, 401);
-                let shown = "x".repeat(MAX_EXPLANATION_LEN - text.len());
+                let shown = "x".repeat(MAX_EXPLANATION_LEN as usize - text.len());
                 assert_eq!(
                     message,
                     format!(r"\u{{1b}}[31mrefused\nby the server\u{{7}}{shown}")
@@ -2052,17 +2424,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_errors() {
-        // Nothing is listening.
+        // Nothing is listening, neither in plain HTTP nor over QUIC.
         let addr = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let config = config(addr, &KeyPair::generate());
-        let client = RestClient::new(&config, false).unwrap();
-        let error = client
-            .http::<String>("GET", "/user/state")
-            .await
-            .unwrap_err();
-        assert!(error.is_transport_error());
+        for quic_port in [None, Some(unused_udp_port())] {
+            let config = config_with_port(addr, quic_port, &KeyPair::generate());
+            let client = RestClient {
+                timeout: Duration::from_millis(500),
+                ..RestClient::new(&config, false).unwrap()
+            };
+            let error = client
+                .http::<String>("GET", "/user/state")
+                .await
+                .unwrap_err();
+            assert!(error.is_transport_error(), "{error:?}");
+        }
     }
 }

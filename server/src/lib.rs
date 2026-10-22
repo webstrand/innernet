@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use colored::*;
 use coordinator::{Coordinator, CoordinatorConfig, Hooks, Sockets};
 use db::DatabasePeer;
@@ -24,7 +24,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::prelude::*,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -38,6 +38,7 @@ mod db;
 mod error;
 pub mod initialize;
 mod node;
+mod quic;
 #[cfg(test)]
 mod test;
 mod util;
@@ -45,8 +46,9 @@ mod util;
 pub use error::ServerError;
 
 #[cfg(test)]
-pub(crate) use coordinator::{hyper_service, Context, Db};
-pub(crate) use coordinator::{Endpoints, Session};
+pub(crate) use coordinator::Db;
+pub(crate) use coordinator::{hyper_service, Endpoints};
+pub use coordinator::{Context, Session};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -71,10 +73,24 @@ pub struct ConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_port: Option<u16>,
 
+    /// Whether the server serves the legacy API, in plain HTTP over TCP on the listen port, to
+    /// clients that predate TLS, which it identifies by their source address, and to clients
+    /// upgraded from v2.0.0, which ask it for the QUIC port. On unless the config turns it off.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub legacy_api: bool,
+
     /// The DNS server that the server runs, as every node runs it, at the address of the
     /// table, or `None` if the server runs none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsInfo>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
 }
 
 impl ConfigFile {
@@ -187,6 +203,12 @@ pub struct AdminClient {
 impl AdminClient {
     pub fn new(interface: &InterfaceName, conf: &ServerConfig) -> Result<Self, Error> {
         let config = ConfigFile::from_file(conf.config_path(interface))?;
+        let incomplete = || {
+            anyhow!(
+                "the config is incomplete; `innernet-server serve {}` names what it lacks",
+                interface.as_str_lossy()
+            )
+        };
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
         let server = ServerInfo {
             public_key: Key::from_base64(&config.private_key)?
@@ -197,7 +219,7 @@ impl AdminClient {
             external_endpoint: internal_endpoint.into(),
             internal_endpoint,
             features: vec![FEATURE_TLS.to_string()],
-            quic_port: config.quic_port,
+            quic_port: Some(config.quic_port.ok_or_else(incomplete)?),
         };
         let own = InterfaceInfo {
             network_name: interface.to_string(),
@@ -304,6 +326,7 @@ pub async fn serve(
         events: EventSource::default(),
     };
     let endpoints = follow_endpoints(tunnel.events());
+    log::info!("the TLS API's QUIC port is {quic_port}.");
     let db = Arc::new(Mutex::new(store));
     let changed = StoreChanged::default();
     let mut node = Node {
@@ -334,8 +357,15 @@ pub async fn serve(
         Ok(round)
     });
 
-    log::info!("the TLS API's QUIC port is {quic_port}.");
     log::info!("innernet-server {} starting.", VERSION);
+    // The TLS API runs over QUIC, at the primary IP, on a port of its own.
+    let sockets = Sockets {
+        quic: get_udp_socket((config.address, quic_port).into(), &interface)?,
+        legacy: config
+            .legacy_api
+            .then(|| get_listener((config.address, config.listen_port).into(), &interface))
+            .transpose()?,
+    };
     let coordinator = Coordinator::spawn(
         CoordinatorConfig {
             address: config.address,
@@ -343,9 +373,7 @@ pub async fn serve(
         },
         &config.private_key,
         db,
-        Sockets {
-            api: get_listener((config.address, config.listen_port).into(), &interface)?,
-        },
+        sockets,
         Hooks { changed, endpoints },
     )?;
     tokio::select! {
@@ -440,6 +468,21 @@ fn check_internal_address(myself: &DatabasePeer, address: IpAddr) -> Result<(), 
     Ok(())
 }
 
+/// A UDP socket bound to `addr`, and on Linux to `interface` too, as [`get_listener`] binds a
+/// TCP listener, so that only the tunnel's traffic reaches it.
+#[cfg(target_os = "linux")]
+fn get_udp_socket(addr: SocketAddr, interface: &InterfaceName) -> Result<UdpSocket, Error> {
+    let socket = socket2::Socket::from(UdpSocket::bind(addr)?);
+    socket.bind_device(Some(interface.as_str_lossy().as_bytes()))?;
+    Ok(socket.into())
+}
+
+/// A UDP socket bound to `addr`, as [`get_listener`] binds a TCP listener.
+#[cfg(not(target_os = "linux"))]
+fn get_udp_socket(addr: SocketAddr, _interface: &InterfaceName) -> Result<UdpSocket, Error> {
+    Ok(UdpSocket::bind(addr)?)
+}
+
 /// This function differs per OS, because different operating systems have
 /// opposing characteristics when binding to a specific IP address.
 /// On Linux, binding to a specific local IP address does *not* bind it to
@@ -471,16 +514,15 @@ fn get_listener(addr: SocketAddr, _interface: &InterfaceName) -> Result<TcpListe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{coordinator::serve_api, test};
+    use crate::{coordinator::serve_legacy_api, test};
     use anyhow::Result;
     use hyper::{Body, Request, StatusCode};
-    use innernet_shared::{tls, INNERNET_PUBKEY_HEADER};
+    use innernet_shared::{Prefix, INNERNET_PUBKEY_HEADER};
     use std::path::Path;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::TcpStream,
     };
-    use tokio_rustls::rustls;
     use wireguard_control::KeyPair;
 
     #[test]
@@ -787,16 +829,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_serves_tls_and_plain_http_on_one_port() -> Result<(), Error> {
+    async fn test_serves_only_plain_http_over_tcp() -> Result<(), Error> {
         let server = test::Server::new()?;
-        let server_tls_key = KeyPair::generate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(serve_api(
-            listener,
-            server.context(),
-            tls::server_config(&server_tls_key.private.to_base64())?,
-        ));
+        tokio::spawn(serve_legacy_api(listener, server.context()));
+
+        // Plain HTTP is served; nothing is at the loopback's IP.
+        let plain = TcpStream::connect(addr).await?;
+        assert_eq!(
+            status_line(plain, &server_key(&server), "/v1/user/state").await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+
+        // TLS isn't: the start of a TLS handshake is a malformed request.
+        let mut tls = TcpStream::connect(addr).await?;
+        tls.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00])
+            .await?;
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await?;
+        assert!(response.starts_with(b"HTTP/1.1 400 "), "{response:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_serves_the_tls_api_over_quic() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let server_tls_key = KeyPair::generate();
+        let addr = test::serve_quic(&server, &server_tls_key)?;
 
         // A peer whose private key is known, at an IP other than the loopback's.
         let peer_key = KeyPair::generate();
@@ -807,39 +867,35 @@ mod tests {
         };
         let mut contents = test::developer_peer_contents("developer3", ip)?;
         contents.public_key = peer_key.public.to_base64();
-        let peer = DatabasePeer::create(&server.db.lock(), contents)?;
-        server.predate_tls_key(&peer.public_key);
-
+        DatabasePeer::create(&server.db.lock(), contents)?;
+        server.predate_tls_key(&peer_key.public.to_base64());
         let header_key = server_key(&server);
-        let connect_tls = |client: &KeyPair, pinned: &Key| {
-            let config = tls::client_config(&client.private.to_base64(), &pinned.to_base64());
-            let connector = tokio_rustls::TlsConnector::from(config.unwrap());
-            async move {
-                let stream = TcpStream::connect(addr).await.unwrap();
-                let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
-                connector.connect(name, stream).await
-            }
-        };
+        let pinned = &server_tls_key.public;
 
-        // Plain HTTP is still served; nothing is at the loopback's IP.
-        let plain = TcpStream::connect(addr).await?;
-        assert_eq!(
-            status_line(plain, &header_key, "/v1/user/state").await,
-            "HTTP/1.1 401 Unauthorized"
-        );
+        // The peer's key is accepted by the handshake, but not from an IP other than its own,
+        // and that doesn't latch it.
+        let (status, _) =
+            test::quic_get(addr, &peer_key, pinned, &header_key, "/user/state").await?;
+        assert_eq!(status, 401);
+        assert!(!DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?.requires_tls);
 
-        // TLS is served on the same port. The peer's key is accepted by the handshake, but not
-        // from an IP other than its own, and that doesn't latch it.
-        let tls = connect_tls(&peer_key, &server_tls_key.public).await?;
-        assert_eq!(
-            status_line(tls, &header_key, "/user/state").await,
-            "HTTP/1.1 401 Unauthorized"
-        );
-        assert!(!peer.reload(&server.db.lock())?.requires_tls);
+        // From an address of its delegations, it is served, and latched.
+        let delegations = [Prefix::host(ip.parse()?), Prefix::host(addr.ip())];
+        innernet_node::store::write_delegations(
+            &server.db.lock(),
+            &peer_key.public.0,
+            &delegations,
+        )?;
+        let (status, body) =
+            test::quic_get(addr, &peer_key, pinned, &header_key, "/user/state").await?;
+        assert_eq!(status, 200);
+        let _: innernet_shared::State = innernet_shared::cbor::from_slice(&body)?;
+        assert!(DatabasePeer::get_by_address(&server.db.lock(), ip.parse()?)?.requires_tls);
 
         // A client pinning another server key refuses the handshake.
         let wrong = KeyPair::generate().public;
-        assert!(connect_tls(&peer_key, &wrong).await.is_err());
+        let refused = test::quic_get(addr, &peer_key, &wrong, &header_key, "/user/state").await;
+        assert!(refused.is_err());
         Ok(())
     }
 

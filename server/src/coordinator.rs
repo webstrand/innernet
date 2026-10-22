@@ -1,25 +1,23 @@
 //! The coordinator of a network, as a service of the node that it runs beside: it serves the API,
-//! in TLS and, for clients that predate TLS, in plain HTTP, and keeps what it assigns the peers in
-//! its annex to the node's database. It runs on what it is handed: its key, the database that it
-//! shares with its node, a listener that the host has bound, and the hooks through which it tells
-//! the node of a change and learns where the node's tunnel observes the peers.
+//! in TLS over QUIC and, for clients that predate TLS, in plain HTTP, and keeps what it assigns the
+//! peers in its annex to the node's database. It runs on what it is handed: its key, the database
+//! that it shares with its node, its config, sockets that the host has bound, and the hooks through
+//! which it tells the node of a change and learns where the node's tunnel observes the peers.
 
-use crate::{api, db::DatabasePeer, util, ServerError};
-use anyhow::{anyhow, Error};
+use crate::{api, db::DatabasePeer, quic, util, ServerError};
+use anyhow::Error;
 use hyper::{http, service::service_fn, Body, Request, Response};
 use innernet_node::{runtime::StoreChanged, Store};
 use innernet_shared::{media_type::Representation, tls, INNERNET_PUBKEY_HEADER};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, VecDeque},
-    convert::TryInto,
-    net::{IpAddr, SocketAddr, TcpListener},
+    net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpStream, sync::Notify, task::JoinHandle, time::timeout};
-use tokio_rustls::{rustls, TlsAcceptor};
+use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
 use wireguard_control::Key;
 
 /// What the coordinator serves, as its host configures it.
@@ -33,8 +31,10 @@ pub struct CoordinatorConfig {
 
 /// The sockets at which the coordinator serves its API, which the host binds.
 pub struct Sockets {
-    /// The TCP listener of the API, in TLS and in plain HTTP.
-    pub api: TcpListener,
+    /// The UDP socket of the TLS API, over QUIC.
+    pub quic: UdpSocket,
+    /// The TCP listener of the legacy API, in plain HTTP, if the coordinator serves it.
+    pub legacy: Option<TcpListener>,
 }
 
 /// What the coordinator shares with its node.
@@ -72,9 +72,26 @@ impl Coordinator {
         };
         spawn_invitation_sweeper(db, hooks.changed, context.invitations.clone());
         let tls_config = tls::server_config(private_key)?;
-        sockets.api.set_nonblocking(true)?;
-        let listener = tokio::net::TcpListener::from_std(sockets.api)?;
-        let task = tokio::spawn(serve_api(listener, context, tls_config));
+        let tls_api = quic::serve(quic::endpoint(sockets.quic, tls_config)?, context.clone());
+        let legacy = sockets
+            .legacy
+            .map(|listener| {
+                listener.set_nonblocking(true)?;
+                Ok::<_, Error>(tokio::net::TcpListener::from_std(listener)?)
+            })
+            .transpose()?;
+        let task = tokio::spawn(async move {
+            match legacy {
+                Some(listener) => {
+                    tokio::try_join!(tls_api, serve_legacy_api(listener, context))?;
+                    Ok(())
+                },
+                None => {
+                    log::info!("the legacy API is off, so the server serves no plain HTTP.");
+                    tls_api.await
+                },
+            }
+        });
         Ok(Self { task })
     }
 
@@ -173,16 +190,15 @@ impl Session {
     }
 }
 
-/// How long a client may take to send its first byte, and then to complete a TLS handshake.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client of the legacy API may take to send the head of a request.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Serves the API in TLS and, for clients that predate it, in plain HTTP on the same port.
-pub(crate) async fn serve_api(
+/// Serves the legacy API, in plain HTTP, to clients that predate TLS, and to clients upgraded from
+/// v2.0.0, which ask it for the QUIC port of the TLS API.
+pub(crate) async fn serve_legacy_api(
     listener: tokio::net::TcpListener,
     context: Context,
-    tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<(), Error> {
-    let acceptor = TlsAcceptor::from(tls_config);
     loop {
         let (stream, remote_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -193,46 +209,29 @@ pub(crate) async fn serve_api(
                 continue;
             },
         };
-        let (context, acceptor) = (context.clone(), acceptor.clone());
+        let context = context.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(stream, remote_addr, context, acceptor).await {
+            if let Err(e) = serve_legacy_connection(stream, remote_addr, context).await {
                 log::debug!("{remote_addr} - connection failed: {e}");
             }
         });
     }
 }
 
-/// Serves one connection, in TLS if it starts with a TLS handshake record, which no HTTP request
-/// does, and in plain HTTP otherwise.
-async fn serve_connection(
+/// Serves one connection of the legacy API, in plain HTTP.
+async fn serve_legacy_connection(
     stream: TcpStream,
     remote_addr: SocketAddr,
     context: Context,
-    acceptor: TlsAcceptor,
 ) -> Result<(), Error> {
-    let mut first_byte = [0u8; 1];
-    if timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first_byte)).await?? == 0 {
-        return Ok(());
-    }
     let mut http = hyper::server::conn::Http::new();
     http.http1_only(true);
-
-    if first_byte[0] == tls::TLS_HANDSHAKE_RECORD {
-        let stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await??;
-        let client_key = tls::peer_public_key(stream.get_ref().1.peer_certificates())
-            .ok_or_else(|| anyhow!("the client presented no usable key"))?;
-        let service = service_fn(move |req: Request<Body>| {
-            log::debug!("{} (TLS) - {} {}", remote_addr, req.method(), req.uri());
-            hyper_service(req, context.clone(), remote_addr, Some(client_key.clone()))
-        });
-        http.serve_connection(stream, service).await?;
-    } else {
-        let service = service_fn(move |req: Request<Body>| {
-            log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
-            hyper_service(req, context.clone(), remote_addr, None)
-        });
-        http.serve_connection(stream, service).await?;
-    }
+    http.http1_header_read_timeout(HEADER_TIMEOUT);
+    let service = service_fn(move |req: Request<Body>| {
+        log::debug!("{} - {} {}", remote_addr, req.method(), req.uri());
+        hyper_service(req, context.clone(), remote_addr, None)
+    });
+    http.serve_connection(stream, service).await?;
     Ok(())
 }
 

@@ -33,6 +33,10 @@ clap = { version = "4.3", features = ["derive", "wrap_help"] }
 clap_complete = "4.3"
 colored.workspace = true
 dialoguer.workspace = true
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# hyper 0.14 speaks the `http` of version 0.2, and h3 that of version 1.
+http1 = { package = "http", version = "1" }
 hyper = { version = "0.14", default-features = false, features = [
   "http1",
   "server",
@@ -49,6 +53,11 @@ libc = "0.2"
 log = "0.4"
 parking_lot = "0.12"
 pretty_env_logger = "0.4"
+quinn = { version = "0.11.12", default-features = false, features = [
+  "log",
+  "runtime-tokio",
+  "rustls-ring",
+] }
 rusqlite.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,7 +65,6 @@ sha2 = "0.10"
 subtle = "2"
 thiserror = "1"
 tokio = { version = "1.28.0", features = ["macros", "net", "rt-multi-thread", "time"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 toml = "0.8.10"
 url = "2"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }

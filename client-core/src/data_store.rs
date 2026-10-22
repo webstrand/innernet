@@ -163,6 +163,53 @@ impl DataStore {
         Self::_open(data_dir, interface, config, true)
     }
 
+    /// Create the data store residing at "`data_dir`/`interface`.db", whose peers must lie within
+    /// the network of `config`, failing if `interface` has a data store already, of this version
+    /// or an earlier one. A data store that fails to open once created is removed.
+    pub fn create_new(
+        data_dir: &Path,
+        interface: &InterfaceName,
+        config: &InterfaceConfig,
+    ) -> Result<Self, Error> {
+        let network = Network::from_config(config)?;
+        ensure_dirs_exist(&[data_dir])?;
+        let [path, _, legacy_path] = Self::get_paths(data_dir, interface);
+        if legacy_path.try_exists().with_path(&legacy_path)? {
+            bail!("the data store {} exists already", legacy_path.display());
+        }
+        // The file is created with its mode in the same call that fails if it exists.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_path(&path)?;
+        Self::open_with_paths(&path, &legacy_path, network, false).inspect_err(|_| {
+            if let Err(e) = Self::remove_files(data_dir, interface) {
+                log::warn!("failed to remove the data store {}: {e:#}", path.display());
+            }
+        })
+    }
+
+    /// Removes the data store of `interface`, which [`DataStore::create_new`] created, with its
+    /// journal.
+    pub fn discard(self, data_dir: &Path, interface: &InterfaceName) -> Result<(), Error> {
+        drop(self);
+        Self::remove_files(data_dir, interface)
+    }
+
+    /// Removes the database of `interface` and its journal, whichever exist.
+    fn remove_files(data_dir: &Path, interface: &InterfaceName) -> Result<(), Error> {
+        let [path, journal, _] = Self::get_paths(data_dir, interface);
+        for path in [path, journal] {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e).with_path(&path)?,
+                _ => {},
+            }
+        }
+        Ok(())
+    }
+
     /// The node's store of the data store.
     pub fn store(&self) -> &Store {
         &self.store
@@ -300,6 +347,19 @@ impl DataStore {
             "no peer with the public key {public_key} is recorded"
         );
         Ok(())
+    }
+
+    /// Whether the data store records the peer with `public_key`.
+    pub fn records_peer(&self, public_key: &str) -> Result<bool, Error> {
+        let recorded = self
+            .store
+            .query_row(
+                "SELECT 1 FROM peers WHERE public_key = ?1",
+                [store::key_to_bytes(public_key)?],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(recorded.is_some())
     }
 
     /// The UDP port of the TLS API of the peer with `public_key`, the coordinator, which runs over
@@ -693,6 +753,32 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode & 0o077, 0);
+    }
+
+    #[test]
+    fn test_create_new() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "wg0".parse().unwrap();
+        let config = introducing_config(&wireguard_control::KeyPair::generate());
+
+        // A data store is created with its mode only where none exists, and a discarded one is
+        // removed.
+        let store = DataStore::create_new(dir.path(), &interface, &config).unwrap();
+        let mode = std::fs::metadata(db_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+        assert!(DataStore::create_new(dir.path(), &interface, &config).is_err());
+        store.discard(dir.path(), &interface).unwrap();
+        assert!(!DataStore::exists(dir.path(), &interface).unwrap());
+
+        // A data store of an earlier version counts as one.
+        write_legacy(dir.path(), &BASE_PEERS, &BASE_CIDRS);
+        assert!(DataStore::create_new(dir.path(), &interface, &config).is_err());
+        assert!(!db_path(dir.path()).exists());
     }
 
     #[test]

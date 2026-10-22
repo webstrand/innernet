@@ -17,7 +17,8 @@ use innernet_node::{
 };
 use innernet_shared::{
     interface_config::{ResolvedInvitation, FEATURE_TLS},
-    wg, Endpoint, PeerChange, PeerContents, Prefix, RedeemContents, REDEEM_TRANSITION_WAIT,
+    wg, Endpoint, IoErrorContext, PeerChange, PeerContents, Prefix, RedeemContents,
+    REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
 use thiserror::Error;
@@ -58,7 +59,8 @@ pub enum RedeemInviteError {
 /// - Generates a fresh key pair and uses the public part to redeem the invite and the private part
 ///   to update the WireGuard interface.
 /// - Creates the data store with the coordinator and this client, as the invitation introduces
-///   them.
+///   them, and writes the config, both before redeeming the invitation. If the redemption fails,
+///   both are removed.
 /// - Bails if either a WireGuard or an innernet `interface` of the same name already exists and
 ///   brings the interface down if it was already up.
 pub async fn redeem_invite(
@@ -146,48 +148,86 @@ async fn update_keypair(
     interface: &InterfaceName,
     config_path: &Path,
     data_dir: &Path,
-    mut config: InterfaceConfig,
+    invitation: InterfaceConfig,
     delegations: &[Prefix],
 ) -> Result<(), RedeemInviteError> {
     log::info!("Generating new keypair.");
     let keypair = wireguard_control::KeyPair::generate();
+    let mut config = invitation.clone();
+    config.interface.private_key = keypair.private.to_base64();
+
+    // The data store and the config are ready before the invitation is spent, so that redeeming it
+    // leaves both behind. Until the server answers, the invitation is the authority on whether the
+    // server speaks TLS, and at which QUIC port.
+    let server_key = &config.server.public_key;
+    let mut store = DataStore::create_new(data_dir, interface, &config)
+        .map_err(RedeemInviteError::DataStoreIntroduction)?;
+    let introduced = (|| -> Result<(), Error> {
+        store.introduce(&config, delegations)?;
+        if config.server.has_feature(FEATURE_TLS) {
+            store.latch_tls(server_key)?;
+        }
+        if let Some(port) = config.server.quic_port {
+            store.set_quic_port(server_key, port)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = introduced {
+        discard_data_store(store, data_dir, interface);
+        return Err(RedeemInviteError::DataStoreIntroduction(e));
+    }
+
+    // The config is written next to its final path, so that renaming it into place doesn't cross
+    // file systems. Its extension isn't that of a config, so it isn't taken for an interface.
+    let new_config_path = config_path.with_extension("conf.new");
+    if let Err(e) = config.save_new(&new_config_path, 0o600) {
+        discard_data_store(store, data_dir, interface);
+        return Err(RedeemInviteError::InterfaceConfigAccess(e));
+    }
 
     log::info!(
         "Registering keypair with server (at {}).",
         config.server.internal_endpoint
     );
-    let rest_client = RestClient::new(&config, config.server.has_feature(FEATURE_TLS))?;
-    rest_client
-        .http_form::<_, ()>(
-            "POST",
-            "/user/redeem",
-            RedeemContents {
-                public_key: keypair.public.to_base64(),
-            },
-        )
-        .await?;
-    // The server authenticated with the key of the invitation if it answered over TLS.
-    let speaks_tls = rest_client.speaks_tls();
-    drop(rest_client);
+    let redeemed = async {
+        let rest_client = RestClient::new(&invitation, invitation.server.has_feature(FEATURE_TLS))?;
+        rest_client
+            .http_form::<_, ()>(
+                "POST",
+                "/user/redeem",
+                RedeemContents {
+                    public_key: keypair.public.to_base64(),
+                },
+            )
+            .await?;
+        Ok::<_, RestError>(rest_client)
+    }
+    .await;
+    let rest_client = match redeemed {
+        Ok(rest_client) => rest_client,
+        Err(e) => {
+            if let Err(e) = std::fs::remove_file(&new_config_path) {
+                log::warn!(
+                    "failed to remove {}: {e}",
+                    new_config_path.to_string_lossy().yellow()
+                );
+            }
+            discard_data_store(store, data_dir, interface);
+            return Err(e.into());
+        },
+    };
 
-    config.interface.private_key = keypair.private.to_base64();
-    config
-        .save_new(config_path, 0o600)
+    std::fs::rename(&new_config_path, config_path)
+        .with_path(&new_config_path)
         .map_err(RedeemInviteError::InterfaceConfigAccess)?;
     log::info!(
         "New keypair registered. Copied config to {}.\n",
         config_path.to_string_lossy().yellow()
     );
-
-    DataStore::open_or_create(data_dir, interface, &config)
-        .and_then(|mut store| {
-            store.introduce(&config, delegations)?;
-            if speaks_tls {
-                store.latch_tls(&config.server.public_key)?;
-            }
-            Ok(())
-        })
-        .map_err(RedeemInviteError::DataStoreIntroduction)?;
+    // What the server stated when it answered, such as a QUIC port that the invitation didn't
+    // state, is recorded as a fetch would record it.
+    record_coordinator(&mut store, &config, &rest_client);
+    drop(rest_client);
 
     log::info!("Changing keys and waiting 5s for server's WireGuard interface to transition.",);
     DeviceUpdate::new()
@@ -200,6 +240,13 @@ async fn update_keypair(
     tokio::time::sleep(REDEEM_TRANSITION_WAIT).await;
 
     Ok(())
+}
+
+/// Removes the data store that a redemption created, when the invitation wasn't redeemed.
+fn discard_data_store(store: DataStore, data_dir: &Path, interface: &InterfaceName) {
+    if let Err(e) = store.discard(data_dir, interface) {
+        log::warn!("failed to remove the data store: {e:#}");
+    }
 }
 
 /// Fetches the state of `interface` from the coordinator, configures the interface from it, and
@@ -320,6 +367,7 @@ pub async fn round(
     };
     let mut link = RemoteLink {
         interface: *interface,
+        config: &config,
         store,
         rest_client: RestClient::for_interface(&config, data_dir, interface)?,
         fetched: false,
@@ -345,6 +393,7 @@ pub async fn round(
 /// A client's link to its coordinator, over the API.
 struct RemoteLink<'a> {
     interface: InterfaceName,
+    config: &'a InterfaceConfig,
     store: DataStore,
     rest_client: RestClient<'a>,
     /// Whether the last sync reached the coordinator.
@@ -387,6 +436,7 @@ impl Link for RemoteLink<'_> {
                 e
             );
         }
+        record_coordinator(&mut self.store, self.config, &self.rest_client);
         self.fetched = true;
         Ok(())
     }
@@ -418,6 +468,34 @@ impl Link for RemoteLink<'_> {
                 Ok(())
             },
         }
+    }
+}
+
+/// Records in `store` that the coordinator speaks TLS, and the QUIC port at which it answered, as
+/// `rest_client` learned them. A data store that the client first made without an invitation, as
+/// when the client was upgraded from v2.0.0, records the coordinator only once the server reports
+/// it; until then, nothing is recorded.
+fn record_coordinator(store: &mut DataStore, config: &InterfaceConfig, rest_client: &RestClient) {
+    if !rest_client.speaks_tls() {
+        return;
+    }
+    let server_key = &config.server.public_key;
+    let mut record = || -> Result<(), Error> {
+        if !store.records_peer(server_key)? {
+            return Ok(());
+        }
+        if !store.speaks_tls(server_key)? {
+            store.latch_tls(server_key)?;
+        }
+        match rest_client.quic_port() {
+            Some(port) if store.quic_port(server_key)? != Some(port) => {
+                store.set_quic_port(server_key, port)
+            },
+            _ => Ok(()),
+        }
+    };
+    if let Err(e) = record() {
+        log::warn!("failed to record that the innernet server speaks TLS, and its port: {e:#}");
     }
 }
 

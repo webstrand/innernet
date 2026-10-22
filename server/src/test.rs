@@ -5,12 +5,13 @@ use crate::{
     Context, Db, Endpoints, ServerConfig,
 };
 use anyhow::anyhow;
+use bytes::Buf;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_node::Store;
 use innernet_shared::{
     cbor,
     problem::{self, Problem, ProblemType},
-    Error, LegacyPeerContents, PeerContents, Prefix,
+    tls, Error, LegacyPeerContents, PeerContents, Prefix,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Serialize};
@@ -362,6 +363,59 @@ impl Server {
         let req = self.body_request(verb, path, "application/json", body);
         self.raw_request_as(ip_str, None, req).await
     }
+}
+
+/// Serves the TLS API of `server` over QUIC at the loopback address, authenticated with
+/// `server_key`, and returns the address.
+pub fn serve_quic(server: &Server, server_key: &KeyPair) -> Result<SocketAddr, Error> {
+    let loopback = if cfg!(feature = "v6-test") {
+        "[::1]:0"
+    } else {
+        "127.0.0.1:0"
+    };
+    let socket = std::net::UdpSocket::bind(loopback)?;
+    let addr = socket.local_addr()?;
+    let tls_config = tls::server_config(&server_key.private.to_base64())?;
+    let endpoint = crate::quic::endpoint(socket, tls_config)?;
+    tokio::spawn(crate::quic::serve(endpoint, server.context()));
+    Ok(addr)
+}
+
+/// Sends a GET of `path` over QUIC to the TLS API at `addr`, as a client authenticated with
+/// `client`, which pins the server's key `pinned`, with `header_key` as the server's key in
+/// [`innernet_shared::INNERNET_PUBKEY_HEADER`]. Returns the status of the answer, and its body.
+pub async fn quic_get(
+    addr: SocketAddr,
+    client: &KeyPair,
+    pinned: &Key,
+    header_key: &str,
+    path: &str,
+) -> Result<(u16, Vec<u8>), Error> {
+    let tls_config = tls::client_config(&client.private.to_base64(), &pinned.to_base64())?;
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?;
+    let unspecified: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0".parse()?
+    } else {
+        "[::]:0".parse()?
+    };
+    let mut endpoint = quinn::Endpoint::client(unspecified)?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let connection = endpoint.connect(addr, &addr.ip().to_string())?.await?;
+    let (mut driver, mut send_request) =
+        h3::client::new(h3_quinn::Connection::new(connection)).await?;
+    tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let request = http1::Request::get(format!("https://{addr}{path}"))
+        .header(innernet_shared::INNERNET_PUBKEY_HEADER, header_key)
+        .header("accept", innernet_shared::media_type::accept())
+        .body(())?;
+    let mut stream = send_request.send_request(request).await?;
+    stream.finish().await?;
+    let response = stream.recv_response().await?;
+    let mut body = vec![];
+    while let Some(mut chunk) = stream.recv_data().await? {
+        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    Ok((response.status().as_u16(), body))
 }
 
 /// The media type of the newest version of the API, which the bodies of requests and responses of

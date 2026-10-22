@@ -39,9 +39,11 @@ db() { sqlite3 "$work/coordination-server/data/e2e.db" "$@"; }
 # for its API, which the admin commands of innernet-server reach it at.
 await_coordinator() { # <namespace> <config>
     local port
-    port=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["listen-port"])' "$2")
     for _ in $(seq 50); do
-        if ip netns exec "$1" ss -Hltn "sport = :$port" | grep -q .; then
+        port=$(python3 -I -c 'import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+print(c.get("coordinator", c).get("quic-port", ""))' "$2")
+        if [ -n "$port" ] && ip netns exec "$1" ss -Hlun "sport = :$port" | grep -q .; then
             return 0
         fi
         sleep 0.2

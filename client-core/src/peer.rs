@@ -56,8 +56,8 @@ pub async fn create_peer(
 ///
 /// The coordinator is the peer with the key of `server`, which authenticated the server. The
 /// invitation names it at the endpoint of its peer in `existing_peers`, if it has one, and at the
-/// external endpoint of `server` otherwise. It states that the server speaks TLS only if the
-/// server answered this client over TLS.
+/// external endpoint of `server` otherwise. It states that the server speaks TLS, and the QUIC
+/// port at which it answered, only if the server answered this client over TLS.
 pub async fn invite(
     rest_client: &RestClient<'_>,
     interface: &InterfaceName,
@@ -71,10 +71,10 @@ pub async fn invite(
     let peer = rest_client.create_peer(&peer_contents).await?;
 
     let mut server_info = server.clone();
-    server_info.features = if rest_client.speaks_tls() {
-        vec![FEATURE_TLS.to_string()]
+    (server_info.features, server_info.quic_port) = if rest_client.speaks_tls() {
+        (vec![FEATURE_TLS.to_string()], rest_client.quic_port())
     } else {
-        vec![]
+        (vec![], None)
     };
     if let Some(endpoint) = existing_peers
         .iter()
