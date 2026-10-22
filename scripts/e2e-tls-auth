@@ -246,6 +246,61 @@ client adm enable-peer e2e --name y --yes || fail "enable-peer as adm"
 [ "$(x_peer)" = "y|0" ] || fail "adm didn't enable y: $(x_peer)"
 pass "adm enables a peer by key"
 
+step "delegations"
+a_key=$(invitation "$work/a/conf/e2e.conf" interface private-key | wg pubkey)
+# Prints the allowed IPs that a client's interface routes to a key.
+routed() { # <peer> <key>
+    ns "$1" wg show e2e allowed-ips | awk -v key="$2" '$1 == key { $1 = ""; print substr($0, 2) }'
+}
+# Prints the number of pins of a key in a client's data store.
+pins() { # <peer> <key>
+    sqlite3 "$work/$1/data/e2e.db" \
+        "SELECT count(*) FROM prefix_pins WHERE hex(public_key) = '$(key_hex "$2")'"
+}
+
+server add-peer e2e --name w --delegation 10.66.1.32/28 --cidr peers --admin false \
+    --invite-expires 1h --save-config "$work/w.toml" --yes >/dev/null || fail "add-peer w"
+[ "$(invitation "$work/w.toml" interface delegations)" = "['10.66.1.32/28']" ] ||
+    fail "w's invitation doesn't offer its delegation"
+[ "$(invitation_address "$work/w.toml")" = "10.66.1.32/16" ] ||
+    fail "w's invitation names an address"
+pass "the server invites w with a /28, without naming an address"
+
+client adm add-delegation e2e --name a --prefix 10.66.1.64/28 --yes || fail "add-delegation as adm"
+[ "$(db "SELECT count(*) FROM delegations WHERE $(by_key "$a_key")")" = 2 ] ||
+    fail "adm didn't delegate 10.66.1.64/28 to a"
+for peer in a adm; do
+    client "$peer" fetch e2e || fail "fetch as $peer"
+done
+routed adm "$a_key" | grep -qF 10.66.1.64/28 || fail "adm doesn't route a's delegation to a"
+pass "adm delegates a prefix to a, and routes it to a"
+ns a ip addr add 10.66.1.70/32 dev e2e
+ns adm ping -c1 -W2 10.66.1.70 >/dev/null || fail "adm can't reach a within its delegation"
+pass "adm reaches a at an address of its delegation"
+
+client adm withdraw-delegation e2e --name a --prefix 10.66.1.64/28 --yes ||
+    fail "withdraw-delegation as adm"
+client adm fetch e2e || fail "fetch as adm"
+if routed adm "$a_key" | grep -qF 10.66.1.64/28; then
+    fail "adm still routes the withdrawn delegation to a"
+fi
+[ "$(pins adm "$a_key")" = 2 ] || fail "adm doesn't keep the withdrawn delegation pinned to a"
+pass "the withdrawn delegation is no longer routed, but stays pinned to a"
+
+# The server's node keeps the withdrawn prefix pinned to a too, so the server refuses it to adm.
+if client adm add-delegation e2e --name adm --prefix 10.66.1.64/28 --yes; then
+    fail "the server delegated a prefix pinned to a to adm"
+fi
+grep -q "pinned" "$work/adm.log" || fail "the refusal doesn't explain itself"
+pass "the server refuses a prefix pinned to a to another peer"
+
+if server withdraw-delegation e2e --name innernet-server --prefix 10.66.0.1/32 --yes \
+    >"$work/withdraw.log" 2>&1; then
+    fail "the server withdrew the delegation of its internal address"
+fi
+grep -q "internal address" "$work/withdraw.log" || fail "the refusal doesn't explain itself"
+pass "the server keeps the delegation of its internal address"
+
 step "something else on a peer's machine, without its key"
 expect_plain a GET /v1/user/state 401
 case $last_body in *TLS*) pass "the refusal explains TLS is required" ;;
@@ -337,6 +392,11 @@ client c rename-peer e2o --name d --new-name d2 --yes || fail "rename-peer as c 
 client c disable-peer e2o --name d2 --yes || fail "disable-peer as c in plain HTTP"
 [ "$(d_peer)" = "d2|1" ] || fail "c didn't rename and disable d: $(d_peer)"
 pass "c renames and disables a peer by ID in plain HTTP"
+if client c add-delegation e2o --name d2 --prefix 10.67.1.32/28 --yes; then
+    fail "c delegated a prefix through a server that predates TLS"
+fi
+grep -q "single address only" "$work/c.log" || fail "c's refusal doesn't explain itself"
+pass "c refuses to delegate a prefix through a server that predates TLS"
 
 step "the server is upgraded"
 stop_osrv

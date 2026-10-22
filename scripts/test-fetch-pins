@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests whether a compromised coordination server can put its own key on a client's WireGuard
-# interface, in place of a peer that the client has pinned.
+# interface, in place of a peer that the client has pinned: by giving the peer's address to its
+# own key, and by delegating a prefix that covers the peer's address to its own key.
 #
 # Usage: [KEEP=1] scripts/test-fetch-pins <dir containing innernet and innernet-server>
 #
@@ -143,6 +144,23 @@ db "UPDATE peers SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex'
     DELETE FROM endpoints WHERE public_key IN (x'$bob_hex', x'$mallory_hex');
     INSERT INTO endpoints (public_key, kind, position, address, port)
     VALUES (x'$mallory_hex', 0, 0, x'06060606', 51820);"
+fetch_status=0
+client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
+echo "    (fetch exited with status $fetch_status)"
+
+cat <<EOF
+
+--- The coordination server delegates a prefix that covers bob's IP to mallory, and alice fetches -
+
+EOF
+# The /31 that holds bob's IP, as the first and last addresses of the prefix in hex.
+read -r first last < <(python3 -I -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1] + "/31", strict=False)
+print(net.network_address.packed.hex(), net.broadcast_address.packed.hex())' "$bob_ip")
+db "DELETE FROM delegations WHERE public_key = x'$mallory_hex';
+    INSERT INTO delegations (address, prefix_len, last, public_key)
+    VALUES (x'$first', 31, x'$last', x'$mallory_hex');"
 fetch_status=0
 client alice fetch e2e --no-write-hosts 2>&1 | sed 's/^/    | /' || fetch_status=${PIPESTATUS[0]}
 echo "    (fetch exited with status $fetch_status)"
