@@ -9,7 +9,7 @@ use innernet_client_core::{
     data_store::DataStore,
     interface::{fetch, redeem_invite, round, NodeState},
     peer::coordinator_info,
-    rest_client::{RestClient, RestError},
+    rest_client::RestClient,
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
 use innernet_node::{
@@ -23,10 +23,8 @@ use innernet_shared::{
     prompts, wg,
     wg::PeerInfoExt,
     AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DelegationOpts, DeleteCidrOpts,
-    EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
-    IoErrorContext, LegacyCapabilities, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
-    ServerCapabilities, WrappedIoError,
+    EnableDisablePeerOpts, HostsOpts, InstallOpts, Interface, IoErrorContext, NatOpts, NetworkOpts,
+    PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts, WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -292,30 +290,6 @@ enum Command {
 
     /// List existing assocations between CIDRs
     ListAssociations { interface: Interface },
-
-    /// Set the local listen port.
-    SetListenPort {
-        interface: Interface,
-
-        #[clap(flatten)]
-        sub_opts: ListenPortOpts,
-    },
-
-    /// Override your external endpoint that the server sends to other peers
-    OverrideEndpoint {
-        interface: Interface,
-
-        #[clap(flatten)]
-        sub_opts: OverrideEndpointOpts,
-    },
-
-    /// Override the endpoint you use to connect to a particular peer
-    OverridePeerEndpoint {
-        interface: Interface,
-
-        #[clap(flatten)]
-        sub_opts: OverridePeerEndpointOpts,
-    },
 
     /// Generate shell completion scripts
     Completions {
@@ -619,216 +593,6 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
         }
     }
     Ok(())
-}
-
-fn set_listen_port(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: ListenPortOpts,
-) -> Result<(), Error> {
-    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-
-    let listen_port = prompts::set_listen_port(&config.interface, sub_opts)?;
-    if let Some(listen_port) = listen_port {
-        innernet_client_core::set_listen_port(
-            opts.network.backend,
-            &opts.config_dir,
-            interface,
-            &mut config,
-            listen_port,
-        )?;
-    } else {
-        log::info!("exiting without updating the listen port.");
-    }
-
-    Ok(())
-}
-
-async fn override_endpoint(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: OverrideEndpointOpts,
-) -> Result<(), Error> {
-    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let server_capabilities = get_server_capabilities(&config, opts, interface).await?;
-
-    let endpoint_contents = if sub_opts.unset {
-        prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
-    } else {
-        let port = match config.interface.listen_port {
-            Some(port) => port,
-            None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
-        };
-        let endpoint =
-            prompt_override_endpoint(server_capabilities.unspecified_ip, &sub_opts, port)?;
-        endpoint.map(EndpointContents::Set)
-    };
-
-    match endpoint_contents {
-        Some(contents) if server_capabilities.tls.accepts_announcements() => {
-            // A server that accepts announcements takes the endpoint only from this client's
-            // announcements, which the config states, and which each fetch makes.
-            config.interface.external_endpoint = contents.into();
-            config.save(&opts.config_dir, interface)?;
-            log::info!(
-                "endpoint override {} in the config; it is announced on the next fetch.",
-                if sub_opts.unset { "unset" } else { "set" }
-            );
-        },
-        Some(contents) => {
-            log::info!("requesting endpoint update...");
-            RestClient::for_interface(&config, &opts.data_dir, interface)?
-                .http_form::<_, ()>("PUT", "/user/endpoint", contents)
-                .await?;
-            log::info!(
-                "endpoint override {}",
-                if sub_opts.unset { "unset" } else { "set" }
-            );
-        },
-        None => log::info!("exiting without overriding endpoint"),
-    }
-
-    Ok(())
-}
-
-fn override_peer_endpoint(
-    interface: &InterfaceName,
-    opts: &Opts,
-    sub_opts: OverridePeerEndpointOpts,
-) -> Result<(), Error> {
-    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
-    let data_store = DataStore::open(&opts.data_dir, interface, &config)?;
-    let peers = data_store.peers()?;
-    config.refuse_ip_keyed_endpoint_overrides(&peers)?;
-
-    if let Some((peer, endpoint_opt)) =
-        prompts::override_peer_endpoint_prompt(&peers, config.peer_endpoint_overrides(), &sub_opts)?
-    {
-        if let Some(endpoint) = endpoint_opt {
-            log::info!(
-                "overriding endpoint for peer {} ({}) with endpoint {}",
-                peer.display_name(),
-                peer.public_key,
-                endpoint
-            );
-
-            innernet_client_core::set_endpoint_override_for_peer(
-                opts.network.backend,
-                &opts.config_dir,
-                interface,
-                &mut config,
-                &peer,
-                endpoint,
-            )?;
-        } else {
-            log::info!(
-                "unsetting endpoint override for peer {} ({})",
-                peer.display_name(),
-                peer.public_key
-            );
-
-            innernet_client_core::unset_endpoint_override_for_peer(
-                &opts.config_dir,
-                interface,
-                &mut config,
-                &peer,
-            )?;
-
-            log::info!("normal peer endpoint/NAT traversal will be restored on the next call to 'innernet fetch'");
-        }
-    } else {
-        log::info!("exiting without overriding peer endpoint");
-    }
-
-    Ok(())
-}
-
-fn prompt_override_endpoint(
-    unspecified_ip_supported: bool,
-    args: &OverrideEndpointOpts,
-    listen_port: u16,
-) -> Result<Option<Endpoint>, Error> {
-    let endpoint = match &args.endpoint {
-        Some(endpoint) => endpoint.clone(),
-        None => {
-            let external_ip = if unspecified_ip_supported {
-                prompts::unspecified_ip_and_auto_detection_flow()?
-            } else {
-                prompts::ip_auto_detection_flow()?
-            };
-
-            prompts::input_external_endpoint(external_ip, listen_port)?
-        },
-    };
-
-    if endpoint.is_host_unspecified() && !unspecified_ip_supported {
-        bail!(
-            "Attempted to use an unspecified IP (all zeros) but the innernet server does
-    not have the capability to resolve it, likely because its version is older."
-        )
-    }
-
-    if args.yes || prompts::confirm(&format!("Set external endpoint to {endpoint}?"))? {
-        Ok(Some(endpoint))
-    } else {
-        Ok(None)
-    }
-}
-
-fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, Error> {
-    Ok(args.yes
-        || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
-}
-
-/// What `override-endpoint` must know of the server: the capabilities that the TLS API states,
-/// which are the default for a server in plain HTTP, and whether the host of an endpoint may be
-/// unspecified.
-#[derive(Default)]
-struct EndpointCapabilities {
-    tls: ServerCapabilities,
-    unspecified_ip: bool,
-}
-
-/// The capabilities of the server, read in the transport in which the client talks to it. A
-/// server in plain HTTP states whether it fills in an unspecified host itself. Over TLS, the host
-/// may be unspecified if the server accepts announcements, since the client then completes the
-/// host with the endpoint at which the server observes it.
-async fn get_server_capabilities(
-    config: &InterfaceConfig,
-    opts: &Opts,
-    interface: &InterfaceName,
-) -> Result<EndpointCapabilities, Error> {
-    let rest_client = RestClient::for_interface(config, &opts.data_dir, interface)?;
-    let maybe_info: Result<EndpointCapabilities, RestError> = if rest_client.speaks_tls() {
-        rest_client
-            .http::<ServerCapabilities>("GET", "/user/capabilities")
-            .await
-            .map(|tls| EndpointCapabilities {
-                unspecified_ip: tls.accepts_announcements(),
-                tls,
-            })
-    } else {
-        rest_client
-            .http::<LegacyCapabilities>("GET", "/user/capabilities")
-            .await
-            .map(|legacy| EndpointCapabilities {
-                tls: ServerCapabilities::default(),
-                unspecified_ip: legacy.unspecified_ip_in_override_endpoint,
-            })
-    };
-    match maybe_info {
-        Ok(info) => Ok(info),
-        Err(e) => {
-            if e.has_status_of(404) {
-                log::debug!(
-                "innernet server endpoint capabilities not found, assuming default capabilities"
-            );
-                Ok(Default::default())
-            } else {
-                bail!(e)
-            }
-        },
-    }
 }
 
 fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> Result<(), Error> {
@@ -1325,24 +1089,6 @@ async fn run(opts: &Opts) -> Result<(), Error> {
         Command::ListAssociations { interface } => {
             admin_client!(interface, _config, rest_client);
             admin::list_associations(&rest_client).await?
-        },
-        Command::SetListenPort {
-            interface,
-            sub_opts,
-        } => {
-            set_listen_port(&interface, opts, sub_opts)?;
-        },
-        Command::OverrideEndpoint {
-            interface,
-            sub_opts,
-        } => {
-            override_endpoint(&interface, opts, sub_opts).await?;
-        },
-        Command::OverridePeerEndpoint {
-            interface,
-            sub_opts,
-        } => {
-            override_peer_endpoint(&interface, opts, sub_opts)?;
         },
         Command::Completions { shell } => {
             use clap::CommandFactory;

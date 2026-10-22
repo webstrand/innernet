@@ -17,8 +17,8 @@ use innernet_node::{
 use innernet_shared::{
     announcement::{Announcement, SignedAnnouncement},
     interface_config::{ResolvedInvitation, FEATURE_TLS},
-    wg, Endpoint, IoErrorContext, PeerChange, PeerContents, Prefix, RedeemContents,
-    ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
+    wg, Endpoint, EndpointContents, IoErrorContext, PeerChange, PeerContents, Prefix,
+    RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
 use thiserror::Error;
@@ -302,7 +302,15 @@ pub async fn round(
     state: &mut NodeState,
 ) -> Result<Round, Error> {
     hosts_opts.warn_of_hosts_file_options();
-    let config = InterfaceConfig::from_interface(config_dir, interface)?;
+    // The client never writes the config after installation, and reads it anew on every fetch, so
+    // that a fetch applies what the operator edited in it. A config that fails to read fails the
+    // fetch before anything is applied, which leaves the interface as the last fetch left it.
+    let config = InterfaceConfig::from_interface(config_dir, interface).with_context(|| {
+        format!(
+            "failed to read {}",
+            InterfaceConfig::get_path(config_dir, interface).display()
+        )
+    })?;
     let interface_up = interface_is_up(network_opts.backend, interface);
     let store = DataStore::open_or_create(data_dir, interface, &config)?;
 
@@ -357,7 +365,12 @@ pub async fn round(
     }
     let rest_client = RestClient::for_interface(&config, data_dir, interface)?;
     let device = Device::get(interface, network_opts.backend)?;
-    let listen_port = device.listen_port.unwrap_or(51820);
+    apply_listen_port(interface, &config, &device, network_opts.backend)?;
+    let listen_port = config
+        .interface
+        .listen_port
+        .or(device.listen_port)
+        .unwrap_or(51820);
     let mut node = Node {
         interface: *interface,
         info: config.interface.clone(),
@@ -398,6 +411,7 @@ pub async fn round(
     // A server that checks no claims accepts no announcement, and takes what it relays of this
     // client as this client reports it.
     if link.state.is_some() && link.claim_types.as_deref() == Some(&[]) {
+        report_external_endpoint(&rest_client, &config).await;
         report_candidates(&rest_client, nat, listen_port).await?
     }
 
@@ -630,6 +644,51 @@ async fn claim_types(rest_client: &RestClient<'_>) -> Option<Vec<String>> {
             log::warn!("failed to read the capabilities of the innernet server: {e}");
             None
         },
+    }
+}
+
+/// Sets the listen port of the interface to that of `config`, if it states one that `device`
+/// doesn't have. A config that states none leaves the port as it is: the interface takes a random
+/// port only when it is brought up.
+fn apply_listen_port(
+    interface: &InterfaceName,
+    config: &InterfaceConfig,
+    device: &Device,
+    backend: Backend,
+) -> Result<(), Error> {
+    let Some(listen_port) = config.interface.listen_port else {
+        return Ok(());
+    };
+    if device.listen_port == Some(listen_port) {
+        return Ok(());
+    }
+    log::info!(
+        "setting the listen port of {} to {listen_port}.",
+        interface.as_str_lossy().yellow()
+    );
+    wg::set_listen_port(interface, Some(listen_port), backend).context(interface.to_string())?;
+    Ok(())
+}
+
+/// Reports the `external-endpoint` of `config` to a server that accepts no announcement, which
+/// sends it to other peers as this client's endpoint. A config that states none reports nothing,
+/// so the server keeps the endpoint that it last received: an endpoint that an earlier version of
+/// this client set with `innernet override-endpoint` stays until the server is upgraded or the
+/// config states another. A failure is logged and never fails the fetch.
+async fn report_external_endpoint(rest_client: &RestClient<'_>, config: &InterfaceConfig) {
+    let Some(endpoint) = &config.interface.external_endpoint else {
+        return;
+    };
+    log::debug!("reporting the external endpoint {endpoint}");
+    if let Err(e) = rest_client
+        .http_form::<_, ()>(
+            "PUT",
+            "/user/endpoint",
+            EndpointContents::Set(endpoint.clone()),
+        )
+        .await
+    {
+        log::warn!("failed to report the external endpoint {endpoint}: {e}");
     }
 }
 

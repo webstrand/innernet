@@ -262,16 +262,6 @@ impl InterfaceConfig {
         Ok(())
     }
 
-    /// Overwrites the config file if it already exists.
-    pub fn save(&self, config_dir: &Path, interface: &InterfaceName) -> Result<PathBuf, Error> {
-        let path = Self::build_config_file_path(config_dir, interface)?;
-        File::create(&path)
-            .with_path(&path)?
-            .write_all(self.as_toml().as_bytes())?;
-
-        Ok(path)
-    }
-
     fn as_toml(&self) -> String {
         toml::to_string(self).unwrap()
     }
@@ -312,18 +302,6 @@ impl InterfaceConfig {
         self.peer_endpoint_overrides
             .by_public_key
             .get(&peer.public_key)
-    }
-
-    pub fn set_endpoint_override_for_peer(&mut self, peer: &PeerContents, endpoint: Endpoint) {
-        self.peer_endpoint_overrides
-            .by_public_key
-            .insert(peer.public_key.clone(), endpoint);
-    }
-
-    pub fn unset_endpoint_override_for_peer(&mut self, peer: &PeerContents) {
-        self.peer_endpoint_overrides
-            .by_public_key
-            .remove(&peer.public_key);
     }
 
     /// Fails if the config keys an endpoint override by peer IP, as versions before this one wrote
@@ -810,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_endpoint_overrides_keyed_by_public_key() {
-        let mut config = parse(&format!("\"{KEY_A}\" = \"198.51.100.7:51820\"")).unwrap();
+        let config = parse(&format!("\"{KEY_A}\" = \"198.51.100.7:51820\"")).unwrap();
 
         // The override follows the key, wherever its peer is, and never the IP.
         assert_eq!(
@@ -824,14 +802,6 @@ mod tests {
         assert_eq!(
             written_overrides(&config),
             config.peer_endpoint_overrides().clone()
-        );
-
-        // An override is set and unset by the peer's key.
-        config.set_endpoint_override_for_peer(&peer("10.0.0.3", KEY_B), endpoint("1.1.1.1:1"));
-        config.unset_endpoint_override_for_peer(&peer("10.0.0.3", KEY_A));
-        assert_eq!(
-            written_overrides(&config),
-            BTreeMap::from([(KEY_B.to_string(), endpoint("1.1.1.1:1"))])
         );
 
         // A key that is neither a public key nor an IP is refused.

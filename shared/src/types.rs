@@ -631,58 +631,6 @@ pub struct AddDeleteAssociationOpts {
     pub yes: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct ListenPortOpts {
-    /// The listen port you'd like to set for the interface
-    #[clap(short, long)]
-    pub listen_port: Option<u16>,
-
-    /// Unset the local listen port to use a randomized port
-    #[clap(short, long, conflicts_with = "listen_port")]
-    pub unset: bool,
-
-    /// Bypass confirmation
-    #[clap(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct OverrideEndpointOpts {
-    /// The external endpoint that you'd like the innernet server to broadcast to other peers. The
-    /// IP address may be unspecified (all zeros), in which case the server will try to resolve it
-    /// based on its most recent connection. The port will still be used, even if you decide to use
-    /// an unspecified IP address.
-    #[clap(short, long)]
-    pub endpoint: Option<Endpoint>,
-
-    /// Unset an existing override to use the automatic endpoint discovery
-    #[clap(short, long, conflicts_with = "endpoint")]
-    pub unset: bool,
-
-    /// Bypass confirmation
-    #[clap(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct OverridePeerEndpointOpts {
-    /// Name of peer whose endpoint you want to override
-    #[clap(long)]
-    pub name: Option<Hostname>,
-
-    /// The external endpoint that you'd like to use for a given peer
-    #[clap(short, long)]
-    pub endpoint: Option<Endpoint>,
-
-    /// Unset an existing local endpoint override for this peer
-    #[clap(short, long, conflicts_with = "endpoint")]
-    pub unset: bool,
-
-    /// Bypass confirmation
-    #[clap(long)]
-    pub yes: bool,
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct NatOpts {
     #[clap(long)]

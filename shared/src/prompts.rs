@@ -1,8 +1,8 @@
 use crate::{
-    check_delegations, hosts_fallback, interface_config::InterfaceInfo, peer::NewPeerInfo,
-    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, Association, Cidr, CidrTree,
-    DelegationOpts, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt,
-    ListenPortOpts, OverridePeerEndpointOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
+    check_delegations, hosts_fallback, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
+    AddPeerOpts, Association, Cidr, CidrTree, DelegationOpts, DeleteCidrOpts,
+    EnableDisablePeerOpts, Endpoint, Error, Hostname, IpNetExt, PeerContents, Prefix,
+    RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -10,10 +10,9 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use innernet_publicip::Preference;
 use once_cell::sync::Lazy;
 use std::{
-    collections::BTreeMap,
     fmt::{Debug, Display},
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
 };
 
@@ -738,51 +737,6 @@ pub fn reclaim_delegation<'a>(
         },
     )
 }
-
-pub fn set_listen_port(
-    interface: &InterfaceInfo,
-    args: ListenPortOpts,
-) -> Result<Option<Option<u16>>, Error> {
-    let listen_port = if let Some(listen_port) = args.listen_port {
-        Some(listen_port)
-    } else if !args.unset {
-        Some(input(
-            "Listen port",
-            Prefill::Default(interface.listen_port.unwrap_or(51820)),
-        )?)
-    } else {
-        None
-    };
-
-    let confirmation = Confirm::with_theme(&*THEME)
-        .wait_for_newline(true)
-        .with_prompt(
-            &(if let Some(port) = &listen_port {
-                format!("Set listen port to {port}?")
-            } else {
-                "Unset and randomize listen port?".to_string()
-            }),
-        )
-        .default(false);
-
-    if listen_port == interface.listen_port {
-        println!("No change necessary - interface already has this setting.");
-        Ok(None)
-    } else if args.yes || confirmation.interact()? {
-        Ok(Some(listen_port))
-    } else {
-        Ok(None)
-    }
-}
-
-pub fn unspecified_ip_and_auto_detection_flow() -> Result<Option<IpAddr>, Error> {
-    if confirm_unspecified_ip_usage()? {
-        Ok(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
-    } else {
-        ip_auto_detection_flow()
-    }
-}
-
 pub fn ip_auto_detection_flow() -> Result<Option<IpAddr>, Error> {
     let ip_addr = if confirm_ip_auto_detection()? {
         innernet_publicip::get_any(Preference::Ipv4)
@@ -802,19 +756,6 @@ fn confirm_ip_auto_detection() -> Result<bool, Error> {
     Ok(answer)
 }
 
-fn confirm_unspecified_ip_usage() -> Result<bool, Error> {
-    log::info!(
-        "Note: use unspecified IP address (all zeros) if you do not have a fixed global IP but the \
-         port is forwarded." 
-    );
-    let answer = Confirm::with_theme(&*THEME)
-        .wait_for_newline(true)
-        .with_prompt("Use an unspecified IP address and override just the port?")
-        .interact()?;
-
-    Ok(answer)
-}
-
 pub fn input_external_endpoint(
     external_ip: Option<IpAddr>,
     listen_port: u16,
@@ -828,85 +769,6 @@ pub fn input_external_endpoint(
     )?;
 
     Ok(endpoint)
-}
-
-/// Bring up a prompt to override the endpoint for an existing peer.
-/// Returns the peer and desired endpoint.
-pub fn override_peer_endpoint_prompt(
-    peers: &[PeerContents],
-    peer_endpoint_overrides: &BTreeMap<String, Endpoint>,
-    args: &OverridePeerEndpointOpts,
-) -> Result<Option<(PeerContents, Option<Endpoint>)>, Error> {
-    let eligible_peers = peers
-        .iter()
-        .filter(|p| p.name.as_deref() != Some("innernet-server"))
-        // If we're unsetting, filter eligible_peers to just be peers that have
-        // an override already set.
-        .filter(|p| !args.unset || peer_endpoint_overrides.contains_key(&p.public_key))
-        .collect::<Vec<_>>();
-
-    let peer = if let Some(name) = &args.name {
-        let Some(peer) = eligible_peers
-            .into_iter()
-            .find(|p| p.name.as_ref() == Some(name))
-        else {
-            return if args.unset && peers.iter().any(|p| p.name.as_ref() == Some(name)) {
-                log::info!("Peer '{name}' does not have an override set");
-                Ok(None)
-            } else {
-                Err(anyhow!("Peer '{name}' does not exist"))
-            };
-        };
-        peer.clone()
-    } else {
-        let message = if args.unset {
-            if eligible_peers.is_empty() {
-                bail!("No peers have an override endpoint set");
-            }
-
-            "Peer endpoint override to unset"
-        } else {
-            "Peer endpoint to override"
-        };
-
-        let (peer_index, _) = select(
-            message,
-            &eligible_peers
-                .iter()
-                .map(|ep| format!("{} ({})", ep.display_name(), ep.display_address()))
-                .collect::<Vec<_>>(),
-        )?;
-        eligible_peers[peer_index].clone()
-    };
-
-    let endpoint: Option<Endpoint> = if args.unset {
-        None
-    } else if let Some(endpoint) = &args.endpoint {
-        Some(endpoint.clone())
-    } else {
-        Some(input("Endpoint", Prefill::None)?)
-    };
-
-    let confirm_msg = if let Some(endpoint) = &endpoint {
-        &format!(
-            "Override endpoint for peer {} ({}) to {}?",
-            peer.display_name().yellow(),
-            peer.display_address(),
-            endpoint,
-        )
-    } else {
-        &format!(
-            "Unset endpoint override for peer {} ({})?",
-            peer.display_name().yellow(),
-            peer.display_address(),
-        )
-    };
-
-    Ok(if args.yes || confirm(confirm_msg)? {
-        Some((peer, endpoint))
-    } else {
-        None
-    })
 }
 
 #[cfg(test)]
