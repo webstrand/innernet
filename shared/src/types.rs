@@ -618,6 +618,9 @@ fn parse_host_suffix(suffix: &str) -> Result<String, String> {
     }
 }
 
+/// A peer, without the ID by which the API of plain-HTTP sessions names it. The API of TLS
+/// sessions names a peer by its public key, and transfers peers in this form. A peer that a server
+/// in plain HTTP transfers with its ID deserializes into this form too, without the ID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerContents {
     pub name: Hostname,
@@ -643,12 +646,24 @@ impl PeerContents {
     }
 }
 
+impl AsRef<PeerContents> for PeerContents {
+    fn as_ref(&self) -> &PeerContents {
+        self
+    }
+}
+
+impl Display for PeerContents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.public_key)
+    }
+}
+
 /// A peer and its tag: the body of `GET /admin/peers/{key}` in TLS sessions. A change to the peer
 /// carries the tag, and the server refuses the change if the peer has changed since. The tag
 /// leaves out the peer's endpoint and candidates, which the peer reports on its own.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TaggedPeer {
-    pub peer: Peer,
+    pub peer: PeerContents,
     pub tag: String,
 }
 
@@ -714,14 +729,14 @@ struct PeerIdentity {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum MaybePeer {
-    Valid(Peer),
+    Valid(PeerContents),
     Invalid(PeerIdentity),
     Unrecognized(de::IgnoredAny),
 }
 
 /// The peers of `peers` that deserialized, and the canonical public keys of those that didn't but
 /// whose public key is valid, each of which is dropped with a warning.
-fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<Peer>, Vec<String>) {
+fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<PeerContents>, Vec<String>) {
     let mut valid = vec![];
     let mut invalid_keys = vec![];
     for peer in peers {
@@ -743,18 +758,15 @@ fn split_valid_peers(peers: Vec<MaybePeer>) -> (Vec<Peer>, Vec<String>) {
     (valid, invalid_keys)
 }
 
+/// A peer with the ID by which the API of plain-HTTP sessions names it, as clients that predate
+/// TLS transfer peers. The API of TLS sessions transfers peers without an ID, as
+/// [`PeerContents`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Peer {
     pub id: i64,
 
     #[serde(flatten)]
     pub contents: PeerContents,
-}
-
-impl AsRef<Peer> for Peer {
-    fn as_ref(&self) -> &Peer {
-        self
-    }
 }
 
 impl Deref for Peer {
@@ -773,7 +785,7 @@ impl DerefMut for Peer {
 
 impl Display for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.name, self.public_key)
+        self.contents.fmt(f)
     }
 }
 
@@ -835,7 +847,7 @@ impl<T: std::fmt::Debug> OptionExt for Option<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerDiff<'a> {
     pub old: Option<&'a PeerConfig>,
-    pub new: Option<&'a Peer>,
+    pub new: Option<&'a PeerContents>,
     builder: PeerConfigBuilder,
     changes: Vec<PeerChange>,
 }
@@ -844,7 +856,7 @@ impl<'a> PeerDiff<'a> {
     /// `endpoint_override`, if any, replaces the endpoint of `new`.
     pub fn new(
         old_info: Option<&'a PeerInfo>,
-        new: Option<&'a Peer>,
+        new: Option<&'a PeerContents>,
         endpoint_override: Option<&Endpoint>,
     ) -> Result<Option<Self>, Error> {
         let old = old_info.map(|p| &p.config);
@@ -876,7 +888,7 @@ impl<'a> PeerDiff<'a> {
 
     fn peer_config_builder(
         old_info: Option<&PeerInfo>,
-        new: Option<&Peer>,
+        new: Option<&PeerContents>,
         endpoint_override: Option<&Endpoint>,
     ) -> Option<(PeerConfigBuilder, Vec<PeerChange>)> {
         let old = old_info.map(|p| &p.config);
@@ -954,8 +966,8 @@ impl<'a> PeerDiff<'a> {
     }
 }
 
-impl From<&Peer> for PeerConfigBuilder {
-    fn from(peer: &Peer) -> Self {
+impl From<&PeerContents> for PeerConfigBuilder {
+    fn from(peer: &PeerContents) -> Self {
         PeerDiff::new(None, Some(peer), None)
             .expect("No Err on explicitly set peer data")
             .expect("None -> Some(peer) will always create a PeerDiff")
@@ -973,12 +985,15 @@ impl From<PeerDiff<'_>> for PeerConfigBuilder {
 
 /// This model is sent as a response to the /state endpoint, and is meant
 /// to include all the data a client needs to update its WireGuard interface.
+///
+/// The API of TLS sessions sends the peers without IDs. A state that a server sends in plain HTTP,
+/// as [`LegacyState`], deserializes into this form too, without the IDs.
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     /// This list will be only the peers visible to the user requesting this
     /// information, not including disabled peers or peers from other CIDRs
     /// that the user's CIDR is not authorized to communicate with.
-    pub peers: Vec<Peer>,
+    pub peers: Vec<PeerContents>,
 
     /// At the moment, this is all CIDRs, regardless of whether the peer is
     /// eligible to communicate with them or not.
@@ -1008,6 +1023,14 @@ impl<'de> Deserialize<'de> for State {
             invalid_peer_keys,
         })
     }
+}
+
+/// The state that the API of plain-HTTP sessions sends, in which each peer has the ID that
+/// clients that predate TLS expect.
+#[derive(Debug, Clone, Serialize)]
+pub struct LegacyState {
+    pub peers: Vec<Peer>,
+    pub cidrs: Vec<Cidr>,
 }
 
 /// This model is sent as a response to the /capabilities endpoint.
@@ -1199,21 +1222,18 @@ mod tests {
     fn test_peer_no_diff() {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let peer = Peer {
-            id: 1,
-            contents: PeerContents {
-                name: "peer1".parse().unwrap(),
-                ip,
-                cidr_id: 1,
-                public_key: PUBKEY.to_owned(),
-                endpoint: None,
-                persistent_keepalive_interval: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+        let peer = PeerContents {
+            name: "peer1".parse().unwrap(),
+            ip,
+            cidr_id: 1,
+            public_key: PUBKEY.to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1234,21 +1254,18 @@ mod tests {
     fn test_peer_diff() {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let peer = Peer {
-            id: 1,
-            contents: PeerContents {
-                name: "peer1".parse().unwrap(),
-                ip,
-                cidr_id: 1,
-                public_key: PUBKEY.to_owned(),
-                endpoint: None,
-                persistent_keepalive_interval: Some(15),
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+        let peer = PeerContents {
+            name: "peer1".parse().unwrap(),
+            ip,
+            cidr_id: 1,
+            public_key: PUBKEY.to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: Some(15),
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1269,21 +1286,18 @@ mod tests {
     fn test_peer_diff_handshake_time() {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let peer = Peer {
-            id: 1,
-            contents: PeerContents {
-                name: "peer1".parse().unwrap(),
-                ip,
-                cidr_id: 1,
-                public_key: PUBKEY.to_owned(),
-                endpoint: Some("1.1.1.1:1111".parse().unwrap()),
-                persistent_keepalive_interval: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+        let peer = PeerContents {
+            name: "peer1".parse().unwrap(),
+            ip,
+            cidr_id: 1,
+            public_key: PUBKEY.to_owned(),
+            endpoint: Some("1.1.1.1:1111".parse().unwrap()),
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1314,21 +1328,18 @@ mod tests {
     #[test]
     fn test_peer_diff_endpoint_override() {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
-        let peer = Peer {
-            id: 1,
-            contents: PeerContents {
-                name: "peer1".parse().unwrap(),
-                ip: "10.0.0.1".parse().unwrap(),
-                cidr_id: 1,
-                public_key: PUBKEY.to_owned(),
-                endpoint: Some("1.1.1.1:1111".parse().unwrap()),
-                persistent_keepalive_interval: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+        let peer = PeerContents {
+            name: "peer1".parse().unwrap(),
+            ip: "10.0.0.1".parse().unwrap(),
+            cidr_id: 1,
+            public_key: PUBKEY.to_owned(),
+            endpoint: Some("1.1.1.1:1111".parse().unwrap()),
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         };
         let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();
 

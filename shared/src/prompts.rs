@@ -1,8 +1,8 @@
 use crate::{
     interface_config::InterfaceInfo, peer::NewPeerInfo, AddCidrOpts, AddDeleteAssociationOpts,
     AddPeerOpts, Association, Cidr, CidrContents, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
-    Endpoint, Error, Hostname, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, Peer,
-    PeerContents, RenameCidrOpts, RenamePeerOpts,
+    Endpoint, Error, Hostname, IpNetExt, ListenPortOpts, OverridePeerEndpointOpts, PeerContents,
+    RenameCidrOpts, RenamePeerOpts,
 };
 use anyhow::{anyhow, bail};
 use colored::*;
@@ -152,11 +152,15 @@ pub fn rename_cidr(
 }
 
 /// Bring up a prompt to delete a CIDR. Returns the peer request.
-pub fn delete_cidr(cidrs: &[Cidr], peers: &[Peer], request: &DeleteCidrOpts) -> Result<i64, Error> {
+pub fn delete_cidr(
+    cidrs: &[Cidr],
+    peers: &[PeerContents],
+    request: &DeleteCidrOpts,
+) -> Result<i64, Error> {
     let eligible_cidrs: Vec<_> = cidrs
         .iter()
         .filter(|cidr| {
-            !peers.iter().any(|peer| peer.contents.cidr_id == cidr.id) &&
+            !peers.iter().any(|peer| peer.cidr_id == cidr.id) &&
             !cidrs.iter().any(
                 |cidr2| matches!(cidr2.contents.parent, Some(parent_id) if parent_id == cidr.id)
             )
@@ -271,7 +275,7 @@ pub fn add_association<'a>(
     )
 }
 
-pub fn print_invitation_info(peer: &Peer, target_file_name: &str) {
+pub fn print_invitation_info(peer: &PeerContents, target_file_name: &str) {
     println!(
         "\nPeer \"{}\" added\n\
          Peer invitation file written to {}\n\
@@ -301,7 +305,7 @@ pub fn delete_association<'a>(
 /// Bring up a prompt to gather information about a new peer. Returns [`NewPeerInfo`] and a path
 /// where the invite file should be saved.
 pub fn gather_new_peer_info(
-    peers: &[Peer],
+    peers: &[PeerContents],
     cidr_tree: &CidrTree,
     args: &AddPeerOpts,
 ) -> Result<Option<(NewPeerInfo, String)>, Error> {
@@ -382,7 +386,7 @@ pub fn gather_new_peer_info(
 
 /// Bring up a prompt to rename an existing peer. Returns the peer request.
 pub fn rename_peer(
-    peers: &[Peer],
+    peers: &[PeerContents],
     args: &RenamePeerOpts,
 ) -> Result<Option<(PeerContents, Hostname)>, Error> {
     let eligible_peers = peers
@@ -413,7 +417,7 @@ pub fn rename_peer(
     };
 
     let mut new_peer = old_peer;
-    new_peer.contents.name = new_name.clone();
+    new_peer.name = new_name.clone();
 
     Ok(
         if args.yes
@@ -423,7 +427,7 @@ pub fn rename_peer(
                 new_name.yellow()
             ))?
         {
-            Some((new_peer.contents, old_name))
+            Some((new_peer, old_name))
         } else {
             None
         },
@@ -433,10 +437,10 @@ pub fn rename_peer(
 /// Presents a selection and confirmation of eligible peers for either disabling or enabling,
 /// and returns back the ID of the selected peer.
 pub fn enable_or_disable_peer(
-    peers: &[Peer],
+    peers: &[PeerContents],
     args: &EnableDisablePeerOpts,
     enable: bool,
-) -> Result<Option<Peer>, Error> {
+) -> Result<Option<PeerContents>, Error> {
     let enabled_peers: Vec<_> = peers
         .iter()
         .filter(|peer| enable && peer.is_disabled || !enable && !peer.is_disabled)
@@ -568,10 +572,10 @@ pub fn input_external_endpoint(
 /// Bring up a prompt to override the endpoint for an existing peer.
 /// Returns the peer and desired endpoint.
 pub fn override_peer_endpoint_prompt(
-    peers: &[Peer],
+    peers: &[PeerContents],
     peer_endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
     args: &OverridePeerEndpointOpts,
-) -> Result<Option<(Peer, Option<Endpoint>)>, Error> {
+) -> Result<Option<(PeerContents, Option<Endpoint>)>, Error> {
     let eligible_peers = peers
         .iter()
         .filter(|p| &*p.name != "innernet-server")

@@ -65,11 +65,39 @@ pub const ADMIN_CIDR_ID: i64 = 3;
 pub const DEVELOPER_CIDR_ID: i64 = 4;
 pub const USER_CIDR_ID: i64 = 5;
 
+// The IDs by which the API of plain-HTTP sessions names the peers, their positions in the order of
+// their IPs, as [`DatabasePeer::plain_http_ids`] numbers them. The database stores no such ID:
+// [`peer`] finds a peer by the IP of its ID.
+pub const SERVER_PEER_ID: i64 = 1;
 pub const ADMIN_PEER_ID: i64 = 2;
 pub const DEVELOPER1_PEER_ID: i64 = 3;
 pub const DEVELOPER2_PEER_ID: i64 = 4;
 pub const USER1_PEER_ID: i64 = 5;
 pub const USER2_PEER_ID: i64 = 6;
+
+/// The IDs of the peers of the test database.
+const PEER_IDS: [i64; 6] = [
+    SERVER_PEER_ID,
+    ADMIN_PEER_ID,
+    DEVELOPER1_PEER_ID,
+    DEVELOPER2_PEER_ID,
+    USER1_PEER_ID,
+    USER2_PEER_ID,
+];
+
+/// The peer of the test database with the ID `id`, one of the `*_PEER_ID`s, found by its IP.
+pub fn peer(conn: &rusqlite::Connection, id: i64) -> DatabasePeer {
+    let ip = match id {
+        SERVER_PEER_ID => SERVER_CIDR.split_once('/').unwrap().0,
+        ADMIN_PEER_ID => ADMIN_PEER_IP,
+        DEVELOPER1_PEER_ID => DEVELOPER1_PEER_IP,
+        DEVELOPER2_PEER_ID => DEVELOPER2_PEER_IP,
+        USER1_PEER_ID => USER1_PEER_IP,
+        USER2_PEER_ID => USER2_PEER_IP,
+        _ => panic!("the test database has no peer with the ID {id}"),
+    };
+    DatabasePeer::get_from_ip(conn, ip.parse().unwrap()).unwrap()
+}
 
 pub struct Server {
     pub db: Db,
@@ -114,10 +142,7 @@ impl Server {
             &server_key,
         )?;
         assert_eq!(ADMIN_CIDR_ID, create_cidr(&db, "admin", ADMIN_CIDR)?.id);
-        assert_eq!(
-            ADMIN_PEER_ID,
-            DatabasePeer::create(&db, admin_peer_contents("admin", ADMIN_PEER_IP)?)?.id
-        );
+        DatabasePeer::create(&db, admin_peer_contents("admin", ADMIN_PEER_IP)?)?;
         assert_eq!(
             DEVELOPER_CIDR_ID,
             create_cidr(&db, "developer", DEVELOPER_CIDR)?.id
@@ -125,26 +150,18 @@ impl Server {
 
         let developer_1 = developer_peer_contents("developer1", DEVELOPER1_PEER_IP)?;
         let developer_1_public_key = developer_1.public_key.clone();
-        assert_eq!(
-            DEVELOPER1_PEER_ID,
-            DatabasePeer::create(&db, developer_1,)?.id
-        );
+        DatabasePeer::create(&db, developer_1)?;
 
         let developer_2 = developer_peer_contents("developer2", DEVELOPER2_PEER_IP)?;
         let developer_2_public_key = developer_2.public_key.clone();
-        assert_eq!(
-            DEVELOPER2_PEER_ID,
-            DatabasePeer::create(&db, developer_2)?.id
-        );
+        DatabasePeer::create(&db, developer_2)?;
         assert_eq!(USER_CIDR_ID, create_cidr(&db, "user", USER_CIDR)?.id);
-        assert_eq!(
-            USER1_PEER_ID,
-            DatabasePeer::create(&db, user_peer_contents("user1", USER1_PEER_IP)?)?.id
-        );
-        assert_eq!(
-            USER2_PEER_ID,
-            DatabasePeer::create(&db, user_peer_contents("user2", USER2_PEER_IP)?)?.id
-        );
+        DatabasePeer::create(&db, user_peer_contents("user1", USER1_PEER_IP)?)?;
+        DatabasePeer::create(&db, user_peer_contents("user2", USER2_PEER_IP)?)?;
+        let ids = DatabasePeer::plain_http_ids(&db)?;
+        for id in PEER_IDS {
+            assert_eq!(ids[&peer(&db, id).public_key], id);
+        }
 
         let db = Arc::new(Mutex::new(db));
 
@@ -170,12 +187,18 @@ impl Server {
         })
     }
 
-    /// Makes the peer `id` one that the server created before it spoke TLS, which may still use
-    /// plain HTTP until it first connects over TLS.
+    /// Makes the peer with the ID `id` one that the server created before it spoke TLS, which
+    /// may still use plain HTTP until it first connects over TLS.
     pub fn predate_tls(&self, id: i64) {
-        let store = self.db.lock();
-        let key = Key::from_base64(&DatabasePeer::get(&store, id).unwrap().public_key).unwrap();
-        store
+        let key = peer(&self.db.lock(), id).inner.public_key;
+        self.predate_tls_key(&key);
+    }
+
+    /// Makes the peer with the public key `key` one that the server created before it spoke TLS.
+    pub fn predate_tls_key(&self, key: &str) {
+        let key = Key::from_base64(key).unwrap();
+        self.db
+            .lock()
             .execute("UPDATE peers SET tls = 0 WHERE public_key = ?1", [key.0])
             .unwrap();
     }

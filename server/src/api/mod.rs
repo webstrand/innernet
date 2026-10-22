@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use crate::Session;
-use innernet_shared::{Endpoint, Peer};
+use innernet_shared::{Endpoint, PeerContents};
 
 pub mod admin;
 pub mod user;
@@ -15,15 +15,18 @@ pub mod user;
 ///     endpoint or (b) add it to the list of NAT candidates, if an override endpoint is specified.
 ///     Note that NAT traversal does not always work e.g. if the peer is behind double NAT or
 ///     address/port restricted cone NAT.
-pub fn inject_endpoints<'a>(session: &Session, peers: impl IntoIterator<Item = &'a mut Peer>) {
+pub fn inject_endpoints<'a>(
+    session: &Session,
+    peers: impl IntoIterator<Item = &'a mut PeerContents>,
+) {
     for peer in peers {
         let endpoints = session.context.endpoints.read();
         let wg_endpoint = endpoints.get(&peer.public_key);
 
-        match &mut peer.contents.endpoint {
+        match &mut peer.endpoint {
             None => {
                 // 2a. Set the peer endpoint to the wireguard endpoint.
-                peer.contents.endpoint = wg_endpoint.map(|e| e.to_owned().into())
+                peer.endpoint = wg_endpoint.map(|e| e.to_owned().into())
             },
             Some(peer_endpoint) => {
                 if peer_endpoint.is_host_unspecified() {
@@ -34,7 +37,7 @@ pub fn inject_endpoints<'a>(session: &Session, peers: impl IntoIterator<Item = &
                             SocketAddr::new(wg_endpoint.ip(), peer_endpoint.port()).into();
                     } else {
                         // There is no way to complete the peer endpoint, unset it.
-                        peer.contents.endpoint = None;
+                        peer.endpoint = None;
                     }
                 }
             },
@@ -45,7 +48,7 @@ pub fn inject_endpoints<'a>(session: &Session, peers: impl IntoIterator<Item = &
             // either in the peer endpoint or in the peer candidates.
             let wg_endpoint: Endpoint = wg_endpoint.to_owned().into();
 
-            if peer.contents.endpoint.as_ref() != Some(&wg_endpoint)
+            if peer.endpoint.as_ref() != Some(&wg_endpoint)
                 && !peer.candidates.contains(&wg_endpoint)
             {
                 peer.candidates.push(wg_endpoint);

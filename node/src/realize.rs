@@ -10,7 +10,7 @@ use crate::{
     snapshot::Snapshot,
 };
 use innernet_shared::{
-    interface_config::DnsInfo, wg::DeviceExt as _, Endpoint, Error, Peer, PeerChange,
+    interface_config::DnsInfo, wg::DeviceExt as _, Endpoint, Error, PeerChange, PeerContents,
 };
 use std::{
     collections::BTreeMap,
@@ -25,7 +25,7 @@ pub struct Realized {
     /// Whether the tunnel held the peer before.
     pub existed: bool,
     /// The peer as the tunnel now holds it, or `None` if it was removed.
-    pub new: Option<Peer>,
+    pub new: Option<PeerContents>,
     pub changes: Vec<PeerChange>,
 }
 

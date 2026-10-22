@@ -92,11 +92,18 @@ impl<'a> RestClient<'a> {
         self.http("GET", "/admin/cidrs").await
     }
 
-    pub async fn create_peer(&self, peer_contents: &PeerContents) -> Result<Peer, RestError> {
+    /// Creates a peer, and returns it as the server created it. A server in plain HTTP returns the
+    /// peer with its ID, which is left out.
+    pub async fn create_peer(
+        &self,
+        peer_contents: &PeerContents,
+    ) -> Result<PeerContents, RestError> {
         self.http_form("POST", "/admin/peers", peer_contents).await
     }
 
-    pub async fn get_peers(&self) -> Result<Vec<Peer>, RestError> {
+    /// Lists every peer of the network. A server in plain HTTP lists the peers with their IDs,
+    /// which are left out.
+    pub async fn get_peers(&self) -> Result<Vec<PeerContents>, RestError> {
         self.http("GET", "/admin/peers").await
     }
 
@@ -126,7 +133,7 @@ impl<'a> RestClient<'a> {
     /// [`RestError::PeerChanged`]. A peer that the server does not find by its key, since it has
     /// been deleted or its key has changed, as a redeemed invitation's does, is refused as
     /// [`RestError::NoSuchPeer`].
-    pub async fn get_tagged_peer(&self, listed: &Peer) -> Result<TaggedPeer, RestError> {
+    pub async fn get_tagged_peer(&self, listed: &PeerContents) -> Result<TaggedPeer, RestError> {
         let path = format!("/admin/peers/{}", listed.api_path_segment());
         let tagged: TaggedPeer = self
             .http("GET", &path)
@@ -138,14 +145,30 @@ impl<'a> RestClient<'a> {
         Ok(tagged)
     }
 
+    /// The ID by which a server in plain HTTP names the peer `listed`, as long as the peer is
+    /// still as it was listed, but for its endpoint and candidates. The client keeps no IDs, so it
+    /// lists the peers again, and takes the ID of the peer with the public key of `listed`. A peer
+    /// that has changed since it was listed, or is gone, is refused as
+    /// [`RestError::PeerChanged`].
+    async fn get_legacy_id(&self, listed: &PeerContents) -> Result<i64, RestError> {
+        let peers: Vec<Peer> = self.http("GET", "/admin/peers").await?;
+        peers
+            .iter()
+            .find(|peer| peer.public_key == listed.public_key)
+            .filter(|peer| same_but_endpoints(&peer.contents, listed))
+            .map(|peer| peer.id)
+            .ok_or(RestError::PeerChanged)
+    }
+
     /// Applies an admin's changes to the peer `listed`, as it was listed: its name, its admin
-    /// role and whether it is disabled are set to those of `contents`. In the API of TLS
-    /// sessions, a peer that has changed since it was listed is refused as
-    /// [`RestError::PeerChanged`], and a peer that the server does not find by its key as
-    /// [`RestError::NoSuchPeer`]. A server in plain HTTP names the peer by the ID of the listing.
+    /// role and whether it is disabled are set to those of `contents`. A peer that has changed
+    /// since it was listed is refused as [`RestError::PeerChanged`]: in the API of TLS sessions,
+    /// the server refuses it, and with a server in plain HTTP, which can't, the client refuses
+    /// it before the change, as far as it can tell. In the API of TLS sessions, a peer that the
+    /// server does not find by its key is refused as [`RestError::NoSuchPeer`].
     pub async fn update_peer(
         &self,
-        listed: &Peer,
+        listed: &PeerContents,
         contents: &PeerContents,
     ) -> Result<(), RestError> {
         match self.admin_api().await? {
@@ -157,7 +180,8 @@ impl<'a> RestClient<'a> {
                     .map_err(RestError::peer_refusal)
             },
             AdminApi::Legacy => {
-                self.http_form("PUT", &format!("/admin/peers/{}", listed.id), contents)
+                let id = self.get_legacy_id(listed).await?;
+                self.http_form("PUT", &format!("/admin/peers/{id}"), contents)
                     .await
             },
         }
@@ -313,12 +337,12 @@ impl<'a> RestClient<'a> {
 }
 
 /// Whether the peers `a` and `b` are the same, but for their endpoints and candidates, which the
-/// peer reports on its own, and for their IDs, which a server numbers anew in each response.
-fn same_but_endpoints(a: &Peer, b: &Peer) -> bool {
-    let without_endpoints = |peer: &Peer| PeerContents {
+/// peer reports on its own.
+fn same_but_endpoints(a: &PeerContents, b: &PeerContents) -> bool {
+    let without_endpoints = |peer: &PeerContents| PeerContents {
         endpoint: None,
         candidates: vec![],
-        ..peer.contents.clone()
+        ..peer.clone()
     };
     without_endpoints(a) == without_endpoints(b)
 }
@@ -522,11 +546,19 @@ mod tests {
         connections: usize,
         response: &'static str,
     ) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
+        plain_http_server_answering(vec![response.to_string(); connections])
+    }
+
+    /// Answers each connection in plain HTTP with the next of `responses`, like a server that
+    /// predates TLS, and returns the request line of each request, or [`TLS_HANDSHAKE`].
+    fn plain_http_server_answering(
+        responses: Vec<String>,
+    ) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let mut requests = vec![];
-            for stream in listener.incoming().take(connections) {
+            for (response, stream) in responses.into_iter().zip(listener.incoming()) {
                 let mut stream = stream.unwrap();
                 let mut buffer = [0u8; 4096];
                 let read = stream.read(&mut buffer).unwrap();
@@ -612,32 +644,45 @@ mod tests {
 
     const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
 
+    /// [`NO_CONTENT`], for a server that closes each connection after its answer.
+    const NO_CONTENT_CLOSE: &str =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
     /// A peer whose key, in standard base64, holds both '+' and '/'.
-    fn listed_peer() -> Peer {
+    fn listed_peer() -> PeerContents {
         let mut bytes = [0u8; 32];
         for chunk in bytes.chunks_mut(3) {
             chunk.copy_from_slice(&[0xfb, 0xff, 0xbf][..chunk.len()]);
         }
-        Peer {
-            id: 7,
-            contents: PeerContents {
-                name: "peer".parse().unwrap(),
-                ip: "10.0.0.7".parse().unwrap(),
-                cidr_id: 1,
-                public_key: wireguard_control::Key(bytes).to_base64(),
-                endpoint: None,
-                persistent_keepalive_interval: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+        PeerContents {
+            name: "peer".parse().unwrap(),
+            ip: "10.0.0.7".parse().unwrap(),
+            cidr_id: 1,
+            public_key: wireguard_control::Key(bytes).to_base64(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         }
     }
 
+    /// The answer of a server in plain HTTP to a listing of `peers`, each with the ID 7.
+    fn legacy_list_response(peers: &[PeerContents]) -> String {
+        let peers: Vec<_> = peers
+            .iter()
+            .map(|contents| Peer {
+                id: 7,
+                contents: contents.clone(),
+            })
+            .collect();
+        json_response("200 OK", &serde_json::to_string(&peers).unwrap())
+    }
+
     /// The server's answer to a read of `peer` with the tag `tag`.
-    fn tagged_response(peer: &Peer, tag: &str) -> String {
+    fn tagged_response(peer: &PeerContents, tag: &str) -> String {
         let tagged = TaggedPeer {
             peer: peer.clone(),
             tag: tag.into(),
@@ -649,14 +694,10 @@ mod tests {
     async fn test_updates_peers_by_key_over_tls() {
         let server_key = KeyPair::generate();
         let peer = listed_peer();
-        // The server reports the endpoint that it observes, which the tag leaves out, and numbers
-        // the peers anew in each response.
-        let observed = Peer {
-            id: 8,
-            contents: PeerContents {
-                endpoint: Some("198.51.100.1:51820".parse().unwrap()),
-                ..peer.contents.clone()
-            },
+        // The server reports the endpoint that it observes, which the tag leaves out.
+        let observed = PeerContents {
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            ..peer.clone()
         };
         let (addr, requests) = tls_server_recording(
             &server_key,
@@ -673,7 +714,7 @@ mod tests {
         assert_eq!(client.admin_api().await.unwrap(), AdminApi::ByKey);
         let renamed = PeerContents {
             name: "renamed".parse().unwrap(),
-            ..peer.contents.clone()
+            ..peer.clone()
         };
         client.update_peer(&peer, &renamed).await.unwrap();
         assert!(requests
@@ -702,11 +743,8 @@ mod tests {
     async fn test_refuses_peers_changed_since_listed() {
         let server_key = KeyPair::generate();
         let peer = listed_peer();
-        let promoted = Peer {
-            contents: PeerContents {
-                is_admin: true,
-                ..peer.contents.clone()
-            },
+        let promoted = PeerContents {
+            is_admin: true,
             ..peer.clone()
         };
         let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
@@ -730,11 +768,11 @@ mod tests {
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, true).unwrap();
         for _ in 0..2 {
-            let error = client.update_peer(&peer, &peer.contents).await.unwrap_err();
+            let error = client.update_peer(&peer, &peer).await.unwrap_err();
             assert!(matches!(error, RestError::PeerChanged), "{error:?}");
         }
         for _ in 0..2 {
-            let error = client.update_peer(&peer, &peer.contents).await.unwrap_err();
+            let error = client.update_peer(&peer, &peer).await.unwrap_err();
             assert!(matches!(error, RestError::NoSuchPeer), "{error:?}");
         }
         let methods: Vec<_> = requests
@@ -746,23 +784,65 @@ mod tests {
 
     #[tokio::test]
     async fn test_updates_peers_by_id_in_plain_http() {
+        // The server observes an endpoint for the peer, which it didn't when the peer was listed.
+        let peer = listed_peer();
+        let observed = PeerContents {
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            ..peer.clone()
+        };
         let server_key = KeyPair::generate();
-        let (addr, server) = plain_http_server_recording(
-            3,
-            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let (addr, server) = plain_http_server_answering(vec![
+            NO_CONTENT_CLOSE.into(),
+            NO_CONTENT_CLOSE.into(),
+            legacy_list_response(&[observed]),
+            NO_CONTENT_CLOSE.into(),
+        ]);
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
 
+        // The client lists the peers again for the ID of the peer, and changes it by its ID.
         assert_eq!(client.admin_api().await.unwrap(), AdminApi::Legacy);
-        let peer = listed_peer();
-        client.update_peer(&peer, &peer.contents).await.unwrap();
+        client.update_peer(&peer, &peer).await.unwrap();
         assert_eq!(
             server.join().unwrap(),
             [
                 TLS_HANDSHAKE,
                 "GET /v1/user/capabilities HTTP/1.1",
+                "GET /v1/admin/peers HTTP/1.1",
                 "PUT /v1/admin/peers/7 HTTP/1.1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refuses_peers_changed_since_listed_in_plain_http() {
+        // A peer that has changed since it was listed, or that is gone, is refused, and nothing
+        // is changed.
+        let peer = listed_peer();
+        let promoted = PeerContents {
+            is_admin: true,
+            ..peer.clone()
+        };
+        let server_key = KeyPair::generate();
+        let (addr, server) = plain_http_server_answering(vec![
+            NO_CONTENT_CLOSE.into(),
+            NO_CONTENT_CLOSE.into(),
+            legacy_list_response(&[promoted]),
+            legacy_list_response(&[]),
+        ]);
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, false).unwrap();
+        for _ in 0..2 {
+            let error = client.update_peer(&peer, &peer).await.unwrap_err();
+            assert!(matches!(error, RestError::PeerChanged), "{error:?}");
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                TLS_HANDSHAKE,
+                "GET /v1/user/capabilities HTTP/1.1",
+                "GET /v1/admin/peers HTTP/1.1",
+                "GET /v1/admin/peers HTTP/1.1",
             ]
         );
     }

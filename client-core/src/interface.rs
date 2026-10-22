@@ -16,7 +16,7 @@ use innernet_node::{
     store,
 };
 use innernet_shared::{
-    interface_config::FEATURE_TLS, wg, Endpoint, Peer, PeerChange, RedeemContents, State,
+    interface_config::FEATURE_TLS, wg, Endpoint, PeerChange, PeerContents, RedeemContents, State,
     REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
@@ -419,7 +419,7 @@ impl ChangeAction {
     }
 }
 
-fn print_peer_diff(peers: &[Peer], diff: &Realized) {
+fn print_peer_diff(peers: &[PeerContents], diff: &Realized) {
     let public_key = &diff.public_key;
 
     let change_action = match (diff.existed, &diff.new) {

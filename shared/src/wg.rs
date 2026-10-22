@@ -1,4 +1,4 @@
-use crate::{Endpoint, Error, IoErrorContext, NetworkOpts, Peer, PeerDiff};
+use crate::{Endpoint, Error, IoErrorContext, NetworkOpts, PeerContents, PeerDiff};
 use ipnet::IpNet;
 use std::{
     collections::BTreeMap,
@@ -189,7 +189,7 @@ pub trait DeviceExt {
     /// replaced with its override.
     fn diff<'a>(
         &'a self,
-        peers: &'a [Peer],
+        peers: &'a [PeerContents],
         endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
     ) -> Vec<PeerDiff<'a>>;
 
@@ -200,7 +200,7 @@ pub trait DeviceExt {
 impl DeviceExt for Device {
     fn diff<'a>(
         &'a self,
-        peers: &'a [Peer],
+        peers: &'a [PeerContents],
         endpoint_overrides: &BTreeMap<IpAddr, Endpoint>,
     ) -> Vec<PeerDiff<'a>> {
         let interface_public_key = self
@@ -267,26 +267,22 @@ impl PeerInfoExt for PeerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PeerContents;
 
     const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
 
-    fn peer(ip: IpAddr) -> Peer {
-        Peer {
-            id: 1,
-            contents: PeerContents {
-                name: "peer1".parse().unwrap(),
-                ip,
-                cidr_id: 1,
-                public_key: PUBKEY.to_owned(),
-                endpoint: None,
-                persistent_keepalive_interval: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                invite_expires: None,
-                candidates: vec![],
-            },
+    fn peer(ip: IpAddr) -> PeerContents {
+        PeerContents {
+            name: "peer1".parse().unwrap(),
+            ip,
+            cidr_id: 1,
+            public_key: PUBKEY.to_owned(),
+            endpoint: None,
+            persistent_keepalive_interval: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            invite_expires: None,
+            candidates: vec![],
         }
     }
 
@@ -322,7 +318,7 @@ mod tests {
 
         // A disabled peer is removed from the device.
         let mut disabled = peer(ip);
-        disabled.contents.is_disabled = true;
+        disabled.is_disabled = true;
         let peers = [disabled];
         let diffs = device.diff(&peers, &BTreeMap::new());
         assert_eq!(diffs.len(), 1);

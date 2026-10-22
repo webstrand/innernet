@@ -21,8 +21,8 @@ use innernet_shared::{
     interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
     AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
     Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts,
-    NatOpts, NetworkOpts, OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts,
-    RenamePeerOpts, ServerCapabilities, WrappedIoError,
+    NatOpts, NetworkOpts, OverrideEndpointOpts, OverridePeerEndpointOpts, PeerContents,
+    RenameCidrOpts, RenamePeerOpts, ServerCapabilities, WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -37,7 +37,7 @@ use wireguard_control::{Device, InterfaceName, PeerInfo};
 mod util;
 
 struct PeerState<'a> {
-    peer: &'a Peer,
+    peer: &'a PeerContents,
     info: Option<&'a PeerInfo>,
 }
 
@@ -808,7 +808,7 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
             for peer_state in peer_states {
                 let endpoint_has_local_override = interface_config
                     .peer_endpoint_overrides()
-                    .contains_key(&peer_state.peer.contents.ip);
+                    .contains_key(&peer_state.peer.ip);
                 print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
             }
         }
@@ -839,7 +839,7 @@ fn print_tree(
     for peer in peers.iter().filter(|p| p.peer.cidr_id == cidr.id) {
         let endpoint_has_local_override = interface_config
             .peer_endpoint_overrides()
-            .contains_key(&peer.peer.contents.ip);
+            .contains_key(&peer.peer.ip);
         print_peer(peer, true, level, verbose, endpoint_has_local_override);
     }
 }

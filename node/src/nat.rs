@@ -11,7 +11,7 @@ use crate::realize::Realized;
 use anyhow::Error;
 use innernet_shared::{
     wg::{DeviceExt, PeerInfoExt},
-    Endpoint, Peer,
+    Endpoint, PeerContents,
 };
 use std::{collections::BTreeMap, net::IpAddr, time::Duration};
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
@@ -21,7 +21,7 @@ pub const STEP_INTERVAL: Duration = Duration::from_secs(5);
 pub struct NatTraverse {
     interface: InterfaceName,
     backend: Backend,
-    remaining: Vec<Peer>,
+    remaining: Vec<PeerContents>,
 }
 
 impl NatTraverse {

@@ -30,11 +30,11 @@ pub struct DataStore {
     store: Store,
 }
 
-/// Server IDs aren't stored, so every peer read from the data store has this ID, and so does the
-/// CIDR of a peer outside every CIDR. The CIDRs are numbered from 1 as they are read.
+/// Server IDs aren't stored, so the CIDR of a peer outside every CIDR has this ID. The CIDRs are
+/// numbered from 1 as they are read.
 const UNKNOWN_ID: i64 = 0;
 
-/// The data store of the JSON file of earlier versions.
+/// The data store of the JSON file of earlier versions, whose peers have the IDs of the server.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "version")]
 enum LegacyContents {
@@ -171,9 +171,12 @@ impl DataStore {
     /// stays pinned: the coordinator leaves disabled peers out of the state. A dropped peer was
     /// reported, so the stored peer with its key keeps its record unchanged, as does one whose
     /// record failed to deserialize.
-    pub fn update<'a>(&mut self, state: &'a State) -> Result<Vec<(&'a Peer, Error)>, Error> {
+    pub fn update<'a>(
+        &mut self,
+        state: &'a State,
+    ) -> Result<Vec<(&'a PeerContents, Error)>, Error> {
         let tx = self.store.transaction()?;
-        let reported: Vec<&PeerContents> = state.peers.iter().map(|peer| &peer.contents).collect();
+        let reported: Vec<&PeerContents> = state.peers.iter().collect();
         let decided = tx.scope().accept(&reported)?;
         let dropped = state
             .peers
@@ -211,7 +214,10 @@ impl DataStore {
     }
 
     #[cfg(test)]
-    fn update_peers<'a>(&mut self, new_peers: &'a [Peer]) -> Vec<(&'a Peer, Error)> {
+    fn update_peers<'a>(
+        &mut self,
+        new_peers: &'a [PeerContents],
+    ) -> Vec<(&'a PeerContents, Error)> {
         let state = State {
             peers: new_peers.to_vec(),
             cidrs: self.cidrs().unwrap(),
@@ -230,17 +236,14 @@ impl DataStore {
     }
 
     /// The peers, ordered by IP, each with the smallest CIDR that holds its IP as its CIDR.
-    pub fn peers(&self) -> Result<Vec<Peer>, Error> {
+    pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
         let cidrs = self.cidrs()?;
         Ok(store::load_peers(&self.store)?
             .into_iter()
-            .map(|mut contents| {
-                contents.cidr_id = smallest_containing(&cidrs, |cidr| cidr.contains(&contents.ip))
+            .map(|mut peer| {
+                peer.cidr_id = smallest_containing(&cidrs, |cidr| cidr.contains(&peer.ip))
                     .unwrap_or(UNKNOWN_ID);
-                Peer {
-                    id: UNKNOWN_ID,
-                    contents,
-                }
+                peer
             })
             .collect())
     }
@@ -395,22 +398,19 @@ mod tests {
     use once_cell::sync::Lazy;
     use rusqlite::{config::DbConfig, Connection};
     use std::time::{Duration, UNIX_EPOCH};
-    static BASE_PEERS: Lazy<Vec<Peer>> = Lazy::new(|| {
-        vec![Peer {
-            id: 0,
-            contents: PeerContents {
-                name: "blah".parse().unwrap(),
-                ip: "10.0.0.1".parse().unwrap(),
-                cidr_id: 1,
-                public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
-                endpoint: None,
-                is_admin: false,
-                is_disabled: false,
-                is_redeemed: true,
-                persistent_keepalive_interval: None,
-                invite_expires: None,
-                candidates: vec![],
-            },
+    static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
+        vec![PeerContents {
+            name: "blah".parse().unwrap(),
+            ip: "10.0.0.1".parse().unwrap(),
+            cidr_id: 1,
+            public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
+            endpoint: None,
+            is_admin: false,
+            is_disabled: false,
+            is_redeemed: true,
+            persistent_keepalive_interval: None,
+            invite_expires: None,
+            candidates: vec![],
         }]
     });
     static BASE_CIDRS: Lazy<Vec<Cidr>> = Lazy::new(|| {
@@ -438,8 +438,17 @@ mod tests {
         DataStore::open_with_paths(&db_path(dir), &legacy_path(dir), *NETWORK, create)
     }
 
-    /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it.
-    fn write_legacy(dir: &Path, peers: &[Peer], cidrs: &[Cidr]) {
+    /// Writes a legacy data store of `peers` and `cidrs`, as earlier versions wrote it, with the
+    /// peers numbered from 1.
+    fn write_legacy(dir: &Path, peers: &[PeerContents], cidrs: &[Cidr]) {
+        let peers: Vec<Peer> = peers
+            .iter()
+            .zip(1..)
+            .map(|(contents, id)| Peer {
+                id,
+                contents: contents.clone(),
+            })
+            .collect();
         let contents = serde_json::json!({ "version": "1", "peers": peers, "cidrs": cidrs });
         std::fs::write(
             legacy_path(dir),
@@ -464,12 +473,12 @@ mod tests {
             .unwrap();
     }
 
-    fn disabled(peers: &[Peer]) -> Vec<Peer> {
+    fn disabled(peers: &[PeerContents]) -> Vec<PeerContents> {
         peers
             .iter()
             .cloned()
             .map(|mut p| {
-                p.contents.is_disabled = true;
+                p.is_disabled = true;
                 p
             })
             .collect()
@@ -495,8 +504,7 @@ mod tests {
         assert_eq!(store.peers().unwrap(), *BASE_PEERS);
 
         let mut modified = BASE_PEERS.clone();
-        modified[0].contents.public_key =
-            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        modified[0].public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
 
         // Should NOT work, since the IP is pinned to another public key. The pinned peer is
         // disabled, since it is absent from the update.
@@ -513,17 +521,17 @@ mod tests {
         // The same public key reported at another IP is dropped from the update, and the pinned
         // peer, which was reported, keeps its record unchanged.
         let mut moved = BASE_PEERS.clone();
-        moved[0].contents.ip = "10.0.0.2".parse().unwrap();
+        moved[0].ip = "10.0.0.2".parse().unwrap();
         assert_eq!(store.update_peers(&moved).len(), 1);
         assert_eq!(store.peers().unwrap(), *BASE_PEERS);
 
         // Other changes to a pinned peer are applied in place, and new peers are added.
         let mut updated = BASE_PEERS.clone();
-        updated[0].contents.name = "renamed".parse().unwrap();
+        updated[0].name = "renamed".parse().unwrap();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.contents.name = "new".parse().unwrap();
-        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        new_peer.name = "new".parse().unwrap();
+        new_peer.ip = "10.0.0.2".parse().unwrap();
+        new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         updated.push(new_peer);
         assert!(store.update_peers(&updated).is_empty());
         assert_eq!(store.peers().unwrap(), updated);
@@ -594,9 +602,9 @@ mod tests {
         // A peer whose name isn't a valid hostname is dropped, and the other peers are kept.
         let mut invalid = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
-        new_peer.contents.name = Hostname::unchecked("peer\n10.0.0.1 example.com".into());
+        new_peer.ip = "10.0.0.2".parse().unwrap();
+        new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        new_peer.name = Hostname::unchecked("peer\n10.0.0.1 example.com".into());
         invalid.push(new_peer);
         let dropped = store.update_peers(&invalid);
         assert_eq!(dropped.len(), 1);
@@ -605,7 +613,7 @@ mod tests {
 
         // A stored peer renamed to an invalid name keeps its record, and stays enabled.
         let mut renamed = BASE_PEERS.clone();
-        renamed[0].contents.name = Hostname::unchecked("Blah".into());
+        renamed[0].name = Hostname::unchecked("Blah".into());
         assert_eq!(store.update_peers(&renamed).len(), 1);
         assert_eq!(store.peers().unwrap(), *BASE_PEERS);
     }
@@ -619,8 +627,8 @@ mod tests {
         // A new peer outside the network is dropped, and the other peers are kept.
         let mut outside = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.contents.ip = "1.1.1.1".parse().unwrap();
-        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        new_peer.ip = "1.1.1.1".parse().unwrap();
+        new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         outside.push(new_peer);
         let dropped = store.update_peers(&outside);
         assert_eq!(dropped.len(), 1);
@@ -640,8 +648,8 @@ mod tests {
         // A legacy data store with an invalid public key is refused, while a state drops the peer
         // and keeps the others.
         let mut invalid = BASE_PEERS[0].clone();
-        invalid.contents.ip = "10.0.0.2".parse().unwrap();
-        invalid.contents.public_key = "abc".to_string();
+        invalid.ip = "10.0.0.2".parse().unwrap();
+        invalid.public_key = "abc".to_string();
         let peers = [BASE_PEERS[0].clone(), invalid];
         write_legacy(dir.path(), &peers, &[]);
         assert!(open(dir.path(), false).is_err());
@@ -691,12 +699,12 @@ mod tests {
         // Of two new peers at the same IP, the first is kept and the second dropped.
         let mut same_ip = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.contents.name = "second".parse().unwrap();
-        new_peer.contents.ip = "10.0.0.2".parse().unwrap();
-        new_peer.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        new_peer.name = "second".parse().unwrap();
+        new_peer.ip = "10.0.0.2".parse().unwrap();
+        new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
-        new_peer.contents.name = "third".parse().unwrap();
-        new_peer.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        new_peer.name = "third".parse().unwrap();
+        new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
         assert_eq!(dropped.len(), 1);
@@ -706,12 +714,12 @@ mod tests {
         // Of two new peers with the same public key, the first is kept and the second dropped.
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.contents.name = "fourth".parse().unwrap();
-        new_peer.contents.ip = "10.0.0.3".parse().unwrap();
-        new_peer.contents.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
+        new_peer.name = "fourth".parse().unwrap();
+        new_peer.ip = "10.0.0.3".parse().unwrap();
+        new_peer.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
-        new_peer.contents.name = "fifth".parse().unwrap();
-        new_peer.contents.ip = "10.0.0.4".parse().unwrap();
+        new_peer.name = "fifth".parse().unwrap();
+        new_peer.ip = "10.0.0.4".parse().unwrap();
         same_public_key.push(new_peer);
         let dropped = store.update_peers(&same_public_key);
         assert_eq!(dropped.len(), 1);
@@ -724,9 +732,9 @@ mod tests {
         // A legacy data store holding two records of a peer at different IPs, or two peers at one
         // IP, is refused.
         let mut moved = BASE_PEERS[0].clone();
-        moved.contents.ip = "10.0.0.2".parse().unwrap();
+        moved.ip = "10.0.0.2".parse().unwrap();
         let mut replaced = BASE_PEERS[0].clone();
-        replaced.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        replaced.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         for conflicting in [moved, replaced] {
             let dir = tempfile::tempdir().unwrap();
             write_legacy(dir.path(), &[BASE_PEERS[0].clone(), conflicting], &[]);
@@ -746,10 +754,9 @@ mod tests {
     }
 
     /// The coordinator of [`introducing_config`], as the server reports it.
-    static COORDINATOR: Lazy<Peer> = Lazy::new(|| {
+    static COORDINATOR: Lazy<PeerContents> = Lazy::new(|| {
         let mut coordinator = BASE_PEERS[0].clone();
-        coordinator.contents.public_key =
-            "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string();
+        coordinator.public_key = "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string();
         coordinator
     });
 
@@ -810,11 +817,10 @@ mod tests {
 
         // The coordinator can't be reported at another IP, nor another key at its IP.
         let mut moved = [COORDINATOR.clone()];
-        moved[0].contents.ip = "10.0.0.3".parse().unwrap();
+        moved[0].ip = "10.0.0.3".parse().unwrap();
         assert_eq!(store.update_peers(&moved).len(), 1);
         let mut replaced = [COORDINATOR.clone()];
-        replaced[0].contents.public_key =
-            "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        replaced[0].public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         assert_eq!(store.update_peers(&replaced).len(), 1);
 
         // The server's record of the coordinator replaces the introduced one. The data store
@@ -823,7 +829,7 @@ mod tests {
             .update_peers(std::slice::from_ref(&*COORDINATOR))
             .is_empty());
         let mut expected = COORDINATOR.clone();
-        expected.contents.cidr_id = UNKNOWN_ID;
+        expected.cidr_id = UNKNOWN_ID;
         assert_eq!(store.peers().unwrap()[0], expected);
         assert_eq!(store.peers().unwrap().len(), 2);
 
@@ -833,23 +839,23 @@ mod tests {
     }
 
     /// Peers with endpoints of every shape, in a network of each family.
-    fn varied_peers() -> Vec<Peer> {
+    fn varied_peers() -> Vec<PeerContents> {
         let mut v4 = BASE_PEERS[0].clone();
-        v4.contents.endpoint = Some("203.0.113.1:51820".parse().unwrap());
-        v4.contents.candidates = vec![
+        v4.endpoint = Some("203.0.113.1:51820".parse().unwrap());
+        v4.candidates = vec![
             "192.168.1.2:51820".parse().unwrap(),
             "[2001:db8::1]:4000".parse().unwrap(),
             "peer.example.com:1".parse().unwrap(),
         ];
-        v4.contents.persistent_keepalive_interval = Some(25);
-        v4.contents.invite_expires = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        v4.contents.is_admin = true;
+        v4.persistent_keepalive_interval = Some(25);
+        v4.invite_expires = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        v4.is_admin = true;
         let mut domain = BASE_PEERS[0].clone();
-        domain.contents.name = "domain".parse().unwrap();
-        domain.contents.ip = "10.0.1.1".parse().unwrap();
-        domain.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
-        domain.contents.endpoint = Some("vpn.example.com:51820".parse().unwrap());
-        domain.contents.cidr_id = 2;
+        domain.name = "domain".parse().unwrap();
+        domain.ip = "10.0.1.1".parse().unwrap();
+        domain.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        domain.endpoint = Some("vpn.example.com:51820".parse().unwrap());
+        domain.cidr_id = 2;
         vec![v4, domain]
     }
 
@@ -897,8 +903,8 @@ mod tests {
             cidrs
         };
         let mut expected_peers = varied_peers();
-        expected_peers[0].contents.cidr_id = 2;
-        expected_peers[1].contents.cidr_id = 3;
+        expected_peers[0].cidr_id = 2;
+        expected_peers[1].cidr_id = 3;
         assert_eq!(store.cidrs().unwrap(), expected_cidrs);
         assert_eq!(store.peers().unwrap(), expected_peers);
 
@@ -912,9 +918,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let network: IpNet = "fd00::/64".parse().unwrap();
         let mut peer = BASE_PEERS[0].clone();
-        peer.contents.ip = "fd00::1".parse().unwrap();
-        peer.contents.cidr_id = UNKNOWN_ID;
-        peer.contents.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
+        peer.ip = "fd00::1".parse().unwrap();
+        peer.cidr_id = UNKNOWN_ID;
+        peer.endpoint = Some("[::ffff:203.0.113.1]:51820".parse().unwrap());
         let mut store = DataStore::open_with_paths(
             &db_path(dir.path()),
             &legacy_path(dir.path()),
@@ -931,14 +937,13 @@ mod tests {
         // A legacy data store is imported into the new database, without its server IDs, and the
         // file is left untouched.
         let dir = tempfile::tempdir().unwrap();
-        let mut legacy_peers = varied_peers();
-        legacy_peers[0].id = 7;
+        let legacy_peers = varied_peers();
         write_legacy(dir.path(), &legacy_peers, &varied_cidrs());
         let legacy = std::fs::read(legacy_path(dir.path())).unwrap();
         let mut store = open(dir.path(), false).unwrap();
         let mut expected_peers = varied_peers();
-        expected_peers[0].contents.cidr_id = 2;
-        expected_peers[1].contents.cidr_id = 3;
+        expected_peers[0].cidr_id = 2;
+        expected_peers[1].cidr_id = 3;
         assert_eq!(store.peers().unwrap(), expected_peers);
         assert_eq!(store.cidrs().unwrap().len(), 3);
 
@@ -1029,9 +1034,9 @@ mod tests {
         let mut cli = open(dir.path(), false).unwrap();
 
         let mut pinned = BASE_PEERS[0].clone();
-        pinned.contents.name = "pinned".parse().unwrap();
-        pinned.contents.ip = "10.0.0.2".parse().unwrap();
-        pinned.contents.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
+        pinned.name = "pinned".parse().unwrap();
+        pinned.ip = "10.0.0.2".parse().unwrap();
+        pinned.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         let mut with_pinned = BASE_PEERS.clone();
         with_pinned.push(pinned.clone());
         assert!(cli.update_peers(&with_pinned).is_empty());
@@ -1039,8 +1044,8 @@ mod tests {
         // The daemon's handle predates the pin, but its update still keeps another key from the
         // pinned IP, and disables the pinned peer, which its state leaves out.
         let mut impostor = pinned.clone();
-        impostor.contents.name = "impostor".parse().unwrap();
-        impostor.contents.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        impostor.name = "impostor".parse().unwrap();
+        impostor.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         let mut with_impostor = BASE_PEERS.clone();
         with_impostor.push(impostor);
         assert_eq!(daemon.update_peers(&with_impostor).len(), 1);
@@ -1061,7 +1066,7 @@ mod tests {
                     let mut store = open(dir.path(), false).unwrap();
                     for i in 0..25 {
                         let mut peers = BASE_PEERS.clone();
-                        peers[0].contents.is_admin = i % 2 == 0;
+                        peers[0].is_admin = i % 2 == 0;
                         let state = State {
                             peers,
                             cidrs: BASE_CIDRS.clone(),

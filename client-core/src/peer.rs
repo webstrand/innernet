@@ -2,7 +2,7 @@ pub use innernet_shared::peer::NewPeerInfo;
 
 use crate::{
     rest_client::{RestClient, RestError},
-    Cidr, Peer, PeerInvitation,
+    Cidr, PeerContents, PeerInvitation,
 };
 use anyhow::Result;
 use innernet_shared::{
@@ -22,16 +22,16 @@ pub enum CreatePeerError {
     RestRequest(#[from] RestError),
 }
 
-/// Create a new innernet [`Peer`] and a [`PeerInvitation`] they can use to join the network, as
+/// Create a new innernet peer and a [`PeerInvitation`] they can use to join the network, as
 /// the admin client of `interface` in `config_dir` and `data_dir`, as [`invite`] does.
 pub async fn create_peer(
     config_dir: &Path,
     data_dir: &Path,
     interface: &InterfaceName,
     existing_cidrs: &[Cidr],
-    existing_peers: &[Peer],
+    existing_peers: &[PeerContents],
     new_peer_info: NewPeerInfo,
-) -> Result<(Peer, PeerInvitation), CreatePeerError> {
+) -> Result<(PeerContents, PeerInvitation), CreatePeerError> {
     let interface_config = InterfaceConfig::from_interface(config_dir, interface)
         .map_err(CreatePeerError::InterfaceConfigAccess)?;
     let rest_client = RestClient::for_interface(&interface_config, data_dir, interface)?;
@@ -46,7 +46,7 @@ pub async fn create_peer(
     .await
 }
 
-/// Creates a new innernet [`Peer`] through `rest_client`, an admin client of the coordinator of
+/// Creates a new innernet peer through `rest_client`, an admin client of the coordinator of
 /// `interface`, which `server` names, and a [`PeerInvitation`] that the peer can use to join the
 /// network.
 ///
@@ -59,9 +59,9 @@ pub async fn invite(
     interface: &InterfaceName,
     server: &ServerInfo,
     existing_cidrs: &[Cidr],
-    existing_peers: &[Peer],
+    existing_peers: &[PeerContents],
     new_peer_info: NewPeerInfo,
-) -> Result<(Peer, PeerInvitation), CreatePeerError> {
+) -> Result<(PeerContents, PeerInvitation), CreatePeerError> {
     let keypair = KeyPair::generate();
     let peer_contents = new_peer_info.into_peer_contents(&keypair);
     let peer = rest_client.create_peer(&peer_contents).await?;

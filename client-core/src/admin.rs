@@ -158,7 +158,7 @@ pub async fn enable_or_disable_peer(
     if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
         let contents = PeerContents {
             is_disabled: !enable,
-            ..peer.contents.clone()
+            ..peer.clone()
         };
         rest_client.update_peer(&peer, &contents).await?;
     } else {

@@ -8,7 +8,8 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Endpoint, EndpointContents, RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, EndpointContents, LegacyState, RedeemContents, ServerCapabilities, State,
+    REDEEM_TRANSITION_WAIT,
 };
 
 pub async fn routes(
@@ -57,23 +58,33 @@ mod handlers {
     ///
     /// This endpoint returns the visible CIDRs and Peers, providing all the necessary
     /// information for the peer to create connections to all of them.
+    ///
+    /// A TLS session gets the peers without IDs, and a plain-HTTP session with the IDs that
+    /// [`DatabasePeer::plain_http_ids`] numbers them by, as clients that predate TLS expect.
     pub async fn state(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let selected_peer = session.peer.reload(&conn)?;
 
         let cidrs: Vec<_> = DatabaseCidr::list(&conn)?;
 
-        let mut peers: Vec<_> = selected_peer
-            .get_all_allowed_peers(&conn)?
-            .into_iter()
-            .map(|p| p.inner)
-            .collect();
-        inject_endpoints(&session, &mut peers);
-        json_response(State {
-            peers,
-            cidrs,
-            invalid_peer_keys: vec![],
-        })
+        let mut peers = selected_peer.get_all_allowed_peers(&conn)?;
+        inject_endpoints(&session, peers.iter_mut().map(|peer| &mut peer.inner));
+        if session.over_tls {
+            json_response(State {
+                peers: peers.into_iter().map(|peer| peer.inner).collect(),
+                cidrs,
+                invalid_peer_keys: vec![],
+            })
+        } else {
+            let ids = DatabasePeer::plain_http_ids(&conn)?;
+            json_response(LegacyState {
+                peers: peers
+                    .iter()
+                    .map(|peer| peer.legacy(ids[&peer.public_key]))
+                    .collect(),
+                cidrs,
+            })
+        }
     }
 
     pub async fn capabilities() -> Result<Response<Body>, ServerError> {
@@ -97,7 +108,7 @@ mod handlers {
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let mut selected_peer = session.peer.reload(&conn)?;
 
         selected_peer.redeem(&conn, &form.public_key)?;
 
@@ -129,7 +140,7 @@ mod handlers {
             return status_response(StatusCode::PAYLOAD_TOO_LARGE);
         }
         let conn = session.context.db.lock();
-        let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let mut selected_peer = session.peer.reload(&conn)?;
         selected_peer.set_candidates(&conn, contents)?;
 
         status_response(StatusCode::NO_CONTENT)
@@ -141,7 +152,7 @@ mod handlers {
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
-        let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let mut selected_peer = session.peer.reload(&conn)?;
         selected_peer.set_endpoint(&conn, contents.into())?;
 
         status_response(StatusCode::NO_CONTENT)
@@ -155,7 +166,9 @@ mod tests {
     use super::*;
     use crate::{db::DatabaseAssociation, test};
     use bytes::Buf;
-    use innernet_shared::{AssociationContents, CidrContents, Endpoint, EndpointContents, Error};
+    use innernet_shared::{
+        AssociationContents, CidrContents, Endpoint, EndpointContents, Error, Peer,
+    };
 
     #[tokio::test]
     async fn test_get_state_from_developer1() -> Result<(), Error> {
@@ -168,7 +181,7 @@ mod tests {
 
         let whole_body = hyper::body::aggregate(res).await?;
         let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-        let mut peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+        let mut peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
         peer_names.sort_unstable();
         // Developers should see only peers in infra CIDR and developer CIDR.
         assert_eq!(
@@ -176,6 +189,38 @@ mod tests {
             &peer_names[..]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_state_has_ids_only_in_plain_http() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        server.predate_tls(test::DEVELOPER2_PEER_ID);
+        let peers_of = |res: Response<Body>| async {
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+            let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            state["peers"].as_array().unwrap().clone()
+        };
+
+        // A TLS session gets the peers without IDs.
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let peers = peers_of(res).await;
+        assert_eq!(peers.len(), 3);
+        assert!(peers.iter().all(|peer| peer.get("id").is_none()));
+
+        // A plain-HTTP session gets them with the IDs that the server names them by.
+        let res = server
+            .plain_request(test::DEVELOPER2_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let peers: Vec<Peer> = serde_json::from_value(peers_of(res).await.into())?;
+        assert_eq!(peers.len(), 3);
+        let ids = DatabasePeer::plain_http_ids(&server.db().lock())?;
+        for peer in peers {
+            assert_eq!(peer.id, ids[&peer.public_key]);
+        }
         Ok(())
     }
 
@@ -290,7 +335,7 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
             let whole_body = hyper::body::aggregate(res).await?;
             let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-            let mut peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+            let mut peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
             peer_names.sort_unstable();
             // Developers should see only peers in infra CIDR and developer CIDR.
             assert_eq!(
@@ -465,8 +510,8 @@ mod tests {
         let (ip, _) = new_user_and_admin_ips();
         let mut contents = test::user_peer_contents("new-user", ip)?;
         contents.is_redeemed = false;
-        let id = DatabasePeer::create(&server.db().lock(), contents)?.id;
-        server.predate_tls(id);
+        let invitation = DatabasePeer::create(&server.db().lock(), contents)?;
+        server.predate_tls_key(&invitation.public_key);
 
         let body = RedeemContents {
             public_key: wireguard_control::KeyPair::generate().public.to_base64(),
@@ -475,7 +520,8 @@ mod tests {
             .plain_form_request(ip, "POST", "/v1/user/redeem", &body)
             .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        assert!(!DatabasePeer::get(&server.db().lock(), id)?.requires_tls);
+        let ip = ip.parse()?;
+        assert!(!DatabasePeer::get_from_ip(&server.db().lock(), ip)?.requires_tls);
         Ok(())
     }
 
@@ -504,7 +550,7 @@ mod tests {
     async fn test_candidates() -> Result<(), Error> {
         let server = test::Server::new()?;
 
-        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        let peer = test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID);
         assert_eq!(peer.candidates, vec![]);
 
         let candidates = vec!["1.1.1.1:51820".parse::<Endpoint>().unwrap()];
@@ -527,7 +573,7 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        let peer = test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID);
         assert_eq!(peer.candidates, candidates);
         Ok(())
     }
@@ -539,7 +585,7 @@ mod tests {
         // case that the peer has specified an endpoint override).
         let server = test::Server::new()?;
 
-        let peer = DatabasePeer::get(&server.db().lock(), test::DEVELOPER1_PEER_ID)?;
+        let peer = test::peer(&server.db().lock(), test::DEVELOPER1_PEER_ID);
         assert_eq!(peer.candidates, vec![]);
 
         // Specify one NAT candidate. At this point, we have an unspecified
@@ -569,7 +615,7 @@ mod tests {
 
         let developer_1 = peers
             .into_iter()
-            .find(|p| p.id == test::DEVELOPER1_PEER_ID)
+            .find(|p| p.public_key == peer.public_key)
             .unwrap();
         assert_eq!(
             developer_1.endpoint,
@@ -604,7 +650,7 @@ mod tests {
 
         let developer_1 = peers
             .into_iter()
-            .find(|p| p.id == test::DEVELOPER1_PEER_ID)
+            .find(|p| p.public_key == peer.public_key)
             .unwrap();
 
         // The peer endpoint should be the one we just specified in the override-endpoint request.

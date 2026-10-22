@@ -1,4 +1,6 @@
-use crate::{chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, Peer, WrappedIoError};
+use crate::{
+    chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, PeerContents, WrappedIoError,
+};
 use indoc::writedoc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -99,7 +101,7 @@ pub struct ServerInfo {
 pub const FEATURE_TLS: &str = "tls";
 
 impl ServerInfo {
-    pub fn new(server_peer: &Peer, internal_endpoint: SocketAddr) -> Self {
+    pub fn new(server_peer: &PeerContents, internal_endpoint: SocketAddr) -> Self {
         Self {
             external_endpoint: server_peer
                 .endpoint

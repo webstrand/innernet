@@ -9,19 +9,18 @@ use innernet_shared::{
 };
 use rusqlite::{params, Connection};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     ops::{Deref, DerefMut},
     time::SystemTime,
 };
 use wireguard_control::Key;
 
-/// A peer of the coordinator's database, with the ID by which the API of plain HTTP names it, as
-/// [`DatabasePeer::list`] numbers them, and the ID of its CIDR, the smallest CIDR that holds its
+/// A peer of the coordinator's database, with the ID of its CIDR, the smallest CIDR that holds its
 /// IP.
 #[derive(Debug)]
 pub struct DatabasePeer {
-    pub inner: Peer,
+    pub inner: PeerContents,
     /// Whether the peer must authenticate over TLS with its key, and is refused when it connects
     /// in plain HTTP, authenticated only by its source IP: the node's `tls` of the peer. Set from
     /// creation for every peer that the server creates, and for good once a peer that predates
@@ -30,7 +29,7 @@ pub struct DatabasePeer {
 }
 
 impl Deref for DatabasePeer {
-    type Target = Peer;
+    type Target = PeerContents;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -44,6 +43,28 @@ impl DerefMut for DatabasePeer {
 }
 
 impl DatabasePeer {
+    /// The peer as the API of plain-HTTP sessions transfers it, with the ID `id`, which
+    /// [`Self::plain_http_ids`] gives it.
+    pub fn legacy(&self, id: i64) -> Peer {
+        Peer {
+            id,
+            contents: self.inner.clone(),
+        }
+    }
+
+    /// The IDs by which the API of plain-HTTP sessions names the peers, by public key: the
+    /// position of each peer, from 1, in [`Self::list`]. The database stores no such ID. The IDs
+    /// are consistent within one response, which is all that clients that predate TLS rely on,
+    /// but not from one response to the next: creating or deleting a peer renumbers the peers
+    /// after it.
+    pub fn plain_http_ids(conn: &Connection) -> Result<HashMap<String, i64>, ServerError> {
+        Ok(Self::list(conn)?
+            .into_iter()
+            .zip(1..)
+            .map(|(peer, id)| (peer.inner.public_key, id))
+            .collect())
+    }
+
     /// Creates the peer `contents`, which must lie within the CIDR that it names, a CIDR without
     /// child CIDRs, at an address that the CIDR can assign, and which the server's node must
     /// accept: a valid name that no other peer has, and an address and a key that are pinned to
@@ -95,11 +116,8 @@ impl DatabasePeer {
             params![key],
         )?;
         tx.commit()?;
-        let id = Self::get_by_key(store, &key)?
-            .ok_or(ServerError::NotFound)?
-            .id;
         Ok(Self {
-            inner: Peer { id, contents },
+            inner: contents,
             requires_tls: true,
         })
     }
@@ -135,9 +153,9 @@ impl DatabasePeer {
             log::warn!("the server's node refuses the change: {refusal}");
             return Err(ServerError::InvalidQuery);
         }
-        self.contents.name = updated.name;
-        self.contents.is_admin = updated.is_admin;
-        self.contents.is_disabled = updated.is_disabled;
+        self.inner.name = updated.name;
+        self.inner.is_admin = updated.is_admin;
+        self.inner.is_disabled = updated.is_disabled;
         Ok(())
     }
 
@@ -150,6 +168,11 @@ impl DatabasePeer {
         key_to_bytes(&self.public_key).map_err(|_| ServerError::NotFound)
     }
 
+    /// The peer as the database now holds it, found by its public key.
+    pub fn reload(&self, conn: &Connection) -> Result<Self, ServerError> {
+        Self::get_by_key(conn, &self.key()?)?.ok_or(ServerError::NotFound)
+    }
+
     /// Sets the endpoint that the peer reports for itself.
     pub fn set_endpoint(
         &mut self,
@@ -157,7 +180,7 @@ impl DatabasePeer {
         endpoint: Option<Endpoint>,
     ) -> Result<(), ServerError> {
         store::write_endpoints(conn, &self.key()?, EndpointKind::Endpoint, &endpoint)?;
-        self.contents.endpoint = endpoint;
+        self.inner.endpoint = endpoint;
         Ok(())
     }
 
@@ -168,7 +191,7 @@ impl DatabasePeer {
         candidates: Vec<Endpoint>,
     ) -> Result<(), ServerError> {
         store::write_endpoints(conn, &self.key()?, EndpointKind::Candidate, &candidates)?;
-        self.contents.candidates = candidates;
+        self.inner.candidates = candidates;
         Ok(())
     }
 
@@ -185,8 +208,8 @@ impl DatabasePeer {
         store::write_endpoints(&tx, &key, EndpointKind::Endpoint, &endpoint)?;
         store::write_endpoints(&tx, &key, EndpointKind::Candidate, &candidates)?;
         tx.commit()?;
-        self.contents.endpoint = endpoint;
-        self.contents.candidates = candidates;
+        self.inner.endpoint = endpoint;
+        self.inner.candidates = candidates;
         Ok(())
     }
 
@@ -236,16 +259,9 @@ impl DatabasePeer {
             )?;
         }
         tx.commit()?;
-        self.contents.public_key = pubkey.into();
-        self.contents.is_redeemed = true;
+        self.inner.public_key = pubkey.into();
+        self.inner.is_redeemed = true;
         Ok(())
-    }
-
-    pub fn get(conn: &Connection, id: i64) -> Result<Self, ServerError> {
-        Self::list(conn)?
-            .into_iter()
-            .find(|peer| peer.id == id)
-            .ok_or(ServerError::NotFound)
     }
 
     fn get_by_key(conn: &Connection, key: &[u8; 32]) -> Result<Option<Self>, ServerError> {
@@ -316,16 +332,13 @@ impl DatabasePeer {
             .collect())
     }
 
-    /// Every peer, ordered by IP, each with its ID, its position from 1 in that order, by which the
-    /// API of plain HTTP names it. The IDs are consistent within one response, which is all that
-    /// the clients of that API rely on: creating or deleting a peer renumbers the peers after it.
+    /// Every peer, ordered by IP.
     pub fn list(conn: &Connection) -> Result<Vec<Self>, ServerError> {
         let cidrs = DatabaseCidr::list(conn)?;
         let latched = Self::latched(conn)?;
         Ok(store::load_peers(conn)?
             .into_iter()
-            .zip(1..)
-            .map(|(mut contents, id)| {
+            .map(|mut contents| {
                 contents.cidr_id = cidrs
                     .iter()
                     .filter(|cidr| cidr.cidr.contains(&contents.ip))
@@ -335,7 +348,7 @@ impl DatabasePeer {
                 contents.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
                 Self {
                     requires_tls: latched.contains(&contents.public_key),
-                    inner: Peer { id, contents },
+                    inner: contents,
                 }
             })
             .collect())

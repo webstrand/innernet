@@ -130,6 +130,9 @@ pub struct Context {
 pub struct Session {
     pub context: Context,
     pub peer: DatabasePeer,
+    /// Whether the peer authenticated with its key over TLS. Plain-HTTP sessions are those of
+    /// clients that predate TLS, and are served the API as those clients know it.
+    pub over_tls: bool,
 }
 
 impl Session {
@@ -310,7 +313,11 @@ fn get_session(
         peer
     };
 
-    Ok(Session { context, peer })
+    Ok(Session {
+        context,
+        peer,
+        over_tls: client_key.is_some(),
+    })
 }
 
 #[cfg(test)]
@@ -322,9 +329,7 @@ mod tests {
     use wireguard_control::KeyPair;
 
     fn requires_tls(server: &test::Server, id: i64) -> bool {
-        DatabasePeer::get(&server.db.lock(), id)
-            .unwrap()
-            .requires_tls
+        test::peer(&server.db.lock(), id).requires_tls
     }
 
     fn server_key(server: &test::Server) -> String {
@@ -382,7 +387,7 @@ mod tests {
     async fn test_tls_key_must_match_peer_and_ip() -> Result<(), Error> {
         let server = test::Server::new()?;
         let admin_key = {
-            let admin = DatabasePeer::get(&server.db.lock(), test::ADMIN_PEER_ID)?;
+            let admin = test::peer(&server.db.lock(), test::ADMIN_PEER_ID);
             Key::from_base64(&admin.public_key)?
         };
         let request = || {
@@ -464,8 +469,8 @@ mod tests {
         };
         let mut contents = test::developer_peer_contents("developer3", ip)?;
         contents.public_key = peer_key.public.to_base64();
-        let id = DatabasePeer::create(&server.db.lock(), contents)?.id;
-        server.predate_tls(id);
+        let peer = DatabasePeer::create(&server.db.lock(), contents)?;
+        server.predate_tls_key(&peer.public_key);
 
         let header_key = server_key(&server);
         let connect_tls = |client: &KeyPair, pinned: &Key| {
@@ -492,7 +497,7 @@ mod tests {
             status_line(tls, &header_key).await,
             "HTTP/1.1 401 Unauthorized"
         );
-        assert!(!requires_tls(&server, id));
+        assert!(!peer.reload(&server.db.lock())?.requires_tls);
 
         // A client pinning another server key refuses the handshake.
         let wrong = KeyPair::generate().public;

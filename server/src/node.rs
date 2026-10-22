@@ -26,7 +26,7 @@ impl Link for LocalLink {
     fn snapshot(&self) -> Result<Snapshot, Error> {
         let peers = DatabasePeer::list(&self.db.lock())?
             .into_iter()
-            .map(|peer| peer.inner.contents);
+            .map(|peer| peer.inner);
         Ok(snapshot::snapshot(peers))
     }
 

@@ -76,8 +76,7 @@ fn tag<T: Serialize>(kind: &str, value: &T) -> Result<String, ServerError> {
 }
 
 /// The tag of a peer: that of everything an admin reads of the peer, its public key included, but
-/// its ID, which only the API of plain-HTTP sessions uses, and its endpoint and candidates, which
-/// the peer reports on its own.
+/// its endpoint and candidates, which the peer reports on its own.
 fn peer_tag(peer: &PeerContents) -> Result<String, ServerError> {
     let peer = PeerContents {
         endpoint: None,
@@ -111,7 +110,7 @@ fn get_unchanged(
     tag_of: impl Fn(&PeerContents) -> Result<String, ServerError>,
 ) -> Result<DatabasePeer, ServerError> {
     match DatabasePeer::get_from_public_key(conn, key) {
-        Ok(peer) if tag_of(&peer.contents)? == tag => Ok(peer),
+        Ok(peer) if tag_of(&peer)? == tag => Ok(peer),
         Ok(_) => Err(ServerError::PeerChanged),
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(ServerError::NotFound),
         Err(e) => Err(e.into()),
@@ -135,14 +134,14 @@ mod handlers {
             session.context.invitations.notify_one();
         }
 
-        json_status_response(&*peer, StatusCode::CREATED)
+        json_status_response(&peer.inner, StatusCode::CREATED)
     }
 
     /// The peer with the public key `key` as the listing reports it, with its tag.
     pub async fn get_by_key(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut peer = DatabasePeer::get_from_public_key(&conn, &key)?.inner;
-        let tag = peer_tag(&peer.contents)?;
+        let tag = peer_tag(&peer)?;
         inject_endpoints(&session, [&mut peer]);
         json_response(TaggedPeer { peer, tag })
     }
@@ -160,7 +159,7 @@ mod handlers {
             name: form.name,
             is_admin: form.is_admin,
             is_disabled: form.is_disabled,
-            ..peer.contents.clone()
+            ..peer.inner.clone()
         };
         peer.update(&conn, contents)?;
         // The update may have enabled or disabled the peer.
@@ -204,7 +203,7 @@ mod handlers {
         status_response(StatusCode::NO_CONTENT)
     }
 
-    /// List all peers, including disabled ones. This is an admin-only endpoint.
+    /// List all peers, including disabled ones, without IDs. This is an admin-only endpoint.
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let mut peers = DatabasePeer::list(&conn)?
@@ -221,7 +220,7 @@ mod tests {
     use super::*;
     use crate::test;
     use bytes::Buf;
-    use innernet_shared::{Endpoint, Error, Peer};
+    use innernet_shared::{Endpoint, Error};
     use wireguard_control::KeyPair;
 
     #[tokio::test]
@@ -243,9 +242,9 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CREATED);
         // The response contains the new peer information.
         let whole_body = hyper::body::aggregate(res).await?;
-        let peer_res: Peer = serde_json::from_reader(whole_body.reader())?;
+        let peer_res: PeerContents = serde_json::from_reader(whole_body.reader())?;
 
-        assert_eq!(peer, peer_res.contents);
+        assert_eq!(peer, peer_res);
 
         // The number of peer entries in the database increased by 1.
         let new_peers = DatabasePeer::list(&server.db().lock())?;
@@ -380,7 +379,7 @@ mod tests {
     }
 
     fn peer(server: &test::Server, id: i64) -> DatabasePeer {
-        DatabasePeer::get(&server.db.lock(), id).unwrap()
+        test::peer(&server.db.lock(), id)
     }
 
     /// The path of the peer `id` in the API of TLS sessions.
@@ -428,7 +427,7 @@ mod tests {
     /// The changes that leave the peer at `path` as it is, with its current tag.
     async fn unchanged(server: &test::Server, path: &str) -> PeerUpdate {
         let TaggedPeer { peer, tag } = get_tagged(server, path).await;
-        PeerUpdate::new(tag, &peer.contents)
+        PeerUpdate::new(tag, &peer)
     }
 
     #[tokio::test]
@@ -466,7 +465,7 @@ mod tests {
         // An unknown key is not found, even with the tag of a peer that exists.
         let unknown = PeerContents {
             public_key: KeyPair::generate().public.to_base64(),
-            ..new_peer.contents.clone()
+            ..new_peer.inner.clone()
         };
         let path = format!("/v1/admin/peers/{}", unknown.api_path_segment());
         let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
@@ -512,7 +511,7 @@ mod tests {
         // The endpoint and candidates that the peer reports leave its tag unchanged.
         {
             let store = server.db.lock();
-            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            let mut peer = test::peer(&store, test::DEVELOPER1_PEER_ID);
             peer.set_endpoint(&store, Some("198.51.100.1:51820".parse().unwrap()))?;
             peer.set_candidates(&store, vec!["198.51.100.2:51820".parse().unwrap()])?;
         }
@@ -521,7 +520,7 @@ mod tests {
         // A change by another admin turns away a change based on what was read before it.
         let rename = |name: &str| PeerUpdate {
             name: name.parse().unwrap(),
-            ..PeerUpdate::new(seen.tag.clone(), &seen.peer.contents)
+            ..PeerUpdate::new(seen.tag.clone(), &seen.peer)
         };
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, rename("first"))
@@ -557,7 +556,7 @@ mod tests {
         let candidate: Endpoint = "192.168.0.2:51820".parse().unwrap();
         {
             let store = server.db.lock();
-            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            let mut peer = test::peer(&store, test::DEVELOPER1_PEER_ID);
             peer.set_endpoint(&store, Some(endpoint.clone()))?;
             peer.set_candidates(&store, vec![candidate.clone()])?;
         }
@@ -630,7 +629,7 @@ mod tests {
         };
         {
             let store = server.db.lock();
-            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            let mut peer = test::peer(&store, test::DEVELOPER1_PEER_ID);
             peer.set_candidates(&store, vec![])?;
         }
         assert_eq!(put(&report).await.status(), StatusCode::CONFLICT);
@@ -726,7 +725,7 @@ mod tests {
 
         let change = PeerContents {
             name: "new-peer-name".parse().unwrap(),
-            ..old_peer.contents.clone()
+            ..old_peer.inner.clone()
         };
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &id_path, &change)
@@ -805,8 +804,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         let whole_body = hyper::body::aggregate(res).await?;
-        let peers: Vec<Peer> = serde_json::from_reader(whole_body.reader())?;
-        let peer_names = peers.iter().map(|p| &*p.contents.name).collect::<Vec<_>>();
+        let peers: Vec<PeerContents> = serde_json::from_reader(whole_body.reader())?;
+        let peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
         // An admin peer should see all the peers.
         assert_eq!(
             &[
@@ -820,6 +819,39 @@ mod tests {
             &peer_names[..]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peers_without_ids() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:3"
+        } else {
+            "10.80.64.4"
+        };
+        let json = |res: Response<Body>| async {
+            let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        // The admin API lists and creates peers without IDs.
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        let peers = json(res).await;
+        assert_eq!(peers.as_array().unwrap().len(), 6);
+        assert!(peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|peer| peer.get("id").is_none()));
+        let contents = test::developer_peer_contents("developer3", ip)?;
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &contents)
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(json(res).await.get("id").is_none());
         Ok(())
     }
 
@@ -861,7 +893,7 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::OK);
 
-        let peers = |peers: Vec<DatabasePeer>| -> Vec<Peer> {
+        let peers = |peers: Vec<DatabasePeer>| -> Vec<PeerContents> {
             peers.into_iter().map(|peer| peer.inner).collect()
         };
         assert_eq!(

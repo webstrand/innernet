@@ -5,7 +5,7 @@
 use crate::interface::interface_is_up;
 pub use innernet_shared::{
     interface_config::PeerInvitation, Cidr, CidrContents, CidrTree, Endpoint, HostsOpts, NatOpts,
-    NetworkOpts, Peer, WrappedIoError,
+    NetworkOpts, Peer, PeerContents, WrappedIoError,
 };
 pub use wireguard_control::Backend;
 use wireguard_control::{DeviceUpdate, Key, PeerConfigBuilder};
@@ -50,7 +50,7 @@ pub fn set_endpoint_override_for_peer(
     config_dir: &Path,
     interface: &interface::InterfaceName,
     config: &mut interface::InterfaceConfig,
-    peer: &Peer,
+    peer: &PeerContents,
     endpoint: Endpoint,
 ) -> Result<(), Error> {
     config.set_endpoint_override_for_peer(peer.ip, endpoint.clone());
@@ -72,7 +72,7 @@ pub fn unset_endpoint_override_for_peer(
     config_dir: &Path,
     interface: &interface::InterfaceName,
     config: &mut interface::InterfaceConfig,
-    peer: &Peer,
+    peer: &PeerContents,
 ) -> Result<(), Error> {
     config.unset_endpoint_override_for_peer(peer.ip);
     config.save(config_dir, interface)?;
