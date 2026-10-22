@@ -13,7 +13,7 @@
 #                          upgraded midway
 #     new     198.18.0.5   admin invitation redeemed by a client that predates TLS
 #     osrv    198.18.0.6   a server that predates TLS, upgraded and downgraded midway
-#     c       198.18.0.7   peer of osrv with a current client
+#     c       198.18.0.7   admin of osrv with a current client
 #
 # Clients that predate TLS are played by wg(8) and curl(1) speaking plain HTTP, which is also
 # what anything else on a peer's machine can do from the peer's innernet IP. The server that
@@ -90,6 +90,12 @@ expect_requires_tls() { # <peer> <0|1>
 invitation() { # <invitation> <table> <key>
     python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$@"
 }
+
+# Prints the bytes of a base64 key in hex.
+key_hex() { python3 -I -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).hex().upper())' "$1"; }
+# Prints the condition that selects the peer with a public key, which a database holds as raw
+# bytes, or, in the database of a server that predates the rebuild of its peers table, in base64.
+by_key() { echo "(public_key = '$1' OR hex(public_key) = '$(key_hex "$1")')"; }
 
 # Requests the API in plain HTTP from a namespace, printing the status and body.
 plain() { # <namespace> <method> <path> [json body]
@@ -182,6 +188,22 @@ pass "a fetches"
 client adm list-associations e2e || fail "list associations as adm"
 pass "adm uses the admin API"
 
+step "a current admin client addresses peers by public key over TLS"
+client adm add-peer e2e --name x --auto-ip --cidr peers --admin false \
+    --invite-expires 1h --save-config "$work/x.toml" --yes || fail "add-peer as adm"
+x_key=$(invitation "$work/x.toml" interface private-key | wg pubkey)
+x_peer() { db "SELECT name, is_disabled FROM peers WHERE $(by_key "$x_key")"; }
+[ "$(x_peer)" = "x|0" ] || fail "adm didn't add x"
+pass "adm adds a peer"
+# A TLS session has no routes by ID, so these succeed only by key.
+client adm rename-peer e2e --name x --new-name y --yes || fail "rename-peer as adm"
+client adm disable-peer e2e --name y --yes || fail "disable-peer as adm"
+[ "$(x_peer)" = "y|1" ] || fail "adm didn't rename and disable x: $(x_peer)"
+pass "adm renames and disables a peer by key"
+client adm enable-peer e2e --name y --yes || fail "enable-peer as adm"
+[ "$(x_peer)" = "y|0" ] || fail "adm didn't enable y: $(x_peer)"
+pass "adm enables a peer by key"
+
 step "something else on a peer's machine, without its key"
 expect_plain a GET /v1/user/state 401
 case $last_body in *TLS*) pass "the refusal explains TLS is required" ;;
@@ -252,8 +274,13 @@ mkdir -p "$work/osrv"
 origin_server new --network-name e2o --network-cidr 10.67.0.0/16 \
     --external-endpoint 198.18.0.6:51820 --listen-port 51820 >/dev/null
 origin_server add-cidr e2o --name peers --cidr 10.67.1.0/24 --parent e2o --yes >/dev/null
-origin_server add-peer e2o --name c --auto-ip --cidr peers --admin false \
+origin_server add-peer e2o --name c --auto-ip --cidr peers --admin true \
     --invite-expires 1h --save-config "$work/c.toml" --yes >/dev/null
+origin_server add-peer e2o --name d --auto-ip --cidr peers --admin false \
+    --invite-expires 1h --save-config "$work/d.toml" --yes >/dev/null
+d_key=$(invitation "$work/d.toml" interface private-key | wg pubkey)
+osrv_db() { sqlite3 "$work/osrv/data/e2o.db" "$@"; }
+d_peer() { osrv_db "SELECT name, is_disabled FROM peers WHERE $(by_key "$d_key")"; }
 serve_osrv "$E2E_ORIGIN_BIN"
 mkdir -p "$work/c"
 client c install "$work/c.toml" --default-name --listen-port 51820 --delete-invite \
@@ -263,6 +290,11 @@ pass "c installed in plain HTTP, with a warning"
 client c fetch e2o || fail "fetch as c"
 [ "$(client_latched c)" = 0 ] || fail "c latched a server that predates TLS"
 pass "c fetches in plain HTTP, unlatched"
+# The server that predates TLS addresses peers only by ID.
+client c rename-peer e2o --name d --new-name d2 --yes || fail "rename-peer as c in plain HTTP"
+client c disable-peer e2o --name d2 --yes || fail "disable-peer as c in plain HTTP"
+[ "$(d_peer)" = "d2|1" ] || fail "c didn't rename and disable d: $(d_peer)"
+pass "c renames and disables a peer by ID in plain HTTP"
 
 step "the server is upgraded"
 stop_osrv
@@ -272,9 +304,13 @@ client c fetch e2o || fail "fetch as c from the upgraded server"
 pass "c fetches over TLS, and latched the server"
 [ -f "$work/osrv/data/e2o.db.v2.0.0" ] || fail "the upgraded server didn't back up its database"
 pass "the upgraded server backed up its database before rebuilding it"
-[ "$(sqlite3 "$work/osrv/data/e2o.db" "SELECT tls FROM peers WHERE name = 'c'")" = 1 ] ||
+[ "$(osrv_db "SELECT tls FROM peers WHERE name = 'c'")" = 1 ] ||
     fail "the upgraded server didn't latch c"
 pass "the upgraded server latched c"
+client c rename-peer e2o --name d2 --new-name d3 --yes || fail "rename-peer as c over TLS"
+client c enable-peer e2o --name d3 --yes || fail "enable-peer as c over TLS"
+[ "$(d_peer)" = "d3|0" ] || fail "c didn't rename and enable d: $(d_peer)"
+pass "c renames and enables a peer by key over TLS"
 
 step "the server is downgraded"
 stop_osrv
