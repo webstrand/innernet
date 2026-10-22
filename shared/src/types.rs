@@ -675,6 +675,25 @@ impl PeerUpdate {
     }
 }
 
+/// The endpoint and candidates stored for a peer, as the peer or an admin set them, without the
+/// endpoint that the server observes.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PeerEndpoints {
+    pub endpoint: Option<Endpoint>,
+    #[serde(default)]
+    pub candidates: Vec<Endpoint>,
+}
+
+/// A peer's endpoints and their tag: the body of `GET` and `PUT /admin/peers/{key}/endpoints` in
+/// TLS sessions. The endpoints are tagged apart from the rest of the peer. A `PUT` carries the
+/// tag of the endpoints as the admin read them, and the server refuses it if they have changed
+/// since.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TaggedPeerEndpoints {
+    pub endpoints: PeerEndpoints,
+    pub tag: String,
+}
+
 /// Deserializes a WireGuard public key, refusing an invalid key and normalizing a valid one to its
 /// canonical base64 encoding, so that public keys can be compared as strings.
 fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {

@@ -172,6 +172,24 @@ impl DatabasePeer {
         Ok(())
     }
 
+    /// Sets the endpoint and candidates of the peer together, on its behalf, so that a failure
+    /// can't leave the endpoint changed and the candidates stale.
+    pub fn set_endpoints(
+        &mut self,
+        conn: &Connection,
+        endpoint: Option<Endpoint>,
+        candidates: Vec<Endpoint>,
+    ) -> Result<(), ServerError> {
+        let key = self.key()?;
+        let tx = conn.unchecked_transaction()?;
+        store::write_endpoints(&tx, &key, EndpointKind::Endpoint, &endpoint)?;
+        store::write_endpoints(&tx, &key, EndpointKind::Candidate, &candidates)?;
+        tx.commit()?;
+        self.contents.endpoint = endpoint;
+        self.contents.candidates = candidates;
+        Ok(())
+    }
+
     /// Requires the peer to authenticate over TLS from now on.
     pub fn set_requires_tls(&mut self, conn: &Connection) -> Result<(), ServerError> {
         conn.execute(

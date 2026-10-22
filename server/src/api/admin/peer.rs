@@ -7,7 +7,7 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::{PeerContents, PeerUpdate, TaggedPeer};
+use innernet_shared::{PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerEndpoints};
 use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha512};
@@ -21,20 +21,26 @@ pub async fn routes(
     session: Session,
 ) -> Result<Response<Body>, ServerError> {
     let peer = components.pop_front();
+    let resource = components.pop_front();
     if !components.is_empty() {
         return Err(ServerError::NotFound);
     }
     let key = peer.as_deref().map(parse_path_key).transpose()?;
-    match (req.method(), key) {
-        (&Method::GET, None) => handlers::list(session).await,
-        (&Method::POST, None) => {
+    match (req.method(), key, resource.as_deref()) {
+        (&Method::GET, None, None) => handlers::list(session).await,
+        (&Method::POST, None, None) => {
             let form = form_body(req).await?;
             handlers::create(form, session).await
         },
-        (&Method::GET, Some(key)) => handlers::get_by_key(key, session).await,
-        (&Method::PUT, Some(key)) => {
+        (&Method::GET, Some(key), None) => handlers::get_by_key(key, session).await,
+        (&Method::PUT, Some(key), None) => {
             let form = form_body(req).await?;
             handlers::update_by_key(key, form, session).await
+        },
+        (&Method::GET, Some(key), Some("endpoints")) => handlers::endpoints(key, session).await,
+        (&Method::PUT, Some(key), Some("endpoints")) => {
+            let form = form_body(req).await?;
+            handlers::set_endpoints(key, form, session).await
         },
         _ => Err(ServerError::NotFound),
     }
@@ -79,6 +85,19 @@ fn peer_tag(peer: &PeerContents) -> Result<String, ServerError> {
         ..peer.clone()
     };
     tag("peer", &peer)
+}
+
+/// The endpoint and candidates stored for a peer.
+fn peer_endpoints(peer: &PeerContents) -> PeerEndpoints {
+    PeerEndpoints {
+        endpoint: peer.endpoint.clone(),
+        candidates: peer.candidates.clone(),
+    }
+}
+
+/// The tag of a peer's endpoints: that of its public key, endpoint and candidates.
+fn endpoints_tag(peer: &PeerContents) -> Result<String, ServerError> {
+    tag("endpoints", &(&peer.public_key, peer_endpoints(peer)))
 }
 
 /// The peer with the public key `key`, if `tag_of` the peer is still `tag`. A peer that has
@@ -145,6 +164,41 @@ mod handlers {
         };
         peer.update(&conn, contents)?;
         // The update may have enabled or disabled the peer.
+        session.context.changed.notify();
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
+    /// The endpoint and candidates stored for the peer with the public key `key`, without the
+    /// endpoint that the server observes, so that they can be written back as they are read, and
+    /// their tag.
+    pub async fn endpoints(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let peer = DatabasePeer::get_from_public_key(&conn, &key)?;
+        json_response(TaggedPeerEndpoints {
+            endpoints: peer_endpoints(&peer),
+            tag: endpoints_tag(&peer)?,
+        })
+    }
+
+    /// Sets the endpoint and candidates of the peer with the public key `key` on its behalf, if
+    /// they haven't changed since the admin read them with the tag that the request carries.
+    pub async fn set_endpoints(
+        key: Key,
+        form: TaggedPeerEndpoints,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        let PeerEndpoints {
+            endpoint,
+            candidates,
+        } = form.endpoints;
+        if candidates.len() > 10 {
+            return status_response(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let conn = session.context.db.lock();
+        let mut peer = get_unchanged(&conn, &key, &form.tag, endpoints_tag)?;
+        peer.set_endpoints(&conn, endpoint, candidates)?;
+        log::info!("set the endpoints of peer {}", *peer);
         session.context.changed.notify();
 
         status_response(StatusCode::NO_CONTENT)
@@ -520,6 +574,114 @@ mod tests {
         assert_eq!(&*new_peer.name, "new-peer-name");
         assert_eq!(new_peer.endpoint, Some(endpoint));
         assert_eq!(new_peer.candidates, vec![candidate]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_endpoints() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let peer_path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let path = format!("{peer_path}/endpoints");
+        let get = || async {
+            let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = hyper::body::aggregate(res).await.unwrap();
+            serde_json::from_reader::<_, TaggedPeerEndpoints>(body.reader()).unwrap()
+        };
+        let put = |endpoints: &TaggedPeerEndpoints| {
+            server.form_request(test::ADMIN_PEER_IP, "PUT", &path, endpoints.clone())
+        };
+
+        // The server observes an endpoint for the peer, which isn't stored.
+        let seen = get().await;
+        assert_eq!(seen.endpoints, PeerEndpoints::default());
+        let peer_tag = get_tagged(&server, &peer_path).await.tag;
+
+        let endpoints = PeerEndpoints {
+            endpoint: Some("198.51.100.1:51820".parse().unwrap()),
+            candidates: vec!["198.51.100.2:51820".parse().unwrap()],
+        };
+        let change = TaggedPeerEndpoints {
+            endpoints: endpoints.clone(),
+            tag: seen.tag.clone(),
+        };
+        assert_eq!(put(&change).await.status(), StatusCode::NO_CONTENT);
+        let stored = peer(&server, test::DEVELOPER1_PEER_ID);
+        assert_eq!(stored.endpoint, endpoints.endpoint);
+        assert_eq!(stored.candidates, endpoints.candidates);
+        let current = get().await;
+        assert_eq!(current.endpoints, endpoints);
+        assert_ne!(current.tag, seen.tag);
+
+        // The endpoints are tagged apart from the rest of the peer.
+        assert_eq!(get_tagged(&server, &peer_path).await.tag, peer_tag);
+        let mut rename = unchanged(&server, &peer_path).await;
+        rename.name = "renamed".parse().unwrap();
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &peer_path, &rename)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(get().await.tag, current.tag);
+
+        // A change based on endpoints read before the peer reported others is refused.
+        let report = TaggedPeerEndpoints {
+            endpoints: PeerEndpoints::default(),
+            tag: current.tag.clone(),
+        };
+        {
+            let store = server.db.lock();
+            let mut peer = DatabasePeer::get(&store, test::DEVELOPER1_PEER_ID)?;
+            peer.set_candidates(&store, vec![])?;
+        }
+        assert_eq!(put(&report).await.status(), StatusCode::CONFLICT);
+
+        // Non-admins can't, too many candidates are refused, and a tag is required.
+        let current = get().await;
+        let res = server
+            .form_request(test::DEVELOPER1_PEER_IP, "PUT", &path, &current)
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let too_many = TaggedPeerEndpoints {
+            endpoints: PeerEndpoints {
+                endpoint: None,
+                candidates: vec!["198.51.100.2:51820".parse().unwrap(); 11],
+            },
+            tag: current.tag.clone(),
+        };
+        assert_eq!(put(&too_many).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let untagged = serde_json::json!({ "endpoints": { "endpoint": null, "candidates": [] } });
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(get().await, current);
+
+        // Any other path under a peer is not found, rather than routed to the peer itself, and
+        // the endpoints are not reached by ID.
+        let id_path = format!("/v1/admin/peers/{}/endpoints", test::DEVELOPER1_PEER_ID);
+        for path in [
+            format!("{peer_path}/other"),
+            format!("{path}/other"),
+            id_path.clone(),
+        ] {
+            for method in ["GET", "PUT", "DELETE"] {
+                let res = server
+                    .form_request(test::ADMIN_PEER_IP, method, &path, &current)
+                    .await;
+                assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            }
+        }
+        server.predate_tls(test::ADMIN_PEER_ID);
+        let res = server
+            .plain_request(test::ADMIN_PEER_IP, "GET", &path)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            peer(&server, test::DEVELOPER1_PEER_ID).endpoint,
+            current.endpoints.endpoint
+        );
+        assert!(!peer(&server, test::DEVELOPER1_PEER_ID).is_disabled);
+
         Ok(())
     }
 
