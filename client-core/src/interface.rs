@@ -16,8 +16,8 @@ use innernet_node::{
     store,
 };
 use innernet_shared::{
-    interface_config::FEATURE_TLS, wg, Endpoint, PeerChange, PeerContents, RedeemContents,
-    REDEEM_TRANSITION_WAIT,
+    interface_config::{ResolvedInvitation, FEATURE_TLS},
+    wg, Endpoint, PeerChange, PeerContents, Prefix, RedeemContents, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
 use thiserror::Error;
@@ -51,12 +51,14 @@ pub enum RedeemInviteError {
     },
 }
 
-/// Redeem an invitation to join an innernet network.
+/// Redeem an invitation to join an innernet network, resolved into the config of the interface
+/// and the delegations that it offers.
 ///
 /// - Brings the WireGuard interface up.
 /// - Generates a fresh key pair and uses the public part to redeem the invite and the private part
 ///   to update the WireGuard interface.
-/// - Creates the data store with the coordinator and this client, as the config introduces them.
+/// - Creates the data store with the coordinator and this client, as the invitation introduces
+///   them.
 /// - Bails if either a WireGuard or an innernet `interface` of the same name already exists and
 ///   brings the interface down if it was already up.
 pub async fn redeem_invite(
@@ -64,8 +66,12 @@ pub async fn redeem_invite(
     data_dir: &Path,
     network_opts: &NetworkOpts,
     interface: &InterfaceName,
-    config: InterfaceConfig,
+    invitation: ResolvedInvitation,
 ) -> Result<(), RedeemInviteError> {
+    let ResolvedInvitation {
+        config,
+        delegations,
+    } = invitation;
     let config_path = InterfaceConfig::build_config_file_path(config_dir, interface)
         .map_err(RedeemInviteError::InterfaceConfigAccess)?;
 
@@ -115,15 +121,22 @@ pub async fn redeem_invite(
         error: e,
     })?;
 
-    update_keypair(network_opts, interface, &config_path, data_dir, config)
-        .await
-        .inspect_err(|e| {
-            log::error!("failed to update keypair (is the innernet server reachable?): {e}.",);
-            log::info!("bringing down the interface.");
-            if let Err(e) = wg::down(interface, network_opts.backend) {
-                log::warn!("failed to bring down interface: {}.", e);
-            };
-        })?;
+    update_keypair(
+        network_opts,
+        interface,
+        &config_path,
+        data_dir,
+        config,
+        &delegations,
+    )
+    .await
+    .inspect_err(|e| {
+        log::error!("failed to update keypair (is the innernet server reachable?): {e}.",);
+        log::info!("bringing down the interface.");
+        if let Err(e) = wg::down(interface, network_opts.backend) {
+            log::warn!("failed to bring down interface: {}.", e);
+        };
+    })?;
 
     Ok(())
 }
@@ -134,6 +147,7 @@ async fn update_keypair(
     config_path: &Path,
     data_dir: &Path,
     mut config: InterfaceConfig,
+    delegations: &[Prefix],
 ) -> Result<(), RedeemInviteError> {
     log::info!("Generating new keypair.");
     let keypair = wireguard_control::KeyPair::generate();
@@ -167,7 +181,7 @@ async fn update_keypair(
 
     DataStore::open_or_create(data_dir, interface, &config)
         .and_then(|mut store| {
-            store.introduce(&config)?;
+            store.introduce(&config, delegations)?;
             if speaks_tls {
                 store.latch_tls(&config.server.public_key)?;
             }

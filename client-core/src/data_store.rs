@@ -178,12 +178,16 @@ impl DataStore {
     /// Records the coordinator and this client as the interface config introduces them, when an
     /// invitation is redeemed, so the data store must be new.
     ///
-    /// The interface config, which the invitation produced, is the authority on both, so their
+    /// The invitation, which produced the interface config, is the authority on both, so their
     /// delegations are pinned to their keys before the coordinator reports anything: the
-    /// coordinator's internal address, and the address of this client. Each record has no name
-    /// until a fetch replaces it with the coordinator's record.
-    pub fn introduce(&mut self, config: &InterfaceConfig) -> Result<(), Error> {
-        let [coordinator, own] = introduced_peers(config)?;
+    /// coordinator's internal address, and `delegations`, those that the invitation offers this
+    /// client. Each record has no name until a fetch replaces it with the coordinator's record.
+    pub fn introduce(
+        &mut self,
+        config: &InterfaceConfig,
+        delegations: &[Prefix],
+    ) -> Result<(), Error> {
+        let [coordinator, own] = introduced_peers(config, delegations)?;
         let tx = self.store.transaction()?;
         if !store::load_peers(&tx)?.is_empty() {
             bail!("the data store to introduce peers into is not new.");
@@ -419,12 +423,16 @@ fn smallest_containing(cidrs: &[Cidr], contains: impl Fn(&IpNet) -> bool) -> Opt
         .map(|cidr| cidr.id)
 }
 
-/// The coordinator and this client, as the interface config introduces them. Each record has
+/// The coordinator, at its internal address, and this client, with the delegations
+/// `delegations`, as the interface config and the invitation introduce them. Each record has
 /// neither a name nor a CIDR.
-fn introduced_peers(config: &InterfaceConfig) -> Result<[PeerContents; 2], Error> {
-    let introduced = |ip, public_key: String, endpoint| PeerContents {
+fn introduced_peers(
+    config: &InterfaceConfig,
+    delegations: &[Prefix],
+) -> Result<[PeerContents; 2], Error> {
+    let introduced = |delegations: Vec<Prefix>, public_key: String, endpoint| PeerContents {
         name: None,
-        delegations: vec![Prefix::host(ip)],
+        delegations,
         cidr_id: UNKNOWN_ID,
         public_key,
         endpoint,
@@ -440,13 +448,15 @@ fn introduced_peers(config: &InterfaceConfig) -> Result<[PeerContents; 2], Error
     let own_key = Key::from_base64(&config.interface.private_key)?
         .get_public()
         .to_base64();
+    let mut delegations = delegations.to_vec();
+    delegations.sort();
     Ok([
         introduced(
-            config.server.internal_endpoint.ip(),
+            vec![Prefix::host(config.server.internal_endpoint.ip())],
             server_key,
             Some(config.server.external_endpoint.clone()),
         ),
-        introduced(config.interface.address.addr(), own_key, None),
+        introduced(delegations, own_key, None),
     ])
 }
 #[cfg(test)]
@@ -994,15 +1004,20 @@ mod tests {
         let own_key = wireguard_control::KeyPair::generate();
         let config = introducing_config(&own_key);
 
-        // A new data store pins the coordinator and this client, without a name.
+        // A new data store pins the coordinator at its internal address, and this client to the
+        // delegations that the invitation offers it, without a name.
         let mut store = open(dir.path(), true).unwrap();
-        store.introduce(&config).unwrap();
+        let offered: Vec<Prefix> = vec![
+            "10.0.0.16/28".parse().unwrap(),
+            "10.0.0.2/32".parse().unwrap(),
+        ];
+        store.introduce(&config, &offered).unwrap();
         let peers = store.peers().unwrap();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].delegations, COORDINATOR.delegations);
         assert_eq!(peers[0].public_key, COORDINATOR.public_key);
         assert_eq!(peers[0].name, None);
-        assert_eq!(peers[1].delegations, host("10.0.0.2"));
+        assert_eq!(peers[1].delegations, [offered[1], offered[0]]);
         assert_eq!(peers[1].public_key, own_key.public.to_base64());
         assert_eq!(peers[1].name, None);
 
@@ -1022,7 +1037,7 @@ mod tests {
         assert_eq!(store.peers().unwrap().len(), 2);
 
         // Only a new data store is introduced.
-        assert!(store.introduce(&config).is_err());
+        assert!(store.introduce(&config, &offered).is_err());
         assert_eq!(store.peers().unwrap().len(), 2);
     }
 

@@ -1,7 +1,8 @@
 use crate::{
-    chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, PeerContents, WrappedIoError,
+    chmod, ensure_dirs_exist, hosts_fallback, Endpoint, Error, IoErrorContext, PeerContents,
+    Prefix, WrappedIoError,
 };
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use indoc::writedoc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -310,16 +311,191 @@ impl InterfaceInfo {
     }
 }
 
+/// An invitation to join a network: the key with which the invited peer redeems it, what the
+/// server offers the peer, and how to reach the server. Redeeming an invitation turns it into an
+/// [`InterfaceConfig`], with [`Invitation::resolve`].
+///
+/// An invitation offers delegations within the network, and names no source address: the client
+/// picks one within the delegations. An invitation of the format of v2.0.0, which a server that
+/// predates TLS writes, and which an admin client writes for such a server, names the address of
+/// the peer instead, and no delegations.
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "kebab-case")]
 #[must_use]
-pub struct PeerInvitation {
-    interface_config: InterfaceConfig,
+pub struct Invitation {
+    pub interface: InvitedInterface,
+    pub server: ServerInfo,
 }
 
-impl PeerInvitation {
-    pub fn new(interface: InterfaceInfo, server: ServerInfo) -> Self {
+/// The `[interface]` table of an [`Invitation`].
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct InvitedInterface {
+    /// The interface name (i.e. "tonari")
+    pub network_name: String,
+
+    /// The source address of the peer, with the prefix of the network. An invitation of the
+    /// format of v2.0.0 names it, and offers it alone. In an invitation that offers delegations,
+    /// it is optional, and selects the source address within them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpNet>,
+
+    /// The WireGuard private key (base64) with which the invitation is redeemed.
+    pub private_key: String,
+
+    /// The network that the peer joins, which holds its delegations. Absent from an invitation
+    /// of the format of v2.0.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_cidr: Option<IpNet>,
+
+    /// The delegations that the server offers the peer. Absent from an invitation of the format
+    /// of v2.0.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegations: Option<Vec<Prefix>>,
+
+    /// The local listen port. A random port will be used if `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+}
+
+/// An invitation resolved into the config of the interface that redeems it, and the delegations
+/// that it offers the peer.
+#[derive(Clone, Debug)]
+pub struct ResolvedInvitation {
+    pub config: InterfaceConfig,
+    pub delegations: Vec<Prefix>,
+}
+
+impl Invitation {
+    /// An invitation for the peer of `keypair` to the network `network_cidr` of `network_name`,
+    /// offering it `delegations`, without a source address.
+    pub fn offering(
+        network_name: &InterfaceName,
+        keypair: &KeyPair,
+        network_cidr: IpNet,
+        delegations: Vec<Prefix>,
+        server: ServerInfo,
+    ) -> Self {
         Self {
-            interface_config: InterfaceConfig::new(interface, server),
+            interface: InvitedInterface {
+                network_name: network_name.to_string(),
+                address: None,
+                private_key: keypair.private.to_base64(),
+                network_cidr: Some(network_cidr.trunc()),
+                delegations: Some(delegations),
+                listen_port: None,
+            },
+            server,
         }
+    }
+
+    /// An invitation of the format of v2.0.0, as servers that predate TLS write it: for the peer
+    /// of `keypair` at `address`, with the prefix of the network.
+    pub fn legacy(
+        network_name: &InterfaceName,
+        keypair: &KeyPair,
+        address: IpNet,
+        server: ServerInfo,
+    ) -> Self {
+        Self {
+            interface: InvitedInterface {
+                network_name: network_name.to_string(),
+                address: Some(address),
+                private_key: keypair.private.to_base64(),
+                network_cidr: None,
+                delegations: None,
+                listen_port: None,
+            },
+            server,
+        }
+    }
+
+    pub fn from_file(file: &mut File) -> Result<Self, Error> {
+        let mut toml = String::new();
+        file.read_to_string(&mut toml)?;
+        Ok(toml::from_str(&toml)?)
+    }
+
+    /// The config of the interface that redeems the invitation, and the delegations that it
+    /// offers.
+    ///
+    /// An invitation that offers delegations must state the network that holds them, every
+    /// delegation must lie within it, and no two delegations may share an address. The source
+    /// address of the interface is the address that the invitation names, which must lie within
+    /// the delegations, or else the lowest address of the delegations, with the prefix of the
+    /// network. An invitation of the format of v2.0.0 must name an address, which it offers as a
+    /// host prefix.
+    pub fn resolve(self) -> Result<ResolvedInvitation, Error> {
+        let InvitedInterface {
+            network_name,
+            address,
+            private_key,
+            network_cidr,
+            delegations,
+            listen_port,
+        } = self.interface;
+        let (address, delegations) = match delegations {
+            Some(mut delegations) => {
+                let network = network_cidr
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "the invitation offers delegations without the network-cidr that \
+                             holds them"
+                        )
+                    })?
+                    .trunc();
+                delegations.sort();
+                if let Some(pair) = delegations
+                    .windows(2)
+                    .find(|pair| pair[0].overlaps(&pair[1]))
+                {
+                    bail!(
+                        "the invitation offers {} and {}, which overlap",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+                if let Some(outside) = delegations
+                    .iter()
+                    .find(|delegation| !network.contains(&delegation.net()))
+                {
+                    bail!(
+                        "the invitation offers {outside}, which is outside the network {network}"
+                    );
+                }
+                let source = match address {
+                    Some(address) => {
+                        let ip = address.addr();
+                        if !delegations.iter().any(|d| d.contains_addr(&ip)) {
+                            bail!(
+                                "the address {ip} of the invitation lies outside the delegations \
+                                 that it offers"
+                            );
+                        }
+                        ip
+                    },
+                    None => hosts_fallback(&delegations)
+                        .ok_or_else(|| anyhow!("the invitation offers no delegation"))?,
+                };
+                (IpNet::new(source, network.prefix_len())?, delegations)
+            },
+            None => {
+                let address = address.ok_or_else(|| {
+                    anyhow!("the invitation names neither an address nor delegations")
+                })?;
+                (address, vec![Prefix::host(address.addr())])
+            },
+        };
+        let interface = InterfaceInfo {
+            network_name,
+            address,
+            private_key,
+            listen_port,
+        };
+        Ok(ResolvedInvitation {
+            config: InterfaceConfig::new(interface, self.server),
+            delegations,
+        })
     }
 
     /// Save a new invitation file, failing if it already exists.
@@ -347,7 +523,7 @@ impl PeerInvitation {
                 "
         )?;
 
-        file.write_all(self.interface_config.as_toml().as_bytes())?;
+        file.write_all(toml::to_string(self).unwrap().as_bytes())?;
 
         Ok(())
     }
@@ -356,7 +532,6 @@ impl PeerInvitation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Prefix;
 
     const INVITATION: &str = r#"
         [interface]
@@ -388,6 +563,132 @@ mod tests {
         assert!(config.server.has_feature(FEATURE_TLS));
         let config: InterfaceConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(config.server.features, ["tls", "from-the-future"]);
+    }
+
+    /// An invitation offering delegations.
+    const OFFERING: &str = r#"
+        [interface]
+        network-name = "test"
+        private-key = "kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM="
+        network-cidr = "10.0.0.0/16"
+        delegations = ["10.0.1.0/24", "10.0.0.9/32"]
+
+        [server]
+        public-key = "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g="
+        external-endpoint = "203.0.113.1:51820"
+        internal-endpoint = "10.0.0.1:51820"
+        features = ["tls"]
+    "#;
+
+    fn prefixes(prefixes: &[&str]) -> Vec<Prefix> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_resolve_invitation() {
+        // The source address is the lowest address of the delegations, with the prefix of the
+        // network.
+        let invitation: Invitation = toml::from_str(OFFERING).unwrap();
+        let resolved = invitation.clone().resolve().unwrap();
+        assert_eq!(
+            resolved.config.interface.address,
+            "10.0.0.9/16".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            resolved.delegations,
+            prefixes(&["10.0.0.9/32", "10.0.1.0/24"])
+        );
+        assert!(resolved.config.server.has_feature(FEATURE_TLS));
+
+        // An address that the invitation names selects the source address within them.
+        let mut named = invitation.clone();
+        named.interface.address = Some("10.0.1.7/16".parse().unwrap());
+        assert_eq!(
+            named.resolve().unwrap().config.interface.address,
+            "10.0.1.7/16".parse::<IpNet>().unwrap()
+        );
+
+        // An address outside the delegations, a delegation outside the network, a missing network,
+        // an empty offer and delegations that overlap are refused.
+        let mut outside = invitation.clone();
+        outside.interface.address = Some("10.0.2.7/16".parse().unwrap());
+        let mut beyond = invitation.clone();
+        beyond.interface.delegations = Some(prefixes(&["10.1.0.0/24"]));
+        let mut without_network = invitation.clone();
+        without_network.interface.network_cidr = None;
+        let mut empty = invitation.clone();
+        empty.interface.delegations = Some(vec![]);
+        let mut overlapping = invitation.clone();
+        overlapping.interface.delegations =
+            Some(prefixes(&["10.0.1.0/24", "10.0.0.9/32", "10.0.1.128/25"]));
+        let mut duplicate = invitation.clone();
+        duplicate.interface.delegations = Some(prefixes(&["10.0.0.9/32", "10.0.0.9/32"]));
+        for (refused, reason) in [
+            (outside, "outside the delegations"),
+            (beyond, "outside the network"),
+            (without_network, "network-cidr"),
+            (empty, "no delegation"),
+            (overlapping, "10.0.1.0/24 and 10.0.1.128/25, which overlap"),
+            (duplicate, "overlap"),
+        ] {
+            let error = refused.resolve().unwrap_err().to_string();
+            assert!(error.contains(reason), "{error}");
+        }
+
+        // An invitation of the format of v2.0.0 offers its address as a host prefix.
+        let legacy: Invitation = toml::from_str(INVITATION).unwrap();
+        let resolved = legacy.resolve().unwrap();
+        assert_eq!(
+            resolved.config.interface.address,
+            "10.0.0.2/24".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(resolved.delegations, prefixes(&["10.0.0.2/32"]));
+        let mut neither: Invitation = toml::from_str(INVITATION).unwrap();
+        neither.interface.address = None;
+        assert!(neither.resolve().is_err());
+    }
+
+    #[test]
+    fn test_write_invitations() {
+        let keypair = KeyPair::generate();
+        let interface: InterfaceName = "test".parse().unwrap();
+        let server: ServerInfo = toml::from_str::<Invitation>(OFFERING).unwrap().server;
+        let written = |invitation: &Invitation| -> toml::Table {
+            toml::from_str::<toml::Table>(&toml::to_string(invitation).unwrap()).unwrap()
+                ["interface"]
+                .as_table()
+                .unwrap()
+                .clone()
+        };
+
+        // An invitation offers delegations, and names no address.
+        let offering = Invitation::offering(
+            &interface,
+            &keypair,
+            "10.0.0.0/16".parse().unwrap(),
+            prefixes(&["10.0.0.9/32"]),
+            server.clone(),
+        );
+        let table = written(&offering);
+        assert!(!table.contains_key("address"));
+        assert_eq!(table["network-cidr"].as_str(), Some("10.0.0.0/16"));
+        assert_eq!(table["delegations"][0].as_str(), Some("10.0.0.9/32"));
+
+        // One of the format of v2.0.0 names the address, which a client that predates TLS reads
+        // into its config, and nothing else.
+        let legacy =
+            Invitation::legacy(&interface, &keypair, "10.0.0.9/16".parse().unwrap(), server);
+        let table = written(&legacy);
+        assert_eq!(table["address"].as_str(), Some("10.0.0.9/16"));
+        assert!(!table.contains_key("network-cidr") && !table.contains_key("delegations"));
+        let config: InterfaceConfig = toml::from_str(&toml::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            config.interface.address,
+            "10.0.0.9/16".parse::<IpNet>().unwrap()
+        );
     }
 
     const KEY_A: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";

@@ -18,11 +18,14 @@ use innernet_node::{
     runtime::{self, Triggers},
 };
 use innernet_shared::{
-    interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
-    AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts,
-    Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts,
-    NatOpts, NetworkOpts, OverrideEndpointOpts, OverridePeerEndpointOpts, PeerContents,
-    RenameCidrOpts, RenamePeerOpts, ServerCapabilities, WrappedIoError,
+    interface_config::{InterfaceConfig, Invitation},
+    prompts, wg,
+    wg::PeerInfoExt,
+    AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
+    EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
+    IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
+    OverridePeerEndpointOpts, PeerContents, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
+    WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -288,19 +291,20 @@ async fn install(
 ) -> Result<(), Error> {
     let mut invite_file = File::open(invite).with_path(invite)?;
     innernet_shared::warn_on_dangerous_mode(&invite_file, invite).with_path(invite)?;
-    let mut config = InterfaceConfig::from_file(&mut invite_file)?;
+    let mut invitation = Invitation::from_file(&mut invite_file)?.resolve()?;
     if let Some(listen_port) = listen_port {
-        config.interface.listen_port = Some(listen_port);
+        invitation.config.interface.listen_port = Some(listen_port);
     }
 
+    let network_name = &invitation.config.interface.network_name;
     let interface_name = if install_opts.default_name {
-        config.interface.network_name.clone()
+        network_name.clone()
     } else if let Some(ref iface) = install_opts.name {
         iface.clone()
     } else {
         Input::with_theme(&*prompts::THEME)
             .with_prompt("Interface name")
-            .default(config.interface.network_name.clone())
+            .default(network_name.clone())
             .interact()?
     };
 
@@ -310,7 +314,7 @@ async fn install(
         &opts.data_dir,
         &opts.network,
         &interface_name,
-        config,
+        invitation,
     )
     .await?;
 

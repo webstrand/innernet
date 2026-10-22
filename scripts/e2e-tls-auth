@@ -106,6 +106,22 @@ invitation() { # <invitation> <table> <key>
     python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$@"
 }
 
+# Prints the source address that a client takes from an invitation, with the prefix of the
+# network: the address that it names, or else the lowest address of the delegations that it
+# offers.
+invitation_address() { # <invitation>
+    python3 -I - "$1" <<'EOF'
+import ipaddress, sys, tomllib
+interface = tomllib.load(open(sys.argv[1], "rb"))["interface"]
+if "address" in interface:
+    print(interface["address"])
+else:
+    network = ipaddress.ip_network(interface["network-cidr"])
+    lowest = min(ipaddress.ip_network(d).network_address for d in interface["delegations"])
+    print(f"{lowest}/{network.prefixlen}")
+EOF
+}
+
 # Prints the bytes of a base64 key in hex.
 key_hex() { python3 -I -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).hex().upper())' "$1"; }
 # Prints the condition that selects the peer with a public key, which a database holds as raw
@@ -143,7 +159,7 @@ old_style_redeem() { # <namespace> <invitation>
         ns "$peer" wg set wg0 private-key /dev/fd/0 listen-port 51820 \
             peer "$server_key" endpoint 198.18.0.1:51820 allowed-ips "${api%:*}/32" \
             persistent-keepalive 1
-    ns "$peer" ip addr add "$(invitation "$invite" interface address)" dev wg0
+    ns "$peer" ip addr add "$(invitation_address "$invite")" dev wg0
     ns "$peer" ip link set wg0 up
     plain "$peer" POST /v1/user/redeem "{\"public_key\": \"$(wg pubkey <"$work/$peer.key")\"}"
 }
@@ -177,9 +193,18 @@ for peer in a adm old new; do
     server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin "$admin" \
         --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
 done
-# The server issued old's invitation before it spoke TLS. The server latched the invitation, and
-# the operator cleared the latch, so that a client that predates TLS can redeem it.
+# The server issued old's invitation before it spoke TLS, in the format of v2.0.0, which names the
+# peer's address rather than offering delegations, and states no features. The server latched the
+# invitation, and the operator cleared the latch, so that a client that predates TLS can redeem it.
 db "UPDATE peers SET tls = 0 WHERE name = 'old'"
+python3 -I - "$work/old.toml" "$(invitation_address "$work/old.toml")" <<'EOF'
+import re, sys
+path, address = sys.argv[1:]
+text = open(path).read()
+text = re.sub(r'(?m)^(network-cidr|delegations|features) = .*\n', '', text)
+text = text.replace('[interface]\n', f'[interface]\naddress = "{address}"\n', 1)
+open(path, "w").write(text)
+EOF
 server_key=$(invitation "$work/a.toml" server public-key)
 api=$(invitation "$work/a.toml" server internal-endpoint)
 
