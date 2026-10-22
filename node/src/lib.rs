@@ -11,6 +11,7 @@
 //! - [`claims`] decides what each peer claims against what is pinned to other keys.
 //! - [`snapshot`] is the output: what the node configures, as a snapshot of what it accepted,
 //!   which the adapters of [`realize`] realize, the tunnel and the DNS server of [`dns`].
+//! - [`own`] makes the node's own announcement.
 //! - [`runtime`] runs the rounds of a node through its link to the coordinator, on the events of
 //!   [`addresses`] and [`events`], with the NAT traversal of [`nat`].
 
@@ -21,6 +22,7 @@ pub mod db;
 pub mod dns;
 pub mod events;
 pub mod nat;
+pub mod own;
 pub mod realize;
 pub mod runtime;
 pub mod snapshot;

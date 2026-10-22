@@ -160,6 +160,14 @@ impl Endpoint {
         self.port
     }
 
+    /// The endpoint with the host of `other` and the port of `self`.
+    pub fn with_host_of(&self, other: &Endpoint) -> Endpoint {
+        Endpoint {
+            host: other.host.clone(),
+            port: self.port,
+        }
+    }
+
     /// The host of the endpoint, if it is an IP address.
     pub fn ip(&self) -> Option<IpAddr> {
         match &self.host {

@@ -24,8 +24,8 @@ use innernet_shared::{
     AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, CidrTree, DelegationOpts, DeleteCidrOpts,
     EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts, Interface,
     IoErrorContext, LegacyCapabilities, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, PeerContents, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
-    WrappedIoError,
+    OverridePeerEndpointOpts, PeerContents, Prefix, RenameCidrOpts, RenamePeerOpts,
+    ServerCapabilities, WrappedIoError,
 };
 use std::{
     collections::HashMap,
@@ -40,7 +40,13 @@ use wireguard_control::{Device, InterfaceName, PeerInfo};
 mod util;
 
 struct PeerState<'a> {
+    /// The peer as it takes effect.
     peer: &'a PeerContents,
+    /// The peer as the coordination server reports it, with the ranges that it assigns this
+    /// client as the delegations of this client.
+    assigned: &'a PeerContents,
+    /// Whether the peer has announced.
+    announces: bool,
     info: Option<&'a PeerInfo>,
 }
 
@@ -642,31 +648,43 @@ async fn override_endpoint(
     opts: &Opts,
     sub_opts: OverrideEndpointOpts,
 ) -> Result<(), Error> {
-    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let server_capabilities = get_server_capabilities(&config, opts, interface).await?;
 
     let endpoint_contents = if sub_opts.unset {
         prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
     } else {
-        let unspecified_ip_supported = unspecified_ip_supported(&config, opts, interface).await?;
         let port = match config.interface.listen_port {
             Some(port) => port,
             None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
         };
-        let endpoint = prompt_override_endpoint(unspecified_ip_supported, &sub_opts, port)?;
+        let endpoint =
+            prompt_override_endpoint(server_capabilities.unspecified_ip, &sub_opts, port)?;
         endpoint.map(EndpointContents::Set)
     };
 
-    if let Some(contents) = endpoint_contents {
-        log::info!("requesting endpoint update...");
-        RestClient::for_interface(&config, &opts.data_dir, interface)?
-            .http_form::<_, ()>("PUT", "/user/endpoint", contents)
-            .await?;
-        log::info!(
-            "endpoint override {}",
-            if sub_opts.unset { "unset" } else { "set" }
-        );
-    } else {
-        log::info!("exiting without overriding endpoint");
+    match endpoint_contents {
+        Some(contents) if server_capabilities.tls.accepts_announcements() => {
+            // A server that accepts announcements takes the endpoint only from this client's
+            // announcements, which the config states, and which each fetch makes.
+            config.interface.external_endpoint = contents.into();
+            config.save(&opts.config_dir, interface)?;
+            log::info!(
+                "endpoint override {} in the config; it is announced on the next fetch.",
+                if sub_opts.unset { "unset" } else { "set" }
+            );
+        },
+        Some(contents) => {
+            log::info!("requesting endpoint update...");
+            RestClient::for_interface(&config, &opts.data_dir, interface)?
+                .http_form::<_, ()>("PUT", "/user/endpoint", contents)
+                .await?;
+            log::info!(
+                "endpoint override {}",
+                if sub_opts.unset { "unset" } else { "set" }
+            );
+        },
+        None => log::info!("exiting without overriding endpoint"),
     }
 
     Ok(())
@@ -761,26 +779,41 @@ fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, E
         || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
 }
 
-/// Whether the server fills in the host at which it observes this client when `override-endpoint`
-/// sets an endpoint whose host is unspecified. A server in plain HTTP states it in its
-/// capabilities; one that speaks TLS does for a peer that has never announced, which this client
-/// is.
-async fn unspecified_ip_supported(
+/// What `override-endpoint` must know of the server: the capabilities that the TLS API states,
+/// which are the default for a server in plain HTTP, and whether the host of an endpoint may be
+/// unspecified.
+#[derive(Default)]
+struct EndpointCapabilities {
+    tls: ServerCapabilities,
+    unspecified_ip: bool,
+}
+
+/// The capabilities of the server, read in the transport in which the client talks to it. A
+/// server in plain HTTP states whether it fills in an unspecified host itself. Over TLS, the host
+/// may be unspecified if the server accepts announcements, since the client then completes the
+/// host with the endpoint at which the server observes it.
+async fn get_server_capabilities(
     config: &InterfaceConfig,
     opts: &Opts,
     interface: &InterfaceName,
-) -> Result<bool, Error> {
+) -> Result<EndpointCapabilities, Error> {
     let rest_client = RestClient::for_interface(config, &opts.data_dir, interface)?;
-    let maybe_info: Result<bool, RestError> = if rest_client.speaks_tls() {
+    let maybe_info: Result<EndpointCapabilities, RestError> = if rest_client.speaks_tls() {
         rest_client
             .http::<ServerCapabilities>("GET", "/user/capabilities")
             .await
-            .map(|_| true)
+            .map(|tls| EndpointCapabilities {
+                unspecified_ip: tls.accepts_announcements(),
+                tls,
+            })
     } else {
         rest_client
             .http::<LegacyCapabilities>("GET", "/user/capabilities")
             .await
-            .map(|legacy| legacy.unspecified_ip_in_override_endpoint)
+            .map(|legacy| EndpointCapabilities {
+                tls: ServerCapabilities::default(),
+                unspecified_ip: legacy.unspecified_ip_in_override_endpoint,
+            })
     };
     match maybe_info {
         Ok(info) => Ok(info),
@@ -840,31 +873,30 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
             },
         };
 
-        let peers = store.peers()?;
+        let assigned = store.peers()?;
+        let peers = store.effective_peers()?;
         let cidrs = store.cidrs()?;
-        let me = peers
-            .iter()
-            .find(|p| p.public_key == public_key)
-            .ok_or_else(|| anyhow!("missing peer info"))?;
+        let state_of = |public_key: &str, info| {
+            let index = assigned.iter().position(|p| p.public_key == public_key)?;
+            Some(PeerState {
+                peer: &peers[index],
+                assigned: &assigned[index],
+                announces: store.announces(public_key).unwrap_or(false),
+                info,
+            })
+        };
+        let me = state_of(&public_key, None).ok_or_else(|| anyhow!("missing peer info"))?;
 
         let mut peer_states = device_info
             .peers
             .iter()
             .map(|info| {
                 let public_key = info.config.public_key.to_base64();
-                match peers.iter().find(|p| p.public_key == public_key) {
-                    Some(peer) => Ok(PeerState {
-                        peer,
-                        info: Some(info),
-                    }),
-                    None => Err(anyhow!("peer {} isn't an innernet peer.", public_key)),
-                }
+                state_of(&public_key, Some(info))
+                    .ok_or_else(|| anyhow!("peer {} isn't an innernet peer.", public_key))
             })
             .collect::<Result<Vec<PeerState>, _>>()?;
-        peer_states.push(PeerState {
-            peer: me,
-            info: None,
-        });
+        peer_states.push(me);
 
         print_interface(&device_info, short || tree)?;
         // Peers without an address come last.
@@ -885,8 +917,68 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
                 print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
             }
         }
+        print_unrouted_pins(&store, &peers, verbose);
     }
     Ok(())
+}
+
+/// Prints the prefixes pinned to a peer's key that aren't routed to it whole, with the reason:
+/// those of a disabled peer, those that the coordination server has withdrawn from a peer that
+/// has never signed an announcement, which stay pinned since an unsigned announcement releases
+/// nothing, and those that the allowed IPs of a peer leave out, whole or in part. A prefix stays
+/// pinned while the peer claims it, whether or not it is routed, so that no other peer can take
+/// it, and an announcement that conflicts with it is refused; this lists what holds such
+/// prefixes. `peers` are those of `store` as they take effect.
+fn print_unrouted_pins(store: &DataStore, peers: &[PeerContents], verbose: bool) {
+    let pins = match store.pins() {
+        Ok(pins) => pins,
+        Err(e) => {
+            log::warn!("failed to read the pins: {e:#}");
+            return;
+        },
+    };
+    let mut unrouted: Vec<(Prefix, &PeerContents, &str)> = pins
+        .into_iter()
+        .filter_map(|(pinned, prefix)| {
+            let peer = peers.iter().find(|p| p.public_key == pinned.public_key)?;
+            let routed = peer.allowed_ips.as_deref().unwrap_or(&peer.delegations);
+            let reason = if peer.is_disabled {
+                "disabled"
+            } else if !peer
+                .delegations
+                .iter()
+                .any(|claimed| claimed.contains(&prefix))
+            {
+                "withdrawn"
+            } else if !routed.iter().any(|routed| routed.overlaps(&prefix)) {
+                "not allowed"
+            } else if !routed.iter().any(|routed| routed.contains(&prefix)) {
+                "allowed in part"
+            } else {
+                return None;
+            };
+            Some((prefix, peer, reason))
+        })
+        .collect();
+    if unrouted.is_empty() {
+        return;
+    }
+    unrouted.sort_by_key(|(prefix, ..)| *prefix);
+    println!("  {}:", "pinned, not routed".bold());
+    for (prefix, peer, reason) in unrouted {
+        let public_key = if verbose {
+            peer.public_key.clone()
+        } else {
+            format!("{}…", &peer.public_key[..10])
+        };
+        println!(
+            "    {}: {} ({}), {}",
+            prefix.to_string().yellow(),
+            peer.display_name().escape_debug(),
+            public_key.dimmed(),
+            reason
+        );
+    }
 }
 
 fn print_tree(
@@ -911,7 +1003,7 @@ fn print_tree(
 
     for peer in peers
         .iter()
-        .filter(|p| p.peer.cidr(cidr.all()) == Some(&**cidr))
+        .filter(|p| p.assigned.cidr(cidr.all()) == Some(&**cidr))
     {
         let endpoint_has_local_override = interface_config
             .endpoint_override_for_peer(peer.peer)
@@ -952,7 +1044,12 @@ fn print_peer(
     endpoint_has_local_override: bool,
 ) {
     let pad = level * 2;
-    let PeerState { peer, info } = peer;
+    let PeerState {
+        peer,
+        assigned,
+        announces,
+        info,
+    } = peer;
     let public_key = if verbose {
         &peer.public_key
     } else {
@@ -995,9 +1092,34 @@ fn print_peer(
         println_pad!(
             pad,
             "  {}: {}",
-            "delegations".bold(),
+            "delegation".bold(),
             peer.display_delegations()
         );
+        // A peer that announces states what it accepts traffic for, and its primary IP; this
+        // client also sees the ranges that the server assigns it.
+        if *announces {
+            let allowed_ips = peer.allowed_ips.as_deref().unwrap_or(&peer.delegations);
+            let allowed_ips: Vec<String> = allowed_ips.iter().map(Prefix::to_string).collect();
+            println_pad!(
+                pad,
+                "  {}: {}",
+                "allowed ips".bold(),
+                if allowed_ips.is_empty() {
+                    "[none]".to_string()
+                } else {
+                    allowed_ips.join(", ")
+                }
+            );
+            println_pad!(pad, "  {}: {}", "primary ip".bold(), peer.display_address());
+            if info.is_none() && assigned.delegations != peer.delegations {
+                println_pad!(
+                    pad,
+                    "  {}: {}",
+                    "assigned".bold(),
+                    assigned.display_delegations()
+                );
+            }
+        }
         if let Some(info) = info {
             if let Some(endpoint) = info.config.endpoint {
                 println_pad!(

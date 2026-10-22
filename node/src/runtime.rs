@@ -1,8 +1,7 @@
 //! The runtime of a node: the rounds that every node runs, whatever its role, and the loop that
 //! runs them. A round brings the node's store up to date through its [`Link`] to the coordinator,
-//! configures the tunnel from what the store holds, reports the node's candidates, and starts the
-//! NAT traversal of the peers that it changed. The host publishes the names of the round's
-//! snapshot.
+//! configures the tunnel from what the store holds, announces the node itself, and starts the NAT
+//! traversal of the peers that it changed. The host publishes the names of the round's snapshot.
 //!
 //! A round runs when the coordinator signals a change of the store through [`StoreChanged`], when
 //! the host's addresses change, and, for a node that polls its coordinator, at its interval. The
@@ -15,14 +14,20 @@ use crate::{
     addresses,
     events::{TunnelEvent, TunnelEvents},
     nat::{NatTraverse, STEP_INTERVAL},
+    own,
     realize::{Realized, TunnelBackend},
-    snapshot::{Snapshot, SnapshotConfig},
+    snapshot::{Own, Snapshot, SnapshotConfig},
 };
-use anyhow::Error;
-use innernet_shared::{get_local_addrs, Endpoint, NatOpts};
+use anyhow::{Context as _, Error};
+use innernet_shared::{
+    announcement::{self, SignedAnnouncement},
+    get_local_addrs,
+    interface_config::InterfaceInfo,
+    xeddsa, Endpoint, NatOpts, PeerContents, Prefix,
+};
 use std::{future::pending, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::Notify, time::Instant};
-use wireguard_control::InterfaceName;
+use wireguard_control::{InterfaceName, Key};
 
 /// The signal by which a coordinator that writes its node's store tells the node that the store
 /// changed, so that the node runs a round at once. A signal given while the node runs a round
@@ -41,24 +46,44 @@ impl StoreChanged {
     }
 }
 
-/// A node's link to its coordinator, through which its store holds what the coordinator reports,
-/// and its own candidates reach the coordinator.
+/// A node's link to its coordinator, through which its store holds what the coordinator relays,
+/// and its own announcement reaches the coordinator.
 #[allow(async_fn_in_trait)]
 pub trait Link {
     /// Brings the node's store up to date with the coordinator.
     async fn sync(&mut self) -> Result<(), Error>;
 
-    /// The snapshot of the node's store, as `config` configures it.
-    fn snapshot(&self, config: &SnapshotConfig) -> Result<Snapshot, Error>;
+    /// The snapshot of the node's store, as `config` configures it, for `own`.
+    fn snapshot(&self, config: &SnapshotConfig, own: Option<Own>) -> Result<Snapshot, Error>;
 
-    /// Reports `candidates`, the endpoints at which other peers try the node during NAT
-    /// traversal, to the coordinator.
-    async fn report_candidates(&mut self, candidates: Vec<Endpoint>) -> Result<(), Error>;
+    /// The timestamp of the last announcement of the peer with `public_key` that the node's store
+    /// accepted.
+    fn last_announced(&self, public_key: &str) -> Result<Option<u64>, Error>;
+
+    /// The node's record as the coordinator assigns it: the ranges among which it claims its
+    /// delegation, and the name that it is offered.
+    fn assignment(&self) -> Result<Option<PeerContents>, Error>;
+
+    /// The types of claims that the coordinator checks, none if it accepts no announcement, or
+    /// `None` if the node can't tell.
+    fn claim_types(&self) -> Option<Vec<String>>;
+
+    /// The endpoint at which the coordinator observes the node, if any.
+    fn observed_endpoint(&self) -> Option<Endpoint>;
+
+    /// Hands `signed`, the node's own announcement, to the coordinator, which checks the claims
+    /// of `claim_types`, and records it in the node's store once the coordinator accepted it.
+    async fn announce(
+        &mut self,
+        signed: &SignedAnnouncement,
+        claim_types: &[String],
+    ) -> Result<(), Error>;
 }
 
-/// A node: its tunnel, and what decides its candidates.
+/// A node, as the config of its interface describes it.
 pub struct Node {
     pub interface: InterfaceName,
+    pub info: InterfaceInfo,
     /// The port at which the tunnel listens, at which the other addresses of the host are the
     /// node's candidates.
     pub listen_port: u16,
@@ -79,22 +104,32 @@ pub struct Round {
 
 impl Node {
     /// Runs a round through `link`: brings the store up to date, configures the tunnel from its
-    /// snapshot, reports the node's candidates, and starts the NAT traversal of the peers that it
-    /// changed. A failure to report the candidates is logged and fails nothing, so that the node
-    /// keeps what it has configured.
+    /// snapshot, announces the node, and starts the NAT traversal of the peers that it changed. A
+    /// failure to announce is logged and fails nothing, so that the node keeps what it has
+    /// configured.
     pub async fn round(&mut self, link: &mut impl Link) -> Result<Round, Error> {
         link.sync().await?;
-        let snapshot = link.snapshot(&self.snapshot_config)?;
+        let own_key = self.public_key()?;
+        let snapshot = link.snapshot(
+            &self.snapshot_config,
+            Some(Own {
+                public_key: &own_key,
+                address: self.info.address.addr(),
+                extra: &self.info.extra_addresses,
+            }),
+        )?;
+        for address in &self.info.extra_addresses {
+            if !snapshot.own_addresses.contains(address) {
+                own::warn_once(format!(
+                    "not adding the extra address {address}, which lies within no prefix that \
+                     this node claims."
+                ));
+            }
+        }
         let events = self.tunnel.events();
         let realized = self.tunnel.realize(&snapshot)?;
-        let candidates = self.candidates()?;
-        log::info!(
-            "reporting {} interface address{} as NAT traversal candidates",
-            candidates.len(),
-            if candidates.len() == 1 { "" } else { "es" },
-        );
-        if let Err(e) = link.report_candidates(candidates).await {
-            log::warn!("failed to report this node's candidates: {e:#}");
+        if let Err(e) = self.announce(link).await {
+            log::warn!("failed to announce this node: {e:#}");
         }
         let nat = match self.nat.no_nat_traversal {
             true => None,
@@ -106,6 +141,59 @@ impl Node {
             nat,
             events,
         })
+    }
+
+    /// Announces the node through `link`, as [`own::own_announcement`] makes the announcement of
+    /// what the coordinator assigns it, with the endpoints at the other addresses of the host as
+    /// its candidates. No announcement is made to a coordinator that accepts none, or whose claim
+    /// types the node can't tell.
+    pub async fn announce(&self, link: &mut impl Link) -> Result<(), Error> {
+        let Some(claim_types) = link.claim_types().filter(|types| !types.is_empty()) else {
+            return Ok(());
+        };
+        let own_key = self.public_key()?;
+        let own = link
+            .assignment()?
+            .context("the coordinator reports no record of this node")?;
+        let last = link.last_announced(&own_key)?;
+        let announcement = own::own_announcement(
+            &self.info,
+            &own,
+            self.candidates()?,
+            link.observed_endpoint().as_ref(),
+            &claim_types,
+            last,
+            announcement::timestamp_now(),
+        );
+        let private_key = xeddsa::PrivateKey::from_base64(&self.info.private_key)?;
+        let signed = announcement.sign(&private_key)?;
+        log::info!(
+            "announcing {} and {} endpoint{}.",
+            if announcement.claims.delegation.is_empty() {
+                "no delegation".to_string()
+            } else {
+                announcement
+                    .claims
+                    .delegation
+                    .iter()
+                    .map(Prefix::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            announcement.endpoints.len(),
+            if announcement.endpoints.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+        link.announce(&signed, &claim_types).await
+    }
+
+    pub fn public_key(&self) -> Result<String, Error> {
+        Ok(Key::from_base64(&self.info.private_key)?
+            .get_public()
+            .to_base64())
     }
 
     /// The endpoints at which other peers try the node during NAT traversal.

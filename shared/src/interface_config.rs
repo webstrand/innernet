@@ -121,7 +121,8 @@ pub struct InterfaceInfo {
     pub network_name: String,
 
     /// The invited peer's internal IP address that's been allocated to it, inside
-    /// the entire network's CIDR prefix.
+    /// the entire network's CIDR prefix. It is the primary IP that this client announces, at
+    /// which its name resolves, and which must lie within the delegation that it claims.
     pub address: IpNet,
 
     /// WireGuard private key (base64)
@@ -129,6 +130,45 @@ pub struct InterfaceInfo {
 
     /// The local listen port. A random port will be used if `None`.
     pub listen_port: Option<u16>,
+
+    /// The endpoint that this client announces, at which other peers reach it, or `None` to
+    /// announce the endpoint at which the server observes it, if `announce_observed_endpoint`
+    /// allows it. An endpoint whose host is unspecified, such as `0.0.0.0:51820`, takes the host
+    /// of the observed endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_endpoint: Option<Endpoint>,
+
+    /// Whether this client announces the endpoint at which the server observes it, as the state
+    /// reports it: as its endpoint if `external_endpoint` is `None`, to complete the host of an
+    /// `external_endpoint` whose host is unspecified, and otherwise as its first candidate. This
+    /// client signs it like the rest of its announcement.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub announce_observed_endpoint: bool,
+
+    /// The delegation that this client claims in its announcements: prefixes each within one of
+    /// the ranges that the server assigns it, or `None` for every assigned range whole. The
+    /// addresses that it claims are its own: no other key may take them while it claims them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Vec<Prefix>>,
+
+    /// The prefixes that this client states that it accepts traffic for, which other peers route
+    /// to it, or `None` for all of its delegation. Other peers shrink them to the delegation that
+    /// it claims; a narrower list routes nothing of the rest of the delegation here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_ips: Option<Vec<Prefix>>,
+
+    /// The addresses that this client assigns itself on its interface besides the address of
+    /// `address`, each within the delegation that it claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_addresses: Vec<IpAddr>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
 }
 
 impl InterfaceInfo {
@@ -138,6 +178,11 @@ impl InterfaceInfo {
             private_key: keypair.private.to_base64(),
             address,
             listen_port: None,
+            external_endpoint: None,
+            announce_observed_endpoint: true,
+            delegation: None,
+            allowed_ips: None,
+            extra_addresses: vec![],
         }
     }
 }
@@ -498,6 +543,11 @@ impl Invitation {
             address,
             private_key,
             listen_port,
+            external_endpoint: None,
+            announce_observed_endpoint: true,
+            delegation: None,
+            allowed_ips: None,
+            extra_addresses: vec![],
         };
         Ok(ResolvedInvitation {
             config: InterfaceConfig::new(interface, self.server),

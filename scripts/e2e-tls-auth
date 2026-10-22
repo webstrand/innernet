@@ -471,14 +471,14 @@ ns a ip addr add 10.66.1.70/32 dev e2e
 ns adm ping -c1 -W2 10.66.1.70 >/dev/null || fail "adm can't reach a within its delegation"
 pass "adm reaches a at an address of its delegation"
 
-client adm withdraw-delegation e2e --name a --prefix 10.66.1.64/28 --yes ||
-    fail "withdraw-delegation as adm"
-client adm fetch e2e || fail "fetch as adm"
-if routed adm "$a_key" | grep -qF 10.66.1.64/28; then
-    fail "adm still routes the withdrawn delegation to a"
+# a claims the prefix in its announcements, so the server never withdraws it, and adm keeps it
+# pinned to a.
+if client adm withdraw-delegation e2e --name a --prefix 10.66.1.64/28 --yes; then
+    fail "the server withdrew a delegation that a claims"
 fi
-[ "$(pins adm "$a_key")" = 2 ] || fail "adm doesn't keep the withdrawn delegation pinned to a"
-pass "the withdrawn delegation is no longer routed, but stays pinned to a"
+grep -q "claims .* in its announcement" "$work/adm.log" || fail "the refusal doesn't explain itself"
+[ "$(pins adm "$a_key")" = 2 ] || fail "adm doesn't pin to a the delegation that a claims"
+pass "the server refuses to withdraw what a claims, which adm pins to a"
 
 if server withdraw-delegation e2e --name innernet-server --prefix 10.66.0.1/32 --yes \
     >"$work/withdraw.log" 2>&1; then

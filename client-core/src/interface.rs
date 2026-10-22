@@ -2,7 +2,7 @@ pub use innernet_shared::interface_config::InterfaceConfig;
 pub use wireguard_control::InterfaceName;
 
 use crate::{
-    data_store::DataStore,
+    data_store::{DataStore, Relay},
     rest_client::{RestClient, RestError},
     HostsOpts, NatOpts, NetworkOpts, WrappedIoError,
 };
@@ -12,12 +12,13 @@ use innernet_node::{
     events::EventSource,
     realize::{DnsService, Realized, WireGuard},
     runtime::{self, Link, Node, Round},
-    snapshot::{Snapshot, SnapshotConfig},
+    snapshot::{Own, Snapshot, SnapshotConfig},
 };
 use innernet_shared::{
+    announcement::SignedAnnouncement,
     interface_config::{ResolvedInvitation, FEATURE_TLS},
     wg, Endpoint, IoErrorContext, PeerChange, PeerContents, Prefix, RedeemContents,
-    REDEEM_TRANSITION_WAIT,
+    ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, path::Path};
 use thiserror::Error;
@@ -353,10 +354,13 @@ pub async fn round(
             );
         }
     }
+    let rest_client = RestClient::for_interface(&config, data_dir, interface)?;
     let device = Device::get(interface, network_opts.backend)?;
+    let listen_port = device.listen_port.unwrap_or(51820);
     let mut node = Node {
         interface: *interface,
-        listen_port: device.listen_port.unwrap_or(51820),
+        info: config.interface.clone(),
+        listen_port,
         nat: nat.clone(),
         snapshot_config: SnapshotConfig::default(),
         tunnel: Box::new(WireGuard {
@@ -367,11 +371,12 @@ pub async fn round(
         }),
     };
     let mut link = RemoteLink {
-        interface: *interface,
-        config: &config,
         store,
-        rest_client: RestClient::for_interface(&config, data_dir, interface)?,
-        fetched: false,
+        rest_client: &rest_client,
+        config: &config,
+        interface,
+        state: None,
+        claim_types: None,
     };
     let round = node.round(&mut link).await?;
     if let Some(dns) = &mut state.dns {
@@ -388,27 +393,35 @@ pub async fn round(
     } else {
         log::info!("{}", "peers are already up to date".green());
     }
+
+    // A server that checks no claims accepts no announcement, and takes what it relays of this
+    // client as this client reports it.
+    if link.state.is_some() && link.claim_types.as_deref() == Some(&[]) {
+        report_candidates(&rest_client, nat, listen_port).await?
+    }
+
     Ok(round)
 }
 
-/// A client's link to its coordinator, over the API.
+/// A client's link to its coordinator, over the API: each round fetches the state and merges it
+/// into the data store, as [`DataStore::update`] does, and the client announces itself to the
+/// coordinator.
 struct RemoteLink<'a> {
-    interface: InterfaceName,
-    config: &'a InterfaceConfig,
     store: DataStore,
-    rest_client: RestClient<'a>,
-    /// Whether the last sync reached the coordinator.
-    fetched: bool,
+    rest_client: &'a RestClient<'a>,
+    config: &'a InterfaceConfig,
+    interface: &'a InterfaceName,
+    /// The state that the coordinator reported in the last round, or `None` if the client could not
+    /// reach the coordinator and goes on with what its data store holds.
+    state: Option<State>,
+    claim_types: Option<Vec<String>>,
 }
 
 impl Link for RemoteLink<'_> {
-    /// Fetches the state from the coordinator, and merges it into the data store, which validates
-    /// it before any of it reaches the interface. A coordinator that can't be reached leaves the
-    /// data store as it is, unless the data store holds no peer to configure.
     async fn sync(&mut self) -> Result<(), Error> {
-        self.fetched = false;
-        let state = match self.rest_client.get_state().await {
-            Ok(state) => state,
+        let interface = self.interface;
+        self.state = match self.rest_client.get_state().await {
+            Ok(state) => Some(state),
             Err(e) if e.is_transport_error() => {
                 if self.store.peers()?.is_empty() {
                     bail!(
@@ -420,55 +433,85 @@ impl Link for RemoteLink<'_> {
                     "Could not connect to the innernet server, proceeding with cached state \
                      instead."
                 );
-                return Ok(());
+                None
             },
             Err(e) => bail!(e),
         };
+        let Some(state) = &self.state else {
+            self.claim_types = None;
+            return Ok(());
+        };
+
+        // The types of claims that the server checks, of which this client accepts the claims of
+        // the announcements that the server relays, and announces its own.
+        self.claim_types = claim_types(self.rest_client).await;
+
+        // The data store validates the reported state before any of it reaches the interface. A
+        // server that doesn't speak TLS relays no announcements, so each of its peers is taken to
+        // make the unsigned announcement of what the server reports of it.
+        let relay = match self.claim_types.as_deref() {
+            _ if !self.rest_client.speaks_tls() => Relay::Synthesized,
+            Some(claim_types) => Relay::Announcements(claim_types),
+            None => Relay::Unknown,
+        };
         let dropped = self
             .store
-            .update(&state)
-            .context(self.interface.to_string())?;
+            .update(state, relay)
+            .context(interface.to_string())?;
         for (peer, e) in dropped {
             log::warn!(
                 "{}: dropping peer {} at {} from the update: {}",
-                self.interface.as_str_lossy().yellow(),
+                interface.as_str_lossy().yellow(),
                 peer.public_key,
                 peer.display_address(),
                 e
             );
         }
-        record_coordinator(&mut self.store, self.config, &self.rest_client);
-        self.fetched = true;
+        record_coordinator(&mut self.store, self.config, self.rest_client);
         Ok(())
     }
 
-    fn snapshot(&self, config: &SnapshotConfig) -> Result<Snapshot, Error> {
-        self.store.snapshot_as(config)
+    fn snapshot(&self, config: &SnapshotConfig, own: Option<Own>) -> Result<Snapshot, Error> {
+        self.store.snapshot_as(config, own)
     }
 
-    /// Reports `candidates` to a coordinator that the last sync reached.
-    async fn report_candidates(&mut self, candidates: Vec<Endpoint>) -> Result<(), Error> {
-        if !self.fetched {
-            return Ok(());
-        }
-        for candidate in &candidates {
-            log::debug!("  candidate: {}", candidate);
-        }
-        match self
-            .rest_client
-            .http_form::<_, ()>("PUT", "/user/candidates", &candidates)
-            .await
-        {
-            Err(e) if e.has_status_of(404) => {
-                log::warn!("your network is using an old version of innernet-server that doesn't support NAT traversal candidate reporting.");
-                Ok(())
-            },
-            Err(e) => Err(e.into()),
-            Ok(()) => {
-                log::debug!("candidates successfully reported");
-                Ok(())
-            },
-        }
+    fn last_announced(&self, public_key: &str) -> Result<Option<u64>, Error> {
+        Ok(self
+            .store
+            .announcement(public_key)?
+            .map(|announcement| announcement.timestamp))
+    }
+
+    fn assignment(&self) -> Result<Option<PeerContents>, Error> {
+        let own_key = self.config.interface.public_key()?;
+        Ok(self.state.as_ref().and_then(|state| {
+            state
+                .peers
+                .iter()
+                .find(|peer| peer.public_key == own_key)
+                .cloned()
+        }))
+    }
+
+    fn claim_types(&self) -> Option<Vec<String>> {
+        self.state.as_ref().and(self.claim_types.clone())
+    }
+
+    fn observed_endpoint(&self) -> Option<Endpoint> {
+        self.state.as_ref()?.observed_endpoint.clone()
+    }
+
+    async fn announce(
+        &mut self,
+        signed: &SignedAnnouncement,
+        claim_types: &[String],
+    ) -> Result<(), Error> {
+        self.rest_client
+            .http_form::<_, ()>("PUT", "/user/announcement", signed)
+            .await?;
+        let own_key = self.config.interface.public_key()?;
+        self.store
+            .accept_announcement(&own_key, signed, claim_types)
     }
 }
 
@@ -561,6 +604,54 @@ fn print_peer_diff(peers: &[PeerContents], diff: &Realized) {
             log::debug!("    {}", change);
         }
     }
+}
+
+/// The types of claims that the coordination server checks in announcements, as its capabilities
+/// state them: none for a server that doesn't speak TLS, which accepts no announcement, or `None`,
+/// with a warning, if this client can't read them.
+async fn claim_types(rest_client: &RestClient<'_>) -> Option<Vec<String>> {
+    if !rest_client.speaks_tls() {
+        return Some(vec![]);
+    }
+    match rest_client
+        .http::<ServerCapabilities>("GET", "/user/capabilities")
+        .await
+    {
+        Ok(capabilities) => Some(capabilities.announcement_claims),
+        Err(e) => {
+            log::warn!("failed to read the capabilities of the innernet server: {e}");
+            None
+        },
+    }
+}
+
+async fn report_candidates(
+    rest_client: &RestClient<'_>,
+    nat: &NatOpts,
+    listen_port: u16,
+) -> Result<(), Error> {
+    let candidates = runtime::local_candidates(nat, listen_port)?;
+    log::info!(
+        "reporting {} interface address{} as NAT traversal candidates",
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "es" },
+    );
+    for candidate in &candidates {
+        log::debug!("  candidate: {}", candidate);
+    }
+    if let Err(e) = rest_client
+        .http_form::<_, ()>("PUT", "/user/candidates", &candidates)
+        .await
+    {
+        if e.has_status_of(404) {
+            log::warn!("your network is using an old version of innernet-server that doesn't support NAT traversal candidate reporting.")
+        } else {
+            return Err(e.into());
+        }
+    }
+
+    log::debug!("candidates successfully reported");
+    Ok(())
 }
 
 pub fn interface_is_up(backend: Backend, interface_name: &InterfaceName) -> bool {

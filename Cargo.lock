@@ -928,6 +928,7 @@ dependencies = [
  "log",
  "rusqlite",
  "rusqlite_migration",
+ "serde_json",
  "tokio",
  "wireguard-control",
 ]

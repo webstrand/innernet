@@ -1,11 +1,12 @@
 //! The output of the node: what it configures, as a snapshot of what its store holds.
 //!
 //! A [`Snapshot`] is the desired state that the output adapters realize: the peers of the tunnel
-//! with what each is routed and where it is reached, and those whose names the node publishes.
-//! The node makes it of what it accepted alone, and never reads what the operating system holds
-//! back as truth.
+//! with what each is routed and where it is reached, the node's own addresses, and the peers whose
+//! names the node publishes. The node makes it of what it accepted alone, and never reads what the
+//! operating system holds back as truth.
 
 use innernet_shared::{announcement::Announcement, PeerContents, Prefix};
+use std::net::IpAddr;
 
 /// How a node configures what it accepted.
 #[derive(Clone, Copy, Debug, Default)]
@@ -16,6 +17,18 @@ pub struct SnapshotConfig {
     pub route_primary_ip: bool,
 }
 
+/// The node itself, as its config describes it.
+#[derive(Clone, Copy, Debug)]
+pub struct Own<'a> {
+    /// The public key of the node, whose peer is its own record.
+    pub public_key: &'a str,
+    /// The address of the node's interface, which it holds whatever it claims.
+    pub address: IpAddr,
+    /// Further addresses that the node holds on its interface, each only while it lies within
+    /// the delegation that the node claims.
+    pub extra: &'a [IpAddr],
+}
+
 /// What a node configures: its desired state, which the output adapters realize.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -23,6 +36,9 @@ pub struct Snapshot {
     /// endpoint, the first that it announces, and its candidates, the others in their order. The
     /// tunnel holds the enabled peers that are routed a prefix, whose names the node publishes.
     pub peers: Vec<PeerContents>,
+    /// The addresses of the node's own interface: the address of its config first, then those of
+    /// its further addresses that lie within the delegation that it claims.
+    pub own_addresses: Vec<IpAddr>,
 }
 
 /// `record`, the node's record of a peer, as it takes effect with `announcement`, the last
@@ -57,6 +73,7 @@ pub fn with_primary_ip(peer: &PeerContents) -> PeerContents {
 pub fn of_store(
     conn: &rusqlite::Connection,
     config: &SnapshotConfig,
+    own: Option<Own>,
 ) -> Result<Snapshot, rusqlite::Error> {
     let peers = crate::store::load_peers(conn)?;
     let announcements = crate::store::load_announcements(conn, None)?;
@@ -70,15 +87,17 @@ pub fn of_store(
                     .map(|stored| &stored.announcement),
             )
         }),
+        own,
     ))
 }
 
 /// The snapshot of `peers`, each the node's record of a peer with the last announcement of it
-/// that the node accepted, if any, as `config` configures them. Each peer takes effect as
-/// [`effective`] makes it.
+/// that the node accepted, if any, as `config` configures them, for `own`, the node itself, if
+/// its config describes it. Each peer takes effect as [`effective`] makes it.
 pub fn snapshot<'a>(
     config: &SnapshotConfig,
     peers: impl IntoIterator<Item = (&'a PeerContents, Option<&'a Announcement>)>,
+    own: Option<Own>,
 ) -> Snapshot {
     let mut snapshot = Snapshot::default();
     for (record, announcement) in peers {
@@ -89,6 +108,18 @@ pub fn snapshot<'a>(
             peer
         };
         snapshot.peers.push(peer);
+    }
+    if let Some(own) = own {
+        let own_peer = snapshot
+            .peers
+            .iter()
+            .find(|peer| peer.public_key == own.public_key);
+        snapshot.own_addresses.push(own.address);
+        for address in own.extra {
+            if own_peer.is_some_and(|own| own.holds(*address)) && *address != own.address {
+                snapshot.own_addresses.push(*address);
+            }
+        }
     }
     snapshot
 }
@@ -134,8 +165,13 @@ mod tests {
         let plain = record("recorded", "10.0.0.2");
         let plain_announced = announcement(Some("plain"), "10.0.0.0/30", "10.0.0.2");
         let silent = record("silent", "10.0.0.3");
+        let own = Own {
+            public_key: &plain.public_key,
+            address: "10.0.0.2".parse().unwrap(),
+            extra: &["10.0.0.3".parse().unwrap(), "10.0.0.9".parse().unwrap()],
+        };
         let peers = [(&plain, Some(&plain_announced)), (&silent, None)];
-        let snapshot = super::snapshot(&SnapshotConfig::default(), peers);
+        let snapshot = super::snapshot(&SnapshotConfig::default(), peers, Some(own));
 
         // Each peer takes effect as it announced: one without an accepted announcement is routed
         // nothing, and has no name.
@@ -146,6 +182,15 @@ mod tests {
         );
         assert!(!snapshot.peers[1].is_routed());
         assert_eq!(snapshot.peers[1].name, None);
+
+        // The node holds its address, and those of its further addresses that it claims.
+        assert_eq!(
+            snapshot.own_addresses,
+            [
+                "10.0.0.2".parse::<IpAddr>().unwrap(),
+                "10.0.0.3".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -159,12 +204,17 @@ mod tests {
         let config = SnapshotConfig {
             route_primary_ip: true,
         };
-        let snapshot = snapshot(&config, [(&peer, Some(&announced))]);
+        let snapshot = snapshot(&config, [(&peer, Some(&announced))], None);
         assert_eq!(
             snapshot.peers[0].allowed_ips,
             Some(vec![Prefix::host("10.0.0.2".parse().unwrap())])
         );
-        let snapshot = super::snapshot(&SnapshotConfig::default(), [(&peer, Some(&announced))]);
+        let snapshot = super::snapshot(
+            &SnapshotConfig::default(),
+            [(&peer, Some(&announced))],
+            None,
+        );
         assert_eq!(snapshot.peers[0].allowed_ips, Some(vec![]));
+        assert!(snapshot.own_addresses.is_empty());
     }
 }

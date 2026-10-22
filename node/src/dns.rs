@@ -463,6 +463,7 @@ mod tests {
                 peer("off", "10.0.0.3", true),
                 peer("Not Valid", "10.0.0.4", false),
             ],
+            ..Default::default()
         };
 
         // The enabled peers that have a name, in the zone of the interface or of the suffix.

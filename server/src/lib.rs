@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use wireguard_control::{InterfaceName, Key};
+use wireguard_control::{InterfaceName, Key, KeyPair};
 
 mod api;
 mod coordinator;
@@ -46,9 +46,7 @@ mod util;
 
 pub use error::ServerError;
 
-#[cfg(test)]
-pub(crate) use coordinator::Db;
-pub(crate) use coordinator::{hyper_service, ConnectionMode, Endpoints};
+pub(crate) use coordinator::{hyper_service, ConnectionMode, Db, Endpoints};
 pub use coordinator::{Context, Session};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -100,6 +98,16 @@ impl ConfigFile {
         IpNet::new(self.address, self.network_cidr_prefix)
             .map(|net| net.trunc())
             .unwrap_or_else(|_| IpNet::from(self.address))
+    }
+
+    /// The server's node of `interface` as the config of a client's interface describes it: its
+    /// address, with the prefix of the network, its private key and its listen port.
+    pub fn interface_info(&self, interface: &InterfaceName) -> Result<InterfaceInfo, Error> {
+        let keypair = KeyPair::from_private(Key::from_base64(&self.private_key)?);
+        let address = IpNet::new(self.address, self.network_cidr_prefix)?;
+        let mut info = InterfaceInfo::new(interface, &keypair, address);
+        info.listen_port = Some(self.listen_port);
+        Ok(info)
     }
 
     pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
@@ -226,15 +234,9 @@ impl AdminClient {
             features: vec![FEATURE_TLS.to_string()],
             quic_port: Some(config.quic_port.ok_or_else(incomplete)?),
         };
-        let own = InterfaceInfo {
-            network_name: interface.to_string(),
-            address: IpNet::new(config.address, config.network_cidr_prefix)?,
-            private_key: config.private_key,
-            listen_port: Some(config.listen_port),
-        };
         Ok(Self {
             interface: *interface,
-            config: InterfaceConfig::new(own, server),
+            config: InterfaceConfig::new(config.interface_info(interface)?, server),
         })
     }
 
@@ -343,6 +345,7 @@ pub async fn serve(
     let changed = StoreChanged::default();
     let mut node = Node {
         interface,
+        info: config.interface_info(&interface)?,
         listen_port: config.listen_port,
         nat: NatOpts {
             no_nat_traversal: false,
@@ -357,7 +360,7 @@ pub async fn serve(
     let mut dns = DnsService::new(interface, hosts_opts.host_suffix.clone());
     let mut link = LocalLink {
         db: db.clone(),
-        key: public_key,
+        server_key: public_key,
     };
     let triggers = Triggers {
         changed: Some(changed.clone()),

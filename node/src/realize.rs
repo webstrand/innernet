@@ -17,6 +17,7 @@ use innernet_shared::{
     wg::{self, DeviceExt as _},
     Endpoint, Error, PeerChange, PeerContents,
 };
+use ipnet::IpNet;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
@@ -54,8 +55,9 @@ pub trait TunnelBackend {
     /// What the backend can tell of itself.
     fn capabilities(&self) -> Capabilities;
 
-    /// Brings the tunnel in line with `snapshot`: it holds every enabled peer of the snapshot, as
-    /// the snapshot configures it, and no other. Returns what it changed of each peer.
+    /// Brings the tunnel in line with `snapshot`: it holds every enabled peer of the snapshot that
+    /// is routed a prefix, as the snapshot configures it, and no other, and the node's own
+    /// addresses. Returns what it changed of each peer.
     fn realize(&mut self, snapshot: &Snapshot) -> Result<Vec<Realized>, Error>;
 
     /// The NAT traversal of the peers that `realized` changed, if the backend traverses NATs.
@@ -95,6 +97,10 @@ impl TunnelBackend for WireGuard {
     }
 
     /// Diffs the peers of the interface with those of `snapshot`, and applies the difference.
+    /// The first own address, that of the interface, is assigned when the interface is brought
+    /// up; the others are assigned here. An address is never removed, since the backend can't
+    /// tell those that it added from those that something else added; one that fails to be
+    /// assigned is logged.
     fn realize(&mut self, snapshot: &Snapshot) -> Result<Vec<Realized>, Error> {
         let device = Device::get(&self.interface, self.backend)?;
         let diffs = device.diff(&snapshot.peers, &self.endpoint_overrides);
@@ -113,6 +119,11 @@ impl TunnelBackend for WireGuard {
             DeviceUpdate::new()
                 .add_peers(&updates)
                 .apply(&self.interface, self.backend)?;
+        }
+        for address in snapshot.own_addresses.iter().skip(1) {
+            if let Err(e) = wg::set_addr(&self.interface, IpNet::from(*address)) {
+                log::warn!("failed to add the address {address}: {e}");
+            }
         }
         Ok(realized)
     }

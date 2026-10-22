@@ -50,6 +50,11 @@ impl NatTraverse {
             peer.candidates
                 .retain(|addr| Some(addr) != endpoint.as_ref());
 
+            // Candidates are popped from the end as the algorithm progresses, so they are
+            // reversed, to be tried in the order in which the peer lists them, its preferred
+            // ones first.
+            peer.candidates.reverse();
+
             // Add the server-reported endpoint to the beginning of the list. In the event
             // no other endpoints worked, the remaining endpoint in the list will be the one
             // assigned to the peer so it should default to the server-reported endpoint.

@@ -141,12 +141,14 @@ $(show_alice_interface)
 EOF
 # The server keys its peers by their raw public keys, and holds delegations and endpoints apart.
 # The server's record of bob, what it assigns and offers bob, moves to mallory's key, with
-# mallory's endpoint.
+# mallory's endpoint, and without bob's signed announcement, so that the server relays the
+# unsigned announcement that it makes of mallory.
 mallory_hex=$(echo "$mallory_key" | base64 -d | od -An -tx1 | tr -d ' \n')
 bob_hex=$(echo "$bob_key" | base64 -d | od -An -tx1 | tr -d ' \n')
 db "UPDATE peers SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex';
     UPDATE offered_names SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex';
     UPDATE delegations SET public_key = x'$mallory_hex' WHERE public_key = x'$bob_hex';
+    DELETE FROM relayed_announcements WHERE public_key = x'$bob_hex';
     DELETE FROM endpoints WHERE public_key IN (x'$bob_hex', x'$mallory_hex') AND kind IN (0, 1);
     INSERT INTO endpoints (public_key, kind, position, address, port)
     VALUES (x'$mallory_hex', 0, 0, x'06060606', 51820);"

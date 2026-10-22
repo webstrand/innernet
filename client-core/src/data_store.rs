@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, ensure, Context as _, Error};
 use innernet_node::{
     accept::{self, Accepted, Received, Refusal},
     db::{self, Scope},
-    snapshot::{self, Snapshot, SnapshotConfig},
+    snapshot::{self, Own, Snapshot, SnapshotConfig},
     store::{self as node_store, key_to_bytes, EndpointKind},
     Store,
 };
@@ -63,6 +63,23 @@ impl Network {
             own: Some((own_key, config.interface.address.addr())),
         })
     }
+}
+
+/// How the coordination server relays the announcements of the peers, which tells
+/// [`DataStore::update`] where the announcement of each peer comes from.
+#[derive(Clone, Copy, Debug)]
+pub enum Relay<'a> {
+    /// The server relays an announcement with each peer, signed by the peer, or, for a peer that
+    /// has never announced, unsigned, as the server makes it, and checks the claims of the types
+    /// that it lists.
+    Announcements(&'a [String]),
+    /// The server predates announcements, so it relays none: each peer is taken to make the
+    /// unsigned announcement that [`Announcement::synthetic`] makes of what the server reports of
+    /// it, as a server that relays announcements would make it.
+    Synthesized,
+    /// The server may relay announcements, but this client can't tell which types of claims it
+    /// checks, so it accepts none of them.
+    Unknown,
 }
 
 /// The data store of the JSON file of earlier versions, whose peers and CIDRs have the IDs that
@@ -279,10 +296,10 @@ impl DataStore {
     /// dropped peer is absent from the update, so a pinned peer that it conflicts with is
     /// disabled, while the stored record of a dropped peer with a pinned key is kept as it was.
     ///
-    /// Each peer is taken to make the unsigned announcement that [`Announcement::synthetic`]
-    /// makes of what the server reports of it, which the node core accepts or refuses, as
-    /// [`innernet_node::db::Scope::decide`] decides. A refused announcement is ignored with a
-    /// warning, so that it never fails an update, and the last one accepted from the peer stays.
+    /// The announcement of each peer comes as `relay` tells, and the node core accepts or refuses
+    /// it, as [`innernet_node::db::Scope::decide`] decides. A refused announcement is ignored with
+    /// a warning, so that it never fails an update, and the last one accepted from the peer stays:
+    /// the server can neither forge, alter nor take back what a peer announces.
     ///
     /// What each peer claims is then pinned to its key. A signed announcement pins what it claims
     /// and releases what it no longer claims; an unsigned one, which the server makes for a peer
@@ -296,11 +313,12 @@ impl DataStore {
     pub fn update<'a>(
         &mut self,
         state: &'a State,
+        relay: Relay,
     ) -> Result<Vec<(&'a PeerContents, Error)>, Error> {
         let network = self.network.clone();
         let dropped = self.transact(|tx| {
             let dropped =
-                update_reported_peers(tx, &network, &state.peers, &state.invalid_peer_keys)?;
+                update_reported_peers(tx, &network, &state.peers, &state.invalid_peer_keys, relay)?;
             write_cidrs(tx, &state.cidrs)?;
             Ok(dropped)
         })?;
@@ -308,14 +326,33 @@ impl DataStore {
         Ok(dropped)
     }
 
-    /// Merges `new_peers`, each taken to make the unsigned announcement of its record.
+    /// Merges `new_peers`, as a server that relays announcements reports them, and checks every
+    /// type of claim.
+    #[cfg(test)]
+    fn relay_peers<'a>(&mut self, new_peers: &'a [PeerContents]) -> Vec<(&'a PeerContents, Error)> {
+        let claim_types = accept::all_claim_types();
+        let network = self.network.clone();
+        self.transact(|tx| {
+            update_reported_peers(
+                tx,
+                &network,
+                new_peers,
+                &[],
+                Relay::Announcements(&claim_types),
+            )
+        })
+        .unwrap()
+    }
+
+    /// Merges `new_peers`, as a server that predates announcements reports them, so that each
+    /// is taken to make the unsigned announcement of its record.
     #[cfg(test)]
     fn update_peers<'a>(
         &mut self,
         new_peers: &'a [PeerContents],
     ) -> Vec<(&'a PeerContents, Error)> {
         let network = self.network.clone();
-        self.transact(|tx| update_reported_peers(tx, &network, new_peers, &[]))
+        self.transact(|tx| update_reported_peers(tx, &network, new_peers, &[], Relay::Synthesized))
             .unwrap()
     }
 
@@ -323,6 +360,20 @@ impl DataStore {
     /// without their announcements, as [`node_store::load_peers`] reads them.
     pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
         Ok(node_store::load_peers(&self.store)?)
+    }
+
+    /// The last announcement accepted from the peer with `public_key`, if any.
+    pub fn announcement(&self, public_key: &str) -> Result<Option<Announcement>, Error> {
+        let key = key_to_bytes(public_key)?;
+        Ok(node_store::load_announcements(&self.store, Some(&key))?
+            .remove(public_key)
+            .map(|stored| stored.announcement))
+    }
+
+    /// Whether the peer with `public_key` has signed an announcement that this client accepted,
+    /// after which only its signed announcements are accepted.
+    pub fn announces(&self, public_key: &str) -> Result<bool, Error> {
+        Ok(node_store::announces(&self.store, &key_to_bytes(public_key)?)?.unwrap_or(false))
     }
 
     /// The peers as they take effect, as [`snapshot::effective`] makes each of the last
@@ -343,25 +394,73 @@ impl DataStore {
     /// The peer with `public_key` as it takes effect, as [`Self::effective_peers`] makes it, or
     /// `None` if the data store doesn't record it.
     pub fn effective_peer(&self, public_key: &str) -> Result<Option<PeerContents>, Error> {
-        let key = key_to_bytes(public_key)?;
-        let Some(peer) = node_store::load_peer(&self.store, &key)? else {
+        let Some(peer) = node_store::load_peer(&self.store, &key_to_bytes(public_key)?)? else {
             return Ok(None);
         };
-        let announcement = node_store::load_announcements(&self.store, Some(&key))?
-            .remove(public_key)
-            .map(|stored| stored.announcement);
+        let announcement = self.announcement(public_key)?;
         Ok(Some(snapshot::effective(&peer, announcement.as_ref())))
     }
 
-    /// What this client configures, as the node core makes it of the data store: the peers as
-    /// they take effect, in the order of [`Self::peers`].
-    pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        self.snapshot_as(&SnapshotConfig::default())
+    /// What this client configures, as the node core makes it of the data store, for `own`, this
+    /// client as its config describes it: the peers as they take effect, in the order of
+    /// [`Self::peers`], and what this client publishes of them.
+    pub fn snapshot(&self, own: Option<Own>) -> Result<Snapshot, Error> {
+        self.snapshot_as(&SnapshotConfig::default(), own)
     }
 
-    /// The snapshot of the data store, as `config` configures it.
-    pub fn snapshot_as(&self, config: &SnapshotConfig) -> Result<Snapshot, Error> {
-        Ok(snapshot::of_store(&self.store, config)?)
+    /// The snapshot of the data store, as `config` configures it, for `own`.
+    pub fn snapshot_as(
+        &self,
+        config: &SnapshotConfig,
+        own: Option<Own>,
+    ) -> Result<Snapshot, Error> {
+        Ok(snapshot::of_store(&self.store, config, own)?)
+    }
+
+    /// The prefixes pinned to the keys of the peers, each with its peer.
+    pub fn pins(&self) -> Result<Vec<(PeerContents, Prefix)>, Error> {
+        let mut claims = node_store::load_claims(&self.store, None)?;
+        Ok(self
+            .peers()?
+            .into_iter()
+            .flat_map(|peer| {
+                let claim = claims.remove(&peer.public_key).unwrap_or_default();
+                claim
+                    .delegation
+                    .into_iter()
+                    .map(move |prefix| (peer.clone(), prefix))
+            })
+            .collect())
+    }
+
+    /// Accepts `signed`, an announcement of the peer with `public_key` that the coordination
+    /// server has accepted, with only the claims of `claim_types`, the types that the server
+    /// checks, pins what it claims, and writes the data store. It must be newer than the last one
+    /// accepted from the peer, which must be recorded, and claim nothing pinned to another key.
+    /// This client records its own announcements so.
+    pub fn accept_announcement(
+        &mut self,
+        public_key: &str,
+        signed: &SignedAnnouncement,
+        claim_types: &[String],
+    ) -> Result<(), Error> {
+        ensure!(signed.is_signed(), "the announcement is not signed");
+        self.transact(|tx| {
+            ensure!(
+                node_store::announces(tx, &key_to_bytes(public_key)?)?.is_some(),
+                "no peer with the public key {public_key} is recorded"
+            );
+            let received = Received {
+                public_key,
+                announcement: signed,
+                checked_types: claim_types,
+                repeats: false,
+            };
+            let now = announcement::timestamp_now();
+            tx.accept_one(&received, now)?
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            Ok(())
+        })
     }
 
     pub fn cidrs(&self) -> Result<Vec<Cidr>, Error> {
@@ -483,14 +582,15 @@ fn check_reported(
 }
 
 /// Merges `new_peers` into the data store of `tx`, dropping each that is invalid, and hands the
-/// unsigned announcement of each to the node core, as [`DataStore::update`] describes.
-/// `invalid_peer_keys` are the public keys of the peers that the server reported but that failed
-/// to deserialize.
+/// announcement of each to the node core, as [`DataStore::update`] describes. `invalid_peer_keys`
+/// are the public keys of the peers that the server reported but that failed to deserialize. Each
+/// accepted peer is stored without its announcement, which comes as `relay` tells.
 fn update_reported_peers<'a>(
     tx: &Scope,
     network: &Network,
     new_peers: &'a [PeerContents],
     invalid_peer_keys: &[String],
+    relay: Relay,
 ) -> Result<Vec<(&'a PeerContents, Error)>, Error> {
     let mut accepted: Vec<&'a PeerContents> = vec![];
     let mut dropped = vec![];
@@ -518,26 +618,38 @@ fn update_reported_peers<'a>(
         }
     }
 
-    // The unsigned announcement of each accepted peer, which the node core decides.
+    // The announcement of each accepted peer, as `relay` tells, which the node core decides.
     let all_types = accept::all_claim_types();
-    let synthesized: Vec<Option<SignedAnnouncement>> = accepted
-        .iter()
-        .map(|peer| {
-            SignedAnnouncement::unsigned(&Announcement::synthetic(peer))
-                .inspect_err(|e| {
-                    log::warn!("ignoring the announcement of peer {}: {e}", peer.public_key)
+    let (checked_types, synthesized): (&[String], Vec<Option<SignedAnnouncement>>) = match relay {
+        Relay::Announcements(claim_types) => (claim_types, vec![]),
+        Relay::Synthesized => (
+            &all_types,
+            accepted
+                .iter()
+                .map(|peer| {
+                    SignedAnnouncement::unsigned(&Announcement::synthetic(peer))
+                        .inspect_err(|e| {
+                            log::warn!("ignoring the announcement of peer {}: {e}", peer.public_key)
+                        })
+                        .ok()
                 })
-                .ok()
-        })
-        .collect();
+                .collect(),
+        ),
+        Relay::Unknown => (&[], vec![]),
+    };
     let received: Vec<Received> = accepted
         .iter()
-        .zip(&synthesized)
-        .filter_map(|(peer, announcement)| {
+        .enumerate()
+        .filter_map(|(index, peer)| {
+            let announcement = match relay {
+                Relay::Announcements(_) => peer.announcement.as_ref()?,
+                Relay::Synthesized => synthesized[index].as_ref()?,
+                Relay::Unknown => return None,
+            };
             Some(Received {
                 public_key: &peer.public_key,
-                announcement: announcement.as_ref()?,
-                checked_types: &all_types,
+                announcement,
+                checked_types,
                 repeats: true,
             })
         })
@@ -776,7 +888,7 @@ fn introduced_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innernet_shared::{Cidr, LegacyCidrContents, LegacyPeerContents};
+    use innernet_shared::{announcement::Claims, Cidr, LegacyCidrContents, LegacyPeerContents};
     use once_cell::sync::Lazy;
     static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
         vec![PeerContents {
@@ -865,12 +977,15 @@ mod tests {
         assert_eq!(0, store.cidrs().unwrap().len());
 
         store
-            .update(&State {
-                peers: BASE_PEERS.to_owned(),
-                cidrs: BASE_CIDRS.to_owned(),
-                observed_endpoint: None,
-                invalid_peer_keys: vec![],
-            })
+            .update(
+                &State {
+                    peers: BASE_PEERS.to_owned(),
+                    cidrs: BASE_CIDRS.to_owned(),
+                    observed_endpoint: None,
+                    invalid_peer_keys: vec![],
+                },
+                Relay::Synthesized,
+            )
             .unwrap();
     }
 
@@ -1132,7 +1247,7 @@ mod tests {
         invalid["name"] = "peer\n10.0.0.1 example.com".into();
         let base = serde_json::to_value(&BASE_PEERS[0]).unwrap();
         assert!(store
-            .update(&state(&[base.clone(), invalid]))
+            .update(&state(&[base.clone(), invalid]), Relay::Synthesized)
             .unwrap()
             .is_empty());
         new_peer.name = None;
@@ -1147,7 +1262,7 @@ mod tests {
         renamed["name"] = "Blah".into();
         let renamed_new = serde_json::to_value(&new_peer).unwrap();
         assert!(store
-            .update(&state(&[renamed, renamed_new]))
+            .update(&state(&[renamed, renamed_new]), Relay::Synthesized)
             .unwrap()
             .is_empty());
         assert_eq!(store.peers().unwrap(), [BASE_PEERS[0].clone(), new_peer]);
@@ -1251,14 +1366,14 @@ mod tests {
                 .unwrap();
         assert!(state.peers.is_empty());
         assert_eq!(state.invalid_peer_keys, [BASE_PEERS[0].public_key.clone()]);
-        assert!(store.update(&state).unwrap().is_empty());
+        assert!(store.update(&state, Relay::Synthesized).unwrap().is_empty());
         assert_eq!(store.peers().unwrap(), *BASE_PEERS);
 
         // A peer that isn't reported at all is disabled.
         let state: State =
             serde_json::from_value(serde_json::json!({ "peers": [], "cidrs": *BASE_CIDRS }))
                 .unwrap();
-        store.update(&state).unwrap();
+        store.update(&state, Relay::Synthesized).unwrap();
         assert_eq!(store.peers().unwrap(), &disabled(&BASE_PEERS)[..]);
     }
 
@@ -1449,12 +1564,15 @@ mod tests {
         let mut cidrs = varied_cidrs();
         cidrs.reverse();
         store
-            .update(&State {
-                peers: varied_peers(),
-                cidrs,
-                observed_endpoint: None,
-                invalid_peer_keys: vec![],
-            })
+            .update(
+                &State {
+                    peers: varied_peers(),
+                    cidrs,
+                    observed_endpoint: None,
+                    invalid_peer_keys: vec![],
+                },
+                Relay::Synthesized,
+            )
             .unwrap();
         let expected_cidrs = {
             let mut cidrs = varied_cidrs();
@@ -1644,7 +1762,7 @@ mod tests {
                             observed_endpoint: None,
                             invalid_peer_keys: vec![],
                         };
-                        assert!(store.update(&state).unwrap().is_empty());
+                        assert!(store.update(&state, Relay::Synthesized).unwrap().is_empty());
                     }
                 });
             }
@@ -1671,6 +1789,352 @@ mod tests {
         assert!(store.update_peers(&BASE_PEERS).is_empty());
         let store = open(dir.path(), false).unwrap();
         assert!(store.speaks_tls(key).unwrap());
+    }
+
+    /// A peer that holds the key `keypair`, with the delegations 10.0.1.0/24 and 10.0.2.1/32,
+    /// for which the server reports the endpoint 203.0.113.9:4000.
+    fn announcing_peer(keypair: &wireguard_control::KeyPair) -> PeerContents {
+        PeerContents {
+            name: Some("announcer".parse().unwrap()),
+            delegations: vec![
+                "10.0.1.0/24".parse().unwrap(),
+                "10.0.2.1/32".parse().unwrap(),
+            ],
+            public_key: keypair.public.to_base64(),
+            endpoint: Some("203.0.113.9:4000".parse().unwrap()),
+            candidates: vec![],
+            ..BASE_PEERS[0].clone()
+        }
+    }
+
+    /// The prefixes of `prefixes`.
+    fn prefixes(prefixes: &[&str]) -> Vec<Prefix> {
+        prefixes
+            .iter()
+            .map(|prefix| prefix.parse().unwrap())
+            .collect()
+    }
+
+    /// Signs announcements of `keypair`.
+    fn signer(
+        keypair: &wireguard_control::KeyPair,
+    ) -> impl Fn(&Announcement) -> SignedAnnouncement {
+        let private_key =
+            innernet_shared::xeddsa::PrivateKey::from_base64(&keypair.private.to_base64()).unwrap();
+        move |announcement| announcement.sign(&private_key).unwrap()
+    }
+
+    #[test]
+    fn test_announcements() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |create| open(dir.path(), create).unwrap();
+        let keypair = wireguard_control::KeyPair::generate();
+        let sign = signer(&keypair);
+        let key = keypair.public.to_base64();
+        let announces = |store: &DataStore| -> bool {
+            store
+                .store
+                .query_row(
+                    "SELECT announces FROM peers WHERE public_key = ?1",
+                    [key_to_bytes(&key).unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let reported = |announcement: Option<SignedAnnouncement>| {
+            vec![PeerContents {
+                announcement,
+                ..announcing_peer(&keypair)
+            }]
+        };
+        let pins = |store: &DataStore| -> Vec<Prefix> {
+            store
+                .pins()
+                .unwrap()
+                .into_iter()
+                .map(|(_, prefix)| prefix)
+                .collect()
+        };
+        let all_types = announcement::CLAIM_TYPES.map(String::from);
+
+        // A peer that has never announced takes effect as the unsigned announcement that the
+        // server makes of it, and its delegations and its name are pinned to its key.
+        let mut store = open(true);
+        let synthetic = Announcement::synthetic(&announcing_peer(&keypair));
+        assert!(store
+            .relay_peers(&reported(Some(
+                SignedAnnouncement::unsigned(&synthetic).unwrap()
+            )))
+            .is_empty());
+        let effective = store.effective_peers().unwrap().remove(0);
+        assert_eq!(effective.delegations, announcing_peer(&keypair).delegations);
+        assert_eq!(
+            effective.allowed_ips(),
+            announcing_peer(&keypair).allowed_ips()
+        );
+        assert!(!announces(&store));
+        assert!(!store.announces(&key).unwrap());
+        assert_eq!(pins(&store), announcing_peer(&keypair).delegations);
+        assert_eq!(
+            store.peers().unwrap()[0].name,
+            announcing_peer(&keypair).name
+        );
+
+        // Its first signed announcement latches it, and it then takes effect as it announces: what
+        // the server reports of its delegations, its name and its endpoint takes no effect, its
+        // allowed IPs are shrunk to its delegation, and what it no longer claims is released.
+        let first = Announcement {
+            timestamp: announcement::timestamp_now(),
+            claims: Claims {
+                delegation: prefixes(&["10.0.1.0/25", "10.0.2.1/32"]),
+                name: Some("claimed".parse().unwrap()),
+            },
+            allowed_ips: prefixes(&["10.0.1.0/26", "10.0.2.0/24"]),
+            primary_ip: Some("10.0.1.1".parse().unwrap()),
+            // The endpoints keep their order, which isn't that of their addresses.
+            endpoints: vec![
+                "198.51.100.1:51820".parse().unwrap(),
+                "peer.example.com:1".parse().unwrap(),
+                "192.0.2.1:51820".parse().unwrap(),
+            ],
+        };
+        let signed = sign(&first);
+        assert!(store
+            .relay_peers(&reported(Some(signed.clone())))
+            .is_empty());
+        assert!(announces(&store));
+        assert!(store.announces(&key).unwrap());
+        let announced = |store: &DataStore| {
+            assert_eq!(store.announcement(&key).unwrap(), Some(first.clone()));
+            let effective = store.effective_peers().unwrap().remove(0);
+            assert_eq!(effective.delegations, first.claims.delegation);
+            assert_eq!(
+                effective.allowed_ips,
+                Some(prefixes(&["10.0.1.0/26", "10.0.2.1/32"]))
+            );
+            assert_eq!(
+                effective.hosts_fallback(),
+                Some("10.0.1.1".parse().unwrap())
+            );
+            assert_eq!(effective.name, first.claims.name);
+            assert_eq!(effective.endpoint.as_ref(), first.endpoints.first());
+            assert_eq!(effective.candidates, first.endpoints[1..]);
+            assert_eq!(pins(store), first.claims.delegation);
+        };
+        announced(&store);
+        // The peer is stored without the signed bytes, and reads back as it was decoded.
+        assert_eq!(store.peers().unwrap()[0].announcement, None);
+        announced(&open(false));
+
+        // A server that leaves the announcement out, relays an older one, one that it forged or
+        // altered, or an unsigned one, can't take it back: the last accepted one stays.
+        let older = sign(&Announcement {
+            timestamp: first.timestamp - 1,
+            ..Default::default()
+        });
+        let forged = signer(&wireguard_control::KeyPair::generate())(&Announcement {
+            timestamp: first.timestamp + 1,
+            ..Default::default()
+        });
+        let mut altered = sign(&Announcement {
+            timestamp: first.timestamp + 1,
+            ..Default::default()
+        });
+        altered.payload.push(0);
+        let ahead = sign(&Announcement {
+            timestamp: announcement::timestamp_now() + 3_600_000_000_000,
+            ..Default::default()
+        });
+        let unsigned = SignedAnnouncement::unsigned(&Announcement {
+            timestamp: first.timestamp + 1,
+            ..synthetic.clone()
+        })
+        .unwrap();
+        for relayed in [
+            None,
+            Some(older),
+            Some(forged),
+            Some(altered),
+            Some(ahead),
+            Some(unsigned),
+        ] {
+            assert!(store.relay_peers(&reported(relayed)).is_empty());
+            announced(&store);
+        }
+        // So can't one that predates announcements, of which this client makes the unsigned
+        // announcement of each peer.
+        assert!(store.update_peers(&reported(None)).is_empty());
+        announced(&store);
+        announced(&open(false));
+
+        // Nothing relayed is accepted while this client doesn't know which types of claims the
+        // server checks, and only the claims of the types that it checks are accepted, while
+        // statements are taken whatever it checks.
+        let mut store = open(false);
+        let renamed = Announcement {
+            timestamp: first.timestamp + 1,
+            claims: Claims {
+                name: Some("renamed".parse().unwrap()),
+                ..first.claims.clone()
+            },
+            ..first.clone()
+        };
+        let update = |store: &mut DataStore, types: Option<&[String]>| {
+            let state = State {
+                peers: reported(Some(sign(&renamed))),
+                cidrs: vec![],
+                observed_endpoint: None,
+                invalid_peer_keys: vec![],
+            };
+            let relay = match types {
+                Some(types) => Relay::Announcements(types),
+                None => Relay::Unknown,
+            };
+            assert!(store.update(&state, relay).unwrap().is_empty());
+        };
+        update(&mut store, None);
+        announced(&store);
+        let some_types = ["delegation".to_string()];
+        update(&mut store, Some(&some_types));
+        let partial = Announcement {
+            claims: Claims {
+                name: None,
+                ..renamed.claims.clone()
+            },
+            ..renamed.clone()
+        };
+        assert_eq!(store.announcement(&key).unwrap(), Some(partial.clone()));
+        assert_eq!(store.effective_peers().unwrap()[0].name, None);
+        assert_eq!(store.peers().unwrap()[0].name, None);
+        // The same announcement relayed again, once the server checks more types, is read again.
+        update(&mut store, Some(&all_types));
+        assert_eq!(store.announcement(&key).unwrap(), Some(renamed.clone()));
+        assert_eq!(
+            store.effective_peers().unwrap()[0].name,
+            renamed.claims.name
+        );
+
+        // A newer one replaces it, and one that states no allowed IPs routes nothing.
+        let silent = Announcement {
+            timestamp: first.timestamp + 2,
+            allowed_ips: vec![],
+            ..renamed.clone()
+        };
+        assert!(store.relay_peers(&reported(Some(sign(&silent)))).is_empty());
+        assert!(!store.effective_peers().unwrap()[0].is_routed());
+        assert_eq!(pins(&store), first.claims.delegation);
+
+        // This client records its own announcements the same way, each newer than the last.
+        let own = Announcement {
+            timestamp: first.timestamp + 3,
+            ..first.clone()
+        };
+        store
+            .accept_announcement(&key, &sign(&own), &all_types)
+            .unwrap();
+        assert!(store
+            .accept_announcement(&key, &sign(&own), &all_types)
+            .is_err());
+        assert!(store
+            .accept_announcement(&key, &signed, &all_types)
+            .is_err());
+        assert_eq!(store.announcement(&key).unwrap(), Some(own.clone()));
+    }
+
+    #[test]
+    fn test_claims_move_between_keys() {
+        // A prefix or a name that a peer stops claiming is released, and another key may claim it
+        // in the same update, while what a peer claims is refused to another key: its
+        // announcement is ignored, and it keeps what it claimed before.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path(), true).unwrap();
+        let [mover, taker] = [(); 2].map(|_| wireguard_control::KeyPair::generate());
+        let peer = |keypair: &wireguard_control::KeyPair, name: &str| PeerContents {
+            name: Some(name.parse().unwrap()),
+            delegations: vec![],
+            public_key: keypair.public.to_base64(),
+            ..BASE_PEERS[0].clone()
+        };
+        let announcement = |timestamp, delegation: &[&str], name: &str| Announcement {
+            timestamp,
+            claims: Claims {
+                delegation: prefixes(delegation),
+                name: Some(name.parse().unwrap()),
+            },
+            allowed_ips: prefixes(delegation),
+            primary_ip: Some(prefixes(delegation)[0].first()),
+            ..Default::default()
+        };
+        let state = |mover_announces: &Announcement, taker_announces: &Announcement| {
+            vec![
+                PeerContents {
+                    announcement: Some(signer(&mover)(mover_announces)),
+                    ..peer(&mover, "mover")
+                },
+                PeerContents {
+                    announcement: Some(signer(&taker)(taker_announces)),
+                    ..peer(&taker, "taker")
+                },
+            ]
+        };
+        let claimed = |store: &DataStore, keypair: &wireguard_control::KeyPair| {
+            let peer = store
+                .effective_peers()
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.public_key == keypair.public.to_base64())
+                .unwrap();
+            (peer.delegations, peer.name.map(|name| name.to_string()))
+        };
+        let now = announcement::timestamp_now();
+
+        let mover_first = announcement(now, &["10.0.1.0/24"], "mover");
+        let taker_first = announcement(now, &["10.0.2.0/24"], "taker");
+        assert!(store
+            .relay_peers(&state(&mover_first, &taker_first))
+            .is_empty());
+
+        // The taker can't take what the mover claims.
+        let grabbing = announcement(now + 1, &["10.0.1.128/25", "10.0.2.0/24"], "mover");
+        assert!(store
+            .relay_peers(&state(&mover_first, &grabbing))
+            .is_empty());
+        assert_eq!(
+            claimed(&store, &taker),
+            (prefixes(&["10.0.2.0/24"]), Some("taker".into()))
+        );
+
+        // Once the mover moves, in the same update, it can.
+        let mover_moved = announcement(now + 2, &["10.0.3.0/24"], "moved");
+        let taker_took = announcement(now + 2, &["10.0.1.0/24", "10.0.2.0/24"], "mover");
+        assert!(store
+            .relay_peers(&state(&mover_moved, &taker_took))
+            .is_empty());
+        assert_eq!(
+            claimed(&store, &mover),
+            (prefixes(&["10.0.3.0/24"]), Some("moved".into()))
+        );
+        assert_eq!(
+            claimed(&store, &taker),
+            (
+                prefixes(&["10.0.1.0/24", "10.0.2.0/24"]),
+                Some("mover".into())
+            )
+        );
+
+        // Two keys that claim the same new prefix are both refused.
+        let mover_grabs = announcement(now + 3, &["10.0.3.0/24", "10.0.4.0/24"], "moved");
+        let taker_grabs = announcement(now + 3, &["10.0.2.0/24", "10.0.4.0/25"], "mover");
+        assert!(store
+            .relay_peers(&state(&mover_grabs, &taker_grabs))
+            .is_empty());
+        assert_eq!(claimed(&store, &mover).0, prefixes(&["10.0.3.0/24"]));
+        assert_eq!(
+            claimed(&store, &taker).0,
+            prefixes(&["10.0.1.0/24", "10.0.2.0/24"])
+        );
+        let reopened = open(dir.path(), false).unwrap();
+        assert_eq!(claimed(&reopened, &mover).0, prefixes(&["10.0.3.0/24"]));
     }
 
     #[test]
