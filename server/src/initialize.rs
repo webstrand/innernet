@@ -95,7 +95,7 @@ fn populate_database(store: &Store, db_init_data: DbInitData) -> Result<(), Erro
     DatabasePeer::create(
         store,
         PeerContents {
-            name: SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?,
+            name: Some(SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?),
             ip: db_init_data.our_ip,
             cidr_id: server_cidr.id,
             public_key: db_init_data.public_key_base64,

@@ -207,10 +207,11 @@ fn rebuild(
             })
             .unwrap_or_default();
         let contents = innernet_shared::PeerContents {
-            name: row
-                .get::<_, String>(1)?
-                .parse()
-                .map_err(|_| anyhow!("peer {id} has an invalid name"))?,
+            name: Some(
+                row.get::<_, String>(1)?
+                    .parse()
+                    .map_err(|_| anyhow!("peer {id} has an invalid name"))?,
+            ),
             ip,
             cidr_id,
             public_key: public_key.clone(),
@@ -345,7 +346,7 @@ mod tests {
         let peers = load_peers(&store).unwrap();
         assert_eq!(peers.len(), 3);
         assert_eq!(peers[0].public_key, server.to_base64());
-        assert_eq!(peers[1].name.to_string(), "alice");
+        assert_eq!(peers[1].display_name(), "alice");
         assert_eq!(peers[1].candidates, ["198.51.100.1:51820".parse().unwrap()]);
 
         // Only the invitation is latched to TLS.

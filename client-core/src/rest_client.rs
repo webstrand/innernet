@@ -95,7 +95,8 @@ impl<'a> RestClient<'a> {
 
     /// Creates a peer, and returns it as the server created it. A server in plain HTTP is sent the
     /// peer as clients that predate TLS know it, and returns the peer with its ID, which is left
-    /// out.
+    /// out. A peer without a name, which such clients can't represent, is refused as
+    /// [`RestError::NamelessUnsupported`] without a request.
     pub async fn create_peer(
         &self,
         peer_contents: &PeerContents,
@@ -103,7 +104,8 @@ impl<'a> RestClient<'a> {
         match self.admin_api().await? {
             AdminApi::ByKey => self.http_form("POST", "/admin/peers", peer_contents).await,
             AdminApi::Legacy => {
-                let legacy = LegacyPeerContents::from_peer(peer_contents);
+                let legacy = LegacyPeerContents::from_peer(peer_contents)
+                    .ok_or(RestError::NamelessUnsupported)?;
                 let peer: LegacyPeer = self.http_form("POST", "/admin/peers", legacy).await?;
                 Ok(peer.contents.into())
             },
@@ -193,7 +195,9 @@ impl<'a> RestClient<'a> {
     /// since it was listed is refused as [`RestError::PeerChanged`]: in the API of TLS sessions,
     /// the server refuses it, and with a server in plain HTTP, which can't, the client refuses
     /// it before the change, as far as it can tell. In the API of TLS sessions, a peer that the
-    /// server does not find by its key is refused as [`RestError::NoSuchPeer`].
+    /// server does not find by its key is refused as [`RestError::NoSuchPeer`]. A server in plain
+    /// HTTP can't hold a peer without a name, so a change that removes the name is refused as
+    /// [`RestError::NamelessUnsupported`] without a request.
     pub async fn update_peer(
         &self,
         listed: &PeerContents,
@@ -208,6 +212,9 @@ impl<'a> RestClient<'a> {
                     .map_err(RestError::peer_refusal)
             },
             AdminApi::Legacy => {
+                if contents.name.is_none() {
+                    return Err(RestError::NamelessUnsupported);
+                }
                 // The peer is sent as the server lists it, with the changes an admin may make.
                 let LegacyPeer { id, contents: peer } = self.get_legacy_peer(listed).await?;
                 let legacy = LegacyPeerContents {
@@ -501,6 +508,11 @@ pub enum RestError {
          anew."
     )]
     NoSuchPeer,
+    #[error(
+        "The innernet server predates TLS, and can't hold a peer without a name. The operator \
+         must upgrade the server first."
+    )]
+    NamelessUnsupported,
     /// The request failed to reach the server, or the server failed to answer it.
     #[error("Error sending request: {0}")]
     RequestSend(Box<dyn std::error::Error + Send + Sync>),
@@ -719,7 +731,7 @@ mod tests {
             chunk.copy_from_slice(&[0xfb, 0xff, 0xbf][..chunk.len()]);
         }
         PeerContents {
-            name: "peer".parse().unwrap(),
+            name: Some("peer".parse().unwrap()),
             ip: "10.0.0.7".parse().unwrap(),
             cidr_id: 1,
             public_key: wireguard_control::Key(bytes).to_base64(),
@@ -739,7 +751,7 @@ mod tests {
             .iter()
             .map(|contents| LegacyPeer {
                 id: 7,
-                contents: LegacyPeerContents::from_peer(contents),
+                contents: LegacyPeerContents::from_peer(contents).unwrap(),
             })
             .collect();
         json_response("200 OK", &serde_json::to_string(&peers).unwrap())
@@ -777,7 +789,7 @@ mod tests {
         // Unless a request has settled it, the client asks the server which API it offers.
         assert_eq!(client.admin_api().await.unwrap(), AdminApi::ByKey);
         let renamed = PeerContents {
-            name: "renamed".parse().unwrap(),
+            name: Some("renamed".parse().unwrap()),
             ..peer.clone()
         };
         client.update_peer(&peer, &renamed).await.unwrap();
@@ -913,13 +925,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_decodes_by_transport() {
-        // A server in plain HTTP sends peers with their IDs, which are left out.
+        // A server in plain HTTP sends peers with their IDs, which are left out, and is never
+        // sent a peer that it can't hold.
         let peer = listed_peer();
         let state = format!(
             r#"{{"peers": {}, "cidrs": []}}"#,
             serde_json::to_string(&[LegacyPeer {
                 id: 7,
-                contents: LegacyPeerContents::from_peer(&peer),
+                contents: LegacyPeerContents::from_peer(&peer).unwrap(),
             }])
             .unwrap()
         );
@@ -939,6 +952,11 @@ mod tests {
             client.get_peers().await.unwrap(),
             std::slice::from_ref(&peer)
         );
+        let nameless = PeerContents { name: None, ..peer };
+        let error = client.create_peer(&nameless).await.unwrap_err();
+        assert!(matches!(error, RestError::NamelessUnsupported), "{error:?}");
+        let error = client.update_peer(&nameless, &nameless).await.unwrap_err();
+        assert!(matches!(error, RestError::NamelessUnsupported), "{error:?}");
         assert_eq!(
             server.join().unwrap(),
             [

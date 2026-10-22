@@ -7,9 +7,11 @@ use crate::{
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
-use innernet_shared::{PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerEndpoints};
+use innernet_shared::{
+    Hostname, PeerContents, PeerEndpoints, PeerUpdate, TaggedPeer, TaggedPeerEndpoints,
+};
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use wireguard_control::Key;
 
@@ -29,7 +31,7 @@ pub async fn routes(
     match (req.method(), key, resource.as_deref()) {
         (&Method::GET, None, None) => handlers::list(session).await,
         (&Method::POST, None, None) => {
-            let form = form_body(req).await?;
+            let form = peer_form_body(req).await?;
             handlers::create(form, session).await
         },
         (&Method::GET, Some(key), None) => handlers::get_by_key(key, session).await,
@@ -57,6 +59,21 @@ fn parse_path_key(segment: &str) -> Result<Key, ServerError> {
         Ok(key) if key.to_base64() == base64 => Ok(key),
         _ => Err(ServerError::NotFound),
     }
+}
+
+/// Reads a peer from the body of `req`. A [`PeerContents`] reads an invalid name as no name, so
+/// that clients can read peers from servers that allow other names, but the server refuses a peer
+/// whose name is not a valid [`Hostname`], with 400.
+async fn peer_form_body(req: Request<Body>) -> Result<PeerContents, ServerError> {
+    #[derive(Deserialize)]
+    struct Name {
+        #[serde(default, rename = "name")]
+        _name: Option<Hostname>,
+    }
+
+    let form: serde_json::Value = form_body(req).await?;
+    Name::deserialize(&form)?;
+    Ok(PeerContents::deserialize(form)?)
 }
 
 /// The tag of `value`, a resource of a peer of the kind `kind`: a hash of the kind and the value,
@@ -220,7 +237,7 @@ mod tests {
     use super::*;
     use crate::test;
     use bytes::Buf;
-    use innernet_shared::{Endpoint, Error};
+    use innernet_shared::{Endpoint, Error, LegacyPeer, State};
     use wireguard_control::KeyPair;
 
     #[tokio::test]
@@ -256,6 +273,38 @@ mod tests {
     #[tokio::test]
     async fn test_add_peer_with_invalid_name() -> Result<(), Error> {
         assert!(test::developer_peer_contents("devel oper", "10.80.64.4").is_err());
+
+        // The server refuses an invalid name with 400, whichever route carries it, although a
+        // client reads an invalid name as no name.
+        let server = test::Server::new()?;
+        let old_peers = DatabasePeer::list(&server.db().lock())?;
+        let ip = if cfg!(feature = "v6-test") {
+            "fd00:1337::2:0:0:3"
+        } else {
+            "10.80.64.4"
+        };
+        let mut invalid = serde_json::to_value(test::developer_peer_contents("developer3", ip)?)?;
+        invalid["name"] = "devel oper".into();
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &invalid)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let path = key_path(&server, test::DEVELOPER1_PEER_ID);
+        let mut rename = serde_json::to_value(unchanged(&server, &path).await)?;
+        rename["name"] = "devel oper".into();
+        let res = server
+            .form_request(test::ADMIN_PEER_IP, "PUT", &path, &rename)
+            .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let peers = |peers: Vec<DatabasePeer>| -> Vec<PeerContents> {
+            peers.into_iter().map(|peer| peer.inner).collect()
+        };
+        assert_eq!(
+            peers(DatabasePeer::list(&server.db().lock())?),
+            peers(old_peers)
+        );
         Ok(())
     }
 
@@ -435,7 +484,7 @@ mod tests {
         let server = test::Server::new()?;
         let path = key_path(&server, test::DEVELOPER1_PEER_ID);
         let mut change = unchanged(&server, &path).await;
-        change.name = "new-peer-name".parse().unwrap();
+        change.name = Some("new-peer-name".parse().unwrap());
         change.is_disabled = true;
 
         let res = server
@@ -444,7 +493,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         let new_peer = peer(&server, test::DEVELOPER1_PEER_ID);
-        assert_eq!(&*new_peer.name, "new-peer-name");
+        assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
         assert!(new_peer.is_disabled);
 
         // A non-admin can't, and no other path under a peer is routed to it.
@@ -490,7 +539,7 @@ mod tests {
         };
         assert_ne!(peer_tag(&other_key)?, tag);
         let renamed = PeerContents {
-            name: "renamed".parse().unwrap(),
+            name: Some("renamed".parse().unwrap()),
             ..peer.clone()
         };
         assert_ne!(peer_tag(&renamed)?, tag);
@@ -519,7 +568,7 @@ mod tests {
 
         // A change by another admin turns away a change based on what was read before it.
         let rename = |name: &str| PeerUpdate {
-            name: name.parse().unwrap(),
+            name: Some(name.parse().unwrap()),
             ..PeerUpdate::new(seen.tag.clone(), &seen.peer)
         };
         let res = server
@@ -532,7 +581,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CONFLICT);
         let body = hyper::body::to_bytes(res.into_body()).await?;
         assert!(String::from_utf8_lossy(&body).contains("changed"));
-        assert_eq!(&*peer(&server, test::DEVELOPER1_PEER_ID).name, "first");
+        assert_eq!(
+            peer(&server, test::DEVELOPER1_PEER_ID).name.as_deref(),
+            Some("first")
+        );
         assert_ne!(get_tagged(&server, &path).await.tag, seen.tag);
 
         // A change must carry a tag.
@@ -545,7 +597,10 @@ mod tests {
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, untagged)
             .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(&*peer(&server, test::DEVELOPER1_PEER_ID).name, "first");
+        assert_eq!(
+            peer(&server, test::DEVELOPER1_PEER_ID).name.as_deref(),
+            Some("first")
+        );
         Ok(())
     }
 
@@ -563,14 +618,14 @@ mod tests {
 
         let path = key_path(&server, test::DEVELOPER1_PEER_ID);
         let mut change = unchanged(&server, &path).await;
-        change.name = "new-peer-name".parse().unwrap();
+        change.name = Some("new-peer-name".parse().unwrap());
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
             .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         let new_peer = peer(&server, test::DEVELOPER1_PEER_ID);
-        assert_eq!(&*new_peer.name, "new-peer-name");
+        assert_eq!(new_peer.name.as_deref(), Some("new-peer-name"));
         assert_eq!(new_peer.endpoint, Some(endpoint));
         assert_eq!(new_peer.candidates, vec![candidate]);
         Ok(())
@@ -615,7 +670,7 @@ mod tests {
         // The endpoints are tagged apart from the rest of the peer.
         assert_eq!(get_tagged(&server, &peer_path).await.tag, peer_tag);
         let mut rename = unchanged(&server, &peer_path).await;
-        rename.name = "renamed".parse().unwrap();
+        rename.name = Some("renamed".parse().unwrap());
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &peer_path, &rename)
             .await;
@@ -699,7 +754,7 @@ mod tests {
         let invitee = DatabasePeer::create(&server.db.lock(), contents)?;
         let path = format!("/v1/admin/peers/{}", invitee.api_path_segment());
         let mut change = unchanged(&server, &path).await;
-        change.name = "renamed".parse().unwrap();
+        change.name = Some("renamed".parse().unwrap());
 
         // The invitation is redeemed, which changes the peer's key, after the admin read it. The
         // change, which names the peer by its old key, finds no peer.
@@ -713,7 +768,7 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let invitee = DatabasePeer::get_from_ip(&server.db.lock(), ip.parse()?)?;
-        assert_eq!(&*invitee.name, "invitee");
+        assert_eq!(invitee.name.as_deref(), Some("invitee"));
         Ok(())
     }
 
@@ -724,7 +779,7 @@ mod tests {
         let id_path = format!("/v1/admin/peers/{}", test::DEVELOPER1_PEER_ID);
 
         let change = PeerContents {
-            name: "new-peer-name".parse().unwrap(),
+            name: Some("new-peer-name".parse().unwrap()),
             ..old_peer.inner.clone()
         };
         let res = server
@@ -805,7 +860,10 @@ mod tests {
 
         let whole_body = hyper::body::aggregate(res).await?;
         let peers: Vec<PeerContents> = serde_json::from_reader(whole_body.reader())?;
-        let peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
+        let peer_names = peers
+            .iter()
+            .map(|p| p.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
         // An admin peer should see all the peers.
         assert_eq!(
             &[
@@ -900,6 +958,67 @@ mod tests {
             peers(DatabasePeer::list(&server.db().lock())?),
             peers(old_peers)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nameless_peers() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let json = |res: Response<Body>| async {
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let names = |peers: &serde_json::Value| -> Vec<serde_json::Value> {
+            peers
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|peer| peer["name"].clone())
+                .collect()
+        };
+
+        // An admin removes the names of both user peers over TLS: any number of peers can be
+        // without a name.
+        for id in [test::USER1_PEER_ID, test::USER2_PEER_ID] {
+            let path = key_path(&server, id);
+            let mut change = unchanged(&server, &path).await;
+            change.name = None;
+            let res = server
+                .form_request(test::ADMIN_PEER_IP, "PUT", &path, &change)
+                .await;
+            assert_eq!(res.status(), StatusCode::NO_CONTENT);
+            assert_eq!(peer(&server, id).name, None);
+            assert_eq!(get_tagged(&server, &path).await.peer.name, None);
+        }
+
+        // Over TLS, a peer without a name has a null name.
+        let res = server
+            .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
+            .await;
+        let listed = json(res).await;
+        assert_eq!(names(&listed).len(), 6);
+        assert_eq!(
+            names(&listed).iter().filter(|name| name.is_null()).count(),
+            2
+        );
+        let res = server
+            .request(test::USER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let state: State = serde_json::from_value(json(res).await)?;
+        assert_eq!(state.peers.iter().filter(|p| p.name.is_none()).count(), 2);
+
+        // The view of plain-HTTP sessions leaves out the peers without a name, which clients that
+        // predate TLS can't read.
+        server.predate_tls(test::USER1_PEER_ID);
+        let res = server
+            .plain_request(test::USER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let state = json(res).await;
+        let peers: Vec<LegacyPeer> = serde_json::from_value(state["peers"].clone())?;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name.as_deref(), Some("innernet-server"));
+
         Ok(())
     }
 }

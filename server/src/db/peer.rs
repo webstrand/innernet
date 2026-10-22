@@ -5,7 +5,7 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    xeddsa, Endpoint, Hostname, LegacyPeer, LegacyPeerContents, PeerContents,
+    xeddsa, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents,
     PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use rusqlite::{params, Connection};
@@ -45,12 +45,13 @@ impl DerefMut for DatabasePeer {
 
 impl DatabasePeer {
     /// The peer as the API of plain-HTTP sessions transfers it, with the ID `id`, which
-    /// [`Self::plain_http_ids`] gives it.
-    pub fn legacy(&self, id: i64) -> LegacyPeer {
-        LegacyPeer {
+    /// [`Self::plain_http_ids`] gives it, or `None` if clients that predate TLS can't represent
+    /// it, as [`LegacyPeerContents::from_peer`] tells.
+    pub fn legacy(&self, id: i64) -> Option<LegacyPeer> {
+        Some(LegacyPeer {
             id,
-            contents: LegacyPeerContents::from_peer(&self.inner),
-        }
+            contents: LegacyPeerContents::from_peer(&self.inner)?,
+        })
     }
 
     /// The IDs by which the API of plain-HTTP sessions names the peers, by public key: the
@@ -68,18 +69,13 @@ impl DatabasePeer {
 
     /// Creates the peer `contents`, which must lie within the CIDR that it names, a CIDR without
     /// child CIDRs, at an address that the CIDR can assign, and which the server's node must
-    /// accept: a valid name that no other peer has, and an address and a key that are pinned to
-    /// no other key and address.
+    /// accept: a name, if it has one, that no other peer has, and an address and a key that are
+    /// pinned to no other key and address.
     pub fn create(store: &Store, contents: PeerContents) -> Result<Self, ServerError> {
         log::info!("creating peer {:?}", contents);
 
         if !Self::is_valid_public_key(&contents.public_key) {
             log::warn!("peer public key is invalid.");
-            return Err(ServerError::InvalidQuery);
-        }
-
-        if !Hostname::is_valid(&contents.name) {
-            log::warn!("peer name is invalid, must conform to hostname(7) requirements.");
             return Err(ServerError::InvalidQuery);
         }
 
@@ -129,14 +125,10 @@ impl DatabasePeer {
             .is_ok_and(|key| xeddsa::is_valid_public_key(&key) && key.to_base64() == public_key)
     }
 
-    /// Applies the changes an admin may make to the peer: its name, whether it is an admin, and
-    /// whether it is disabled. The other fields of `contents` are ignored. The peer alone sets its
-    /// endpoint and candidates, and its IP, public key and CIDR never change.
+    /// Applies the changes an admin may make to the peer: its name, which it may lose, whether it
+    /// is an admin, and whether it is disabled. The other fields of `contents` are ignored. The
+    /// peer alone sets its endpoint and candidates, and its IP, public key and CIDR never change.
     pub fn update(&mut self, store: &Store, contents: PeerContents) -> Result<(), ServerError> {
-        if !Hostname::is_valid(&contents.name) {
-            log::warn!("peer name is invalid, must conform to hostname(7) requirements.");
-            return Err(ServerError::InvalidQuery);
-        }
         if contents.is_admin && !self.is_admin && !self.requires_tls {
             log::warn!(
                 "refusing to make {} an admin before it connects over TLS.",

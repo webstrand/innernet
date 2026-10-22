@@ -623,7 +623,12 @@ fn parse_host_suffix(suffix: &str) -> Result<String, String> {
 /// in plain HTTP transfers, as a [`LegacyPeer`], converts into this form, without the ID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerContents {
-    pub name: Hostname,
+    /// The name of the peer, or `None` if it has none. A peer without a name has `null` as its
+    /// name, or no name at all. A name that is not a valid [`Hostname`] deserializes as no name,
+    /// so that a client can read peers from a server that allows other names; the server refuses
+    /// such a name on its own API.
+    #[serde(default, deserialize_with = "deserialize_peer_name")]
+    pub name: Option<Hostname>,
     pub ip: IpAddr,
     pub cidr_id: i64,
     #[serde(deserialize_with = "deserialize_public_key")]
@@ -644,6 +649,11 @@ impl PeerContents {
     pub fn api_path_segment(&self) -> String {
         self.public_key.replace('+', "-").replace('/', "_")
     }
+
+    /// The name of the peer for display, or "[unnamed]" if it has none.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("[unnamed]")
+    }
 }
 
 impl AsRef<PeerContents> for PeerContents {
@@ -654,7 +664,7 @@ impl AsRef<PeerContents> for PeerContents {
 
 impl Display for PeerContents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.name, self.public_key)
+        write!(f, "{} ({})", self.display_name(), self.public_key)
     }
 }
 
@@ -668,11 +678,13 @@ pub struct TaggedPeer {
 }
 
 /// The changes that an admin may make to a peer: the body of `PUT /admin/peers/{key}` in TLS
-/// sessions. `tag` is that of the peer as the admin read it.
+/// sessions. `tag` is that of the peer as the admin read it. `name` is `null` for a peer without a
+/// name, and must be present, so that an update that leaves it out can't remove the name.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerUpdate {
     pub tag: String,
-    pub name: Hostname,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub name: Option<Hostname>,
     pub is_admin: bool,
     pub is_disabled: bool,
 }
@@ -718,6 +730,15 @@ fn deserialize_public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
         .map_err(|_| de::Error::custom(format!("invalid public key {public_key:?}")))
 }
 
+/// Deserializes the name of a peer, a string or `null`. A string that is not a valid [`Hostname`]
+/// is read as no name.
+fn deserialize_peer_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Hostname>, D::Error> {
+    let name = Option::<String>::deserialize(deserializer)?;
+    Ok(name.and_then(|name| Hostname::try_from(name).ok()))
+}
+
 /// What can be read of a peer that failed to deserialize, to identify it.
 #[derive(Deserialize)]
 struct PeerIdentity {
@@ -761,7 +782,11 @@ fn split_valid_peers<T>(peers: Vec<MaybePeer<T>>) -> (Vec<T>, Vec<String>) {
 /// transfers peers as [`PeerContents`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LegacyPeerContents {
-    pub name: Hostname,
+    /// The name of the peer. Clients that predate TLS can't read a peer without a name, so the
+    /// view of plain-HTTP sessions leaves such peers out. A name that is not a valid
+    /// [`Hostname`] deserializes as no name, as in [`PeerContents`].
+    #[serde(default, deserialize_with = "deserialize_peer_name")]
+    pub name: Option<Hostname>,
     pub ip: IpAddr,
     pub cidr_id: i64,
     #[serde(deserialize_with = "deserialize_public_key")]
@@ -777,9 +802,11 @@ pub struct LegacyPeerContents {
 }
 
 impl LegacyPeerContents {
-    /// `peer` as clients that predate TLS know it.
-    pub fn from_peer(peer: &PeerContents) -> Self {
-        Self {
+    /// `peer` as clients that predate TLS know it, or `None` if they can't represent it: a peer
+    /// without a name.
+    pub fn from_peer(peer: &PeerContents) -> Option<Self> {
+        peer.name.as_ref()?;
+        Some(Self {
             name: peer.name.clone(),
             ip: peer.ip,
             cidr_id: peer.cidr_id,
@@ -791,7 +818,7 @@ impl LegacyPeerContents {
             is_redeemed: peer.is_redeemed,
             invite_expires: peer.invite_expires,
             candidates: peer.candidates.clone(),
-        }
+        })
     }
 }
 
@@ -1175,8 +1202,7 @@ impl From<Timestring> for Duration {
     }
 }
 
-/// The name of a peer. The hosts file names the peer by this name, followed by the host suffix
-/// unless the operator sets an empty one.
+/// The name of a peer. Its hostname is this name, followed by the host suffix.
 ///
 /// A parsed or deserialized name must match [`Hostname::is_valid`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1184,23 +1210,10 @@ impl From<Timestring> for Duration {
 pub struct Hostname(String);
 
 impl Hostname {
-    /// Whether `name` is a single canonical label, which may be a number, since a suffix usually
-    /// follows it in the hosts file.
+    /// Whether `name` is a single canonical label, which may be a number, since a suffix always
+    /// follows it in its hostname.
     pub fn is_valid(name: &str) -> bool {
         innernet_domain::is_canonical_label(name)
-    }
-
-    /// The placeholder name of the peer with `public_key`, for a record that a client makes before
-    /// the coordination server names the peer. A base64 public key always ends in "=", so the
-    /// placeholder is never a valid hostname, and never written to the hosts file.
-    pub fn placeholder(public_key: &str) -> Self {
-        Self(public_key.to_string())
-    }
-
-    /// The name as the data store holds it, without validating it, since a placeholder is not a
-    /// valid hostname.
-    pub fn unchecked(name: String) -> Self {
-        Self(name)
     }
 }
 
@@ -1312,7 +1325,7 @@ mod tests {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
-            name: "peer1".parse().unwrap(),
+            name: Some("peer1".parse().unwrap()),
             ip,
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
@@ -1344,7 +1357,7 @@ mod tests {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
-            name: "peer1".parse().unwrap(),
+            name: Some("peer1".parse().unwrap()),
             ip,
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
@@ -1376,7 +1389,7 @@ mod tests {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = PeerContents {
-            name: "peer1".parse().unwrap(),
+            name: Some("peer1".parse().unwrap()),
             ip,
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
@@ -1418,7 +1431,7 @@ mod tests {
     fn test_peer_diff_endpoint_override() {
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let peer = PeerContents {
-            name: "peer1".parse().unwrap(),
+            name: Some("peer1".parse().unwrap()),
             ip: "10.0.0.1".parse().unwrap(),
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),
@@ -1476,9 +1489,63 @@ mod tests {
     }
 
     #[test]
-    fn test_state_drops_peers_with_invalid_names() {
-        // A peer whose name fails to deserialize is dropped from the state, but its key is kept,
-        // so that the client keeps the peer's record as it was.
+    fn test_peers_without_a_name() {
+        const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
+        let peer = |name: serde_json::Value| {
+            serde_json::from_value::<PeerContents>(serde_json::json!({
+                "name": name,
+                "ip": "10.0.0.1",
+                "cidr_id": 1,
+                "public_key": PUBKEY,
+                "endpoint": null,
+                "persistent_keepalive_interval": null,
+                "is_admin": false,
+                "is_disabled": false,
+                "is_redeemed": true,
+                "invite_expires": null,
+            }))
+        };
+
+        // A peer has no name if its name is null or missing, and is sent with a null name.
+        let nameless = peer(serde_json::json!(null)).unwrap();
+        assert_eq!(nameless.name, None);
+        assert_eq!(nameless.display_name(), "[unnamed]");
+        assert_eq!(
+            serde_json::to_value(&nameless).unwrap()["name"],
+            serde_json::json!(null)
+        );
+        let mut missing = serde_json::to_value(&nameless).unwrap();
+        missing.as_object_mut().unwrap().remove("name");
+        assert_eq!(
+            serde_json::from_value::<PeerContents>(missing).unwrap(),
+            nameless
+        );
+        assert_eq!(
+            peer("peer-1".into()).unwrap().name,
+            Some("peer-1".parse().unwrap())
+        );
+        // A name that is not valid is read as no name.
+        assert_eq!(peer("Peer".into()).unwrap(), nameless);
+        assert_eq!(peer("peer\n10.0.0.1 example.com".into()).unwrap(), nameless);
+        // A name that is not a string fails to deserialize.
+        assert!(peer(1.into()).is_err());
+
+        // An update carries the name, or null, but never leaves it out.
+        let update: PeerUpdate = serde_json::from_value(serde_json::json!({
+            "tag": "ab", "name": null, "is_admin": false, "is_disabled": false,
+        }))
+        .unwrap();
+        assert_eq!(update.name, None);
+        assert!(serde_json::from_value::<PeerUpdate>(serde_json::json!({
+            "tag": "ab", "is_admin": false, "is_disabled": false,
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn test_state_keeps_peers_with_invalid_names() {
+        // A peer whose name is not valid is kept in the state as a peer without a name, as a
+        // server that allows other names reports it.
         const PUBKEY: &str = "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=";
         let peer = serde_json::json!({
             "id": 1,
@@ -1495,8 +1562,10 @@ mod tests {
         });
         let state: State =
             serde_json::from_value(serde_json::json!({ "peers": [peer], "cidrs": [] })).unwrap();
-        assert!(state.peers.is_empty());
-        assert_eq!(state.invalid_peer_keys, [PUBKEY]);
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[0].name, None);
+        assert_eq!(state.peers[0].public_key, PUBKEY);
+        assert!(state.invalid_peer_keys.is_empty());
     }
 
     #[test]
@@ -1533,5 +1602,10 @@ mod tests {
         assert_eq!(state.peers[0].public_key, PUBKEY);
         assert_eq!(state.peers[0].ip.to_string(), "10.0.0.1");
         assert_eq!(state.invalid_peer_keys, [INVALID_KEY]);
+        assert!(LegacyPeerContents::from_peer(&PeerContents {
+            name: None,
+            ..state.peers[0].clone()
+        })
+        .is_none());
     }
 }

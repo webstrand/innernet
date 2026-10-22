@@ -427,7 +427,7 @@ mod tests {
         let config = ConfigFile::from_file(server.wg_conf_path())?;
         let key = Key::from_base64(&config.private_key)?.get_public();
         let own = DatabasePeer::own(&server.db().lock(), &key)?;
-        assert_eq!(&*own.name, "innernet-server");
+        assert_eq!(own.name.as_deref(), Some("innernet-server"));
 
         // A config whose key no peer has doesn't match the database.
         assert_eq!(

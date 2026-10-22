@@ -63,13 +63,13 @@ pub struct Names {
 
 impl Names {
     /// The names that `snapshot` publishes for `interface`, in the zone of `host_suffix`, as
-    /// [`host_zone`] makes it: the hostnames of the enabled peers.
+    /// [`host_zone`] makes it: the hostnames of the enabled peers that have a name.
     pub fn of(interface: &InterfaceName, host_suffix: Option<&str>, snapshot: &Snapshot) -> Self {
         let peers = snapshot
             .peers
             .iter()
             .filter(|peer| !peer.is_disabled)
-            .map(|peer| (peer.name.to_string(), peer.ip));
+            .filter_map(|peer| Some((peer.name.as_ref()?.to_string(), peer.ip)));
         Self {
             zone: fqdn(&host_zone(interface, host_suffix)),
             hosts: hosts(interface, host_suffix, peers),
@@ -442,7 +442,7 @@ mod tests {
     fn test_names_of() {
         let interface: InterfaceName = "wg0".parse().unwrap();
         let peer = |name: &str, ip: &str, is_disabled| innernet_shared::PeerContents {
-            name: innernet_shared::Hostname::unchecked(name.to_string()),
+            name: name.parse().ok(),
             ip: ip.parse().unwrap(),
             cidr_id: 0,
             public_key: wireguard_control::KeyPair::generate().public.to_base64(),
@@ -460,7 +460,7 @@ mod tests {
             peer("Not Valid", "10.0.0.4", false),
         ]);
 
-        // The enabled peers with a valid name, in the zone of the interface or of the suffix.
+        // The enabled peers that have a name, in the zone of the interface or of the suffix.
         assert_eq!(Names::of(&interface, None, &snapshot), {
             Names {
                 zone: Some(name("wg0.wg")),

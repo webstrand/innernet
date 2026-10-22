@@ -89,14 +89,14 @@ impl NatTraverse {
                 if recently_connected {
                     log::debug!(
                         "peer {} removed from NAT traverser (connected!).",
-                        &*peer.name
+                        peer.display_name()
                     );
                 }
                 !recently_connected
             } else {
                 log::debug!(
                     "peer {} removed from NAT traverser (no longer on interface).",
-                    &*peer.name
+                    peer.display_name()
                 );
                 false
             }
@@ -115,7 +115,11 @@ impl NatTraverse {
         let candidate_updates = self.remaining.iter_mut().filter_map(|peer| {
             let endpoint = peer.candidates.pop();
             if let Some(endpoint) = &endpoint {
-                log::debug!("trying endpoint {} for peer {}", endpoint, &*peer.name);
+                log::debug!(
+                    "trying endpoint {} for peer {}",
+                    endpoint,
+                    peer.display_name()
+                );
             }
             set_endpoint(&peer.public_key, endpoint.as_ref())
         });

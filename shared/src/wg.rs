@@ -272,7 +272,7 @@ mod tests {
 
     fn peer(ip: IpAddr) -> PeerContents {
         PeerContents {
-            name: "peer1".parse().unwrap(),
+            name: Some("peer1".parse().unwrap()),
             ip,
             cidr_id: 1,
             public_key: PUBKEY.to_owned(),

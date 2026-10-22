@@ -3,7 +3,7 @@ use crate::{
     store::{self, key_to_bytes, EndpointKind, PinKind},
     Store,
 };
-use innernet_shared::{Hostname, PeerContents};
+use innernet_shared::PeerContents;
 use wireguard_control::KeyPair;
 
 fn network() -> ipnet::IpNet {
@@ -12,7 +12,7 @@ fn network() -> ipnet::IpNet {
 
 fn peer(name: &str, ip: &str) -> PeerContents {
     PeerContents {
-        name: name.parse().unwrap(),
+        name: Some(name.parse().unwrap()),
         ip: ip.parse().unwrap(),
         cidr_id: 0,
         public_key: KeyPair::generate().public.to_base64(),
@@ -46,7 +46,7 @@ fn test_pins() {
         [Err(Refusal::KeyPinned { pinned: a.ip })]
     );
     let impostor = PeerContents {
-        name: "b".parse().unwrap(),
+        name: Some("b".parse().unwrap()),
         ..peer("b", "10.0.0.2")
     };
     assert_eq!(
@@ -56,7 +56,7 @@ fn test_pins() {
 
     // Anything else of a pinned peer changes in place.
     let renamed = PeerContents {
-        name: "renamed".parse().unwrap(),
+        name: Some("renamed".parse().unwrap()),
         is_admin: true,
         ..a.clone()
     };
@@ -65,22 +65,15 @@ fn test_pins() {
 }
 
 #[test]
-fn test_network_and_names() {
+fn test_network() {
     let store = Store::in_memory(network()).unwrap();
     let outside = peer("outside", "10.1.0.2");
-    let invalid = PeerContents {
-        name: Hostname::unchecked("Not Valid".into()),
-        ..peer("x", "10.0.0.4")
-    };
     assert_eq!(
-        accept(&store, &[&outside, &invalid]),
-        [
-            Err(Refusal::OutsideNetwork {
-                ip: outside.ip,
-                network: network()
-            }),
-            Err(Refusal::InvalidName)
-        ]
+        accept(&store, &[&outside]),
+        [Err(Refusal::OutsideNetwork {
+            ip: outside.ip,
+            network: network()
+        })]
     );
     assert!(store::load_peers(&store).unwrap().is_empty());
 }
@@ -91,7 +84,7 @@ fn test_duplicates_and_names_moving() {
     let a = peer("a", "10.0.0.2");
     let b = peer("b", "10.0.0.3");
     let same_ip = PeerContents {
-        name: "c".parse().unwrap(),
+        name: Some("c".parse().unwrap()),
         ..peer("c", "10.0.0.2")
     };
     assert_eq!(
@@ -101,25 +94,25 @@ fn test_duplicates_and_names_moving() {
 
     // Two peers swap names within one batch.
     let a_as_b = PeerContents {
-        name: "b".parse().unwrap(),
+        name: Some("b".parse().unwrap()),
         ..a.clone()
     };
     let b_as_a = PeerContents {
-        name: "a".parse().unwrap(),
+        name: Some("a".parse().unwrap()),
         ..b.clone()
     };
     assert_eq!(accept(&store, &[&a_as_b, &b_as_a]), [Ok(()), Ok(())]);
 
     // A name that its holder keeps can't be taken.
     let c = PeerContents {
-        name: "a".parse().unwrap(),
+        name: Some("a".parse().unwrap()),
         ..peer("c", "10.0.0.4")
     };
     assert_eq!(accept(&store, &[&c]), [Err(Refusal::NameTaken)]);
     let names: Vec<String> = store::load_peers(&store)
         .unwrap()
         .iter()
-        .map(|peer| peer.name.to_string())
+        .map(|peer| peer.display_name().to_string())
         .collect();
     assert_eq!(names, ["b", "a"]);
 }
@@ -194,28 +187,42 @@ fn test_kinds_match_tables() {
 }
 
 #[test]
-fn test_invalid_names_are_no_names() {
-    // A name that isn't a valid hostname is stored as none, so two such peers don't collide, and
-    // each reads as the placeholder of its key.
+fn test_peers_without_a_name() {
+    // Any number of peers can be without a name, and a peer can lose its name and get one again.
     let store = Store::in_memory(network()).unwrap();
-    let placeholders: Vec<PeerContents> = ["10.0.0.2", "10.0.0.3"]
+    let nameless: Vec<PeerContents> = ["10.0.0.2", "10.0.0.3"]
         .into_iter()
-        .map(|ip| {
-            let peer = peer("x", ip);
-            PeerContents {
-                name: Hostname::placeholder(&peer.public_key),
-                ..peer
-            }
+        .map(|ip| PeerContents {
+            name: None,
+            ..peer("x", ip)
         })
         .collect();
-    for peer in &placeholders {
-        store::write_peer(&store, &key_to_bytes(&peer.public_key).unwrap(), peer).unwrap();
-    }
+    let refs: Vec<&PeerContents> = nameless.iter().collect();
+    assert_eq!(accept(&store, &refs), [Ok(()), Ok(())]);
     let nulls: i64 = store
         .query_row("SELECT count(*) FROM peers WHERE name IS NULL", [], |r| {
             r.get(0)
         })
         .unwrap();
     assert_eq!(nulls, 2);
-    assert_eq!(store::load_peers(&store).unwrap(), placeholders);
+    assert_eq!(store::load_peers(&store).unwrap(), nameless);
+
+    let named = PeerContents {
+        name: Some("named".parse().unwrap()),
+        ..nameless[0].clone()
+    };
+    assert_eq!(accept(&store, &[&named]), [Ok(())]);
+    assert_eq!(store::load_peers(&store).unwrap()[0], named);
+}
+
+#[test]
+fn test_invalid_stored_names_are_no_names() {
+    // A stored name that isn't a valid hostname, as an operator may write by hand, reads as none.
+    let store = Store::in_memory(network()).unwrap();
+    let a = peer("a", "10.0.0.2");
+    accept(&store, &[&a]);
+    store
+        .execute("UPDATE peers SET name = 'Not Valid'", [])
+        .unwrap();
+    assert_eq!(store::load_peers(&store).unwrap()[0].name, None);
 }

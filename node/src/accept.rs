@@ -11,7 +11,7 @@
 //! was never redeemed.
 
 use crate::store::{self, key_to_bytes};
-use innernet_shared::{Hostname, PeerContents};
+use innernet_shared::PeerContents;
 use ipnet::IpNet;
 use rusqlite::Connection;
 use std::{
@@ -25,8 +25,6 @@ use std::{
 pub enum Refusal {
     /// The public key of the peer isn't one.
     InvalidKey,
-    /// The name of the peer isn't a valid hostname.
-    InvalidName,
     /// The address of the peer lies outside the network.
     OutsideNetwork { ip: IpAddr, network: IpNet },
     /// The address of the peer is pinned to another key.
@@ -43,7 +41,6 @@ impl Display for Refusal {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidKey => f.write_str("the public key of the peer is not valid"),
-            Self::InvalidName => f.write_str("the name is not a valid hostname"),
             Self::OutsideNetwork { ip, network } => {
                 write!(f, "IP {ip} is outside of the network {network}")
             },
@@ -65,9 +62,9 @@ impl Display for Refusal {
 impl std::error::Error for Refusal {}
 
 /// Decides what the node accepts of `peers`, within the network `network`, without writing
-/// anything. A record is refused if its key or name is invalid, its address lies outside the
-/// network, it conflicts with a pin, it shares its address or key with an earlier record of
-/// `peers`, or its name belongs to a peer that keeps it.
+/// anything. A record is refused if its key is invalid, its address lies outside the network, it
+/// conflicts with a pin, it shares its address or key with an earlier record of `peers`, or its
+/// name belongs to a peer that keeps it. Any number of peers can be without a name.
 pub(crate) fn decide(
     conn: &Connection,
     network: IpNet,
@@ -100,16 +97,19 @@ pub(crate) fn decide(
                 continue;
             }
             let peer = peers[i];
+            let Some(name) = &peer.name else {
+                continue;
+            };
             let taken_in_batch = peers[..i]
                 .iter()
                 .zip(&decided)
-                .any(|(other, decided)| decided.is_ok() && other.name == peer.name);
-            let kept_by_holder = match store::name_holder(conn, &peer.name)? {
+                .any(|(other, decided)| decided.is_ok() && other.name.as_ref() == Some(name));
+            let kept_by_holder = match store::name_holder(conn, name)? {
                 Some(holder) if holder != key_to_bytes(&peer.public_key).expect("checked") => {
                     !peers.iter().zip(&decided).any(|(other, decided)| {
                         decided.is_ok()
                             && key_to_bytes(&other.public_key).ok() == Some(holder)
-                            && other.name != peer.name
+                            && other.name.as_ref() != Some(name)
                     })
                 },
                 _ => false,
@@ -135,9 +135,6 @@ fn check(
     let Ok(key) = key_to_bytes(&peer.public_key) else {
         return Ok(Err(Refusal::InvalidKey));
     };
-    if !Hostname::is_valid(&peer.name) {
-        return Ok(Err(Refusal::InvalidName));
-    }
     if !network.contains(&peer.ip) {
         return Ok(Err(Refusal::OutsideNetwork {
             ip: peer.ip,

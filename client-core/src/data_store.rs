@@ -5,8 +5,8 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents, Hostname,
-    IoErrorContext, LegacyPeer, PeerContents, Prefix, State,
+    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents, IoErrorContext,
+    LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
 use rusqlite::OptionalExtension as _;
@@ -151,8 +151,8 @@ impl DataStore {
     /// invitation is redeemed, so the data store must be new.
     ///
     /// The interface config, which the invitation produced, is the authority on both, so their
-    /// addresses are pinned to their keys before the coordinator reports anything. Each record is
-    /// named by its public key until a fetch replaces it with the coordinator's record.
+    /// addresses are pinned to their keys before the coordinator reports anything. Each record has
+    /// no name until a fetch replaces it with the coordinator's record.
     pub fn introduce(&mut self, config: &InterfaceConfig) -> Result<(), Error> {
         let [coordinator, own] = introduced_peers(config)?;
         let tx = self.store.transaction()?;
@@ -309,8 +309,9 @@ impl DataStore {
 
 /// Imports the legacy data store at `path` into the new database, if there is one. The import
 /// refuses, rather than repairs, a data store that the node would refuse a peer of: one with an
-/// invalid public key or name, a peer outside the network, or two records in conflict. The file
-/// itself is left untouched, so that earlier versions still find their pins in it.
+/// invalid public key, a peer outside the network, or two records in conflict. A name that isn't
+/// valid is read as no name. The file itself is left untouched, so that earlier versions still
+/// find their pins in it.
 fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Error> {
     let json = match std::fs::read_to_string(path) {
         Ok(json) => json,
@@ -364,11 +365,11 @@ fn smallest_containing(cidrs: &[Cidr], contains: impl Fn(&IpNet) -> bool) -> Opt
         .map(|cidr| cidr.id)
 }
 
-/// The coordinator and this client, as the interface config introduces them. Each record is named
-/// by its public key, and has no CIDR.
+/// The coordinator and this client, as the interface config introduces them. Each record has
+/// neither a name nor a CIDR.
 fn introduced_peers(config: &InterfaceConfig) -> Result<[PeerContents; 2], Error> {
     let introduced = |ip, public_key: String, endpoint| PeerContents {
-        name: Hostname::placeholder(&public_key),
+        name: None,
         ip,
         cidr_id: UNKNOWN_ID,
         public_key,
@@ -404,7 +405,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
     static BASE_PEERS: Lazy<Vec<PeerContents>> = Lazy::new(|| {
         vec![PeerContents {
-            name: "blah".parse().unwrap(),
+            name: Some("blah".parse().unwrap()),
             ip: "10.0.0.1".parse().unwrap(),
             cidr_id: 1,
             public_key: "dz0/Fjmj7oRBSGxgWXSkE3n9R3k19kJOj127FzJZ81g=".to_string(),
@@ -450,7 +451,7 @@ mod tests {
             .zip(1..)
             .map(|(contents, id)| LegacyPeer {
                 id,
-                contents: LegacyPeerContents::from_peer(contents),
+                contents: LegacyPeerContents::from_peer(contents).unwrap(),
             })
             .collect();
         let contents = serde_json::json!({ "version": "1", "peers": peers, "cidrs": cidrs });
@@ -531,9 +532,9 @@ mod tests {
 
         // Other changes to a pinned peer are applied in place, and new peers are added.
         let mut updated = BASE_PEERS.clone();
-        updated[0].name = "renamed".parse().unwrap();
+        updated[0].name = Some("renamed".parse().unwrap());
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.name = "new".parse().unwrap();
+        new_peer.name = Some("new".parse().unwrap());
         new_peer.ip = "10.0.0.2".parse().unwrap();
         new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         updated.push(new_peer);
@@ -602,24 +603,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_basic_store(dir.path());
         let mut store = open(dir.path(), false).unwrap();
+        let state = |peers: &[serde_json::Value]| -> State {
+            serde_json::from_value(serde_json::json!({ "peers": peers, "cidrs": *BASE_CIDRS }))
+                .unwrap()
+        };
 
-        // A peer whose name isn't a valid hostname is dropped, and the other peers are kept.
-        let mut invalid = BASE_PEERS.clone();
+        // A peer whose name isn't a valid hostname is recorded as a peer without a name.
         let mut new_peer = BASE_PEERS[0].clone();
         new_peer.ip = "10.0.0.2".parse().unwrap();
         new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
-        new_peer.name = Hostname::unchecked("peer\n10.0.0.1 example.com".into());
-        invalid.push(new_peer);
-        let dropped = store.update_peers(&invalid);
-        assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, &invalid[1]);
-        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
+        let mut invalid = serde_json::to_value(&new_peer).unwrap();
+        invalid["name"] = "peer\n10.0.0.1 example.com".into();
+        let base = serde_json::to_value(&BASE_PEERS[0]).unwrap();
+        assert!(store
+            .update(&state(&[base.clone(), invalid]))
+            .unwrap()
+            .is_empty());
+        new_peer.name = None;
+        assert_eq!(
+            store.peers().unwrap(),
+            [BASE_PEERS[0].clone(), new_peer.clone()]
+        );
 
-        // A stored peer renamed to an invalid name keeps its record, and stays enabled.
-        let mut renamed = BASE_PEERS.clone();
-        renamed[0].name = Hostname::unchecked("Blah".into());
-        assert_eq!(store.update_peers(&renamed).len(), 1);
-        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
+        // A stored peer renamed to an invalid name loses its name, and stays enabled.
+        let mut renamed = base;
+        renamed["name"] = "Blah".into();
+        let renamed_new = serde_json::to_value(&new_peer).unwrap();
+        assert!(store
+            .update(&state(&[renamed, renamed_new]))
+            .unwrap()
+            .is_empty());
+        let unnamed = PeerContents {
+            name: None,
+            ..BASE_PEERS[0].clone()
+        };
+        assert_eq!(store.peers().unwrap(), [unnamed, new_peer]);
+    }
+
+    #[test]
+    fn test_peers_without_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_basic_store(dir.path());
+        let mut store = open(dir.path(), false).unwrap();
+
+        // Any number of peers can be without a name, and a peer can lose its name.
+        let mut nameless = BASE_PEERS.clone();
+        nameless[0].name = None;
+        let mut other = nameless[0].clone();
+        other.ip = "10.0.0.2".parse().unwrap();
+        other.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
+        nameless.push(other);
+        assert!(store.update_peers(&nameless).is_empty());
+        assert_eq!(store.peers().unwrap(), nameless);
+        assert_eq!(open(dir.path(), false).unwrap().peers().unwrap(), nameless);
+
+        // And get a name again.
+        assert!(store.update_peers(&BASE_PEERS).is_empty());
+        assert_eq!(store.peers().unwrap()[0], BASE_PEERS[0]);
     }
 
     #[test]
@@ -703,11 +743,11 @@ mod tests {
         // Of two new peers at the same IP, the first is kept and the second dropped.
         let mut same_ip = BASE_PEERS.clone();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.name = "second".parse().unwrap();
+        new_peer.name = Some("second".parse().unwrap());
         new_peer.ip = "10.0.0.2".parse().unwrap();
         new_peer.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         same_ip.push(new_peer.clone());
-        new_peer.name = "third".parse().unwrap();
+        new_peer.name = Some("third".parse().unwrap());
         new_peer.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         same_ip.push(new_peer);
         let dropped = store.update_peers(&same_ip);
@@ -718,11 +758,11 @@ mod tests {
         // Of two new peers with the same public key, the first is kept and the second dropped.
         let mut same_public_key = same_ip[..2].to_vec();
         let mut new_peer = BASE_PEERS[0].clone();
-        new_peer.name = "fourth".parse().unwrap();
+        new_peer.name = Some("fourth".parse().unwrap());
         new_peer.ip = "10.0.0.3".parse().unwrap();
         new_peer.public_key = "9fNiSxgLIPEqRALrIpaK2a77aiPz/CZCpQVQtF7o4v0=".to_string();
         same_public_key.push(new_peer.clone());
-        new_peer.name = "fifth".parse().unwrap();
+        new_peer.name = Some("fifth".parse().unwrap());
         new_peer.ip = "10.0.0.4".parse().unwrap();
         same_public_key.push(new_peer);
         let dropped = store.update_peers(&same_public_key);
@@ -807,17 +847,17 @@ mod tests {
         let own_key = wireguard_control::KeyPair::generate();
         let config = introducing_config(&own_key);
 
-        // A new data store pins the coordinator and this client, named by their public keys.
+        // A new data store pins the coordinator and this client, without a name.
         let mut store = open(dir.path(), true).unwrap();
         store.introduce(&config).unwrap();
         let peers = store.peers().unwrap();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].ip, COORDINATOR.ip);
         assert_eq!(peers[0].public_key, COORDINATOR.public_key);
-        assert_eq!(*peers[0].name, COORDINATOR.public_key);
+        assert_eq!(peers[0].name, None);
         assert_eq!(peers[1].ip, "10.0.0.2".parse::<std::net::IpAddr>().unwrap());
         assert_eq!(peers[1].public_key, own_key.public.to_base64());
-        assert!(!Hostname::is_valid(&peers[0].name));
+        assert_eq!(peers[1].name, None);
 
         // The coordinator can't be reported at another IP, nor another key at its IP.
         let mut moved = [COORDINATOR.clone()];
@@ -855,7 +895,7 @@ mod tests {
         v4.invite_expires = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         v4.is_admin = true;
         let mut domain = BASE_PEERS[0].clone();
-        domain.name = "domain".parse().unwrap();
+        domain.name = Some("domain".parse().unwrap());
         domain.ip = "10.0.1.1".parse().unwrap();
         domain.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         domain.endpoint = Some("vpn.example.com:51820".parse().unwrap());
@@ -1038,7 +1078,7 @@ mod tests {
         let mut cli = open(dir.path(), false).unwrap();
 
         let mut pinned = BASE_PEERS[0].clone();
-        pinned.name = "pinned".parse().unwrap();
+        pinned.name = Some("pinned".parse().unwrap());
         pinned.ip = "10.0.0.2".parse().unwrap();
         pinned.public_key = "HX6Se15qwliiWM7l3iCVAtK+FXNfHRFeEq8UFRK8BBk=".to_string();
         let mut with_pinned = BASE_PEERS.clone();
@@ -1048,7 +1088,7 @@ mod tests {
         // The daemon's handle predates the pin, but its update still keeps another key from the
         // pinned IP, and disables the pinned peer, which its state leaves out.
         let mut impostor = pinned.clone();
-        impostor.name = "impostor".parse().unwrap();
+        impostor.name = Some("impostor".parse().unwrap());
         impostor.public_key = "OmxANP9F6BAFC8+gGVmgQTEfanMMF+kge3y/eVEICes=".to_string();
         let mut with_impostor = BASE_PEERS.clone();
         with_impostor.push(impostor);

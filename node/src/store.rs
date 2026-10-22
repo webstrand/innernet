@@ -228,9 +228,8 @@ pub fn name_holder(conn: &Connection, name: &str) -> Result<Option<[u8; 32]>, ru
 }
 
 /// Writes `peer`, keyed by `key`, the bytes of its public key: its record, in place of the stored
-/// one, its endpoint and candidates, and its address, pinned to its key if no address is. A name
-/// that isn't a valid [`Hostname`], such as the placeholder of an introduced peer, is stored as
-/// no name.
+/// one, its endpoint and candidates, and its address, pinned to its key if no address is. A peer
+/// without a name is stored with a NULL name.
 pub fn write_peer(
     conn: &Connection,
     key: &[u8; 32],
@@ -253,7 +252,7 @@ pub fn write_peer(
            invite_expires = excluded.invite_expires",
         params![
             key,
-            Hostname::is_valid(&peer.name).then_some(&*peer.name),
+            peer.name.as_deref(),
             peer.is_admin,
             peer.is_disabled,
             peer.is_redeemed,
@@ -288,8 +287,7 @@ pub fn forget_peer(conn: &Connection, key: &[u8; 32]) -> Result<(), rusqlite::Er
 
 /// The peers that the node records, invitations included, each at the address pinned to its key,
 /// ordered by address. Server IDs aren't stored, so every peer's CIDR ID is 0: a host that needs
-/// IDs assigns them. A peer without a valid name, such as an introduced peer, is named by the
-/// placeholder of its public key, which no other name equals.
+/// IDs assigns them. A stored name that isn't a valid [`Hostname`] reads as no name.
 pub fn load_peers(conn: &Connection) -> Result<Vec<PeerContents>, rusqlite::Error> {
     load_peers_where(conn, None)
 }
@@ -322,15 +320,14 @@ fn load_peers_where(
         let invite_expires = row
             .get::<_, Option<u64>>(6)?
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-        let name: Option<String> = row.get(1)?;
+        let name = row
+            .get::<_, Option<String>>(1)?
+            .and_then(|name| Hostname::try_from(name).ok());
         let ip = row_ip(row, 7)?
             .ok_or_else(|| rusqlite::Error::InvalidColumnType(7, "address".into(), Type::Null))?;
         let endpoints = endpoints.remove(&public_key).unwrap_or_default();
         peers.push(PeerContents {
-            name: name
-                .filter(|name| Hostname::is_valid(name))
-                .map(Hostname::unchecked)
-                .unwrap_or_else(|| Hostname::placeholder(&public_key)),
+            name,
             ip,
             cidr_id: 0,
             public_key,

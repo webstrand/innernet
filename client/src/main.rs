@@ -904,7 +904,7 @@ fn print_peer(
                 "◯".dimmed()
             },
             peer.ip.to_string().yellow().bold(),
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             if is_you { "you, " } else { "" },
             public_key.dimmed(),
         );
@@ -913,7 +913,7 @@ fn print_peer(
             pad,
             "{}: {} ({})",
             "peer".yellow().bold(),
-            peer.name.yellow(),
+            peer.display_name().yellow(),
             public_key.yellow(),
         );
         println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);

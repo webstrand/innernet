@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn test_snapshot() {
         let peer = |name: &str, ip: &str, is_disabled| PeerContents {
-            name: name.parse().unwrap(),
+            name: Some(name.parse().unwrap()),
             ip: ip.parse().unwrap(),
             cidr_id: 0,
             public_key: wireguard_control::KeyPair::generate().public.to_base64(),

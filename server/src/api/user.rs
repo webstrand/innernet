@@ -59,8 +59,10 @@ mod handlers {
     /// This endpoint returns the visible CIDRs and Peers, providing all the necessary
     /// information for the peer to create connections to all of them.
     ///
-    /// A TLS session gets the peers without IDs, and a plain-HTTP session with the IDs that
-    /// [`DatabasePeer::plain_http_ids`] numbers them by, as clients that predate TLS expect.
+    /// A TLS session gets the peers without IDs. A plain-HTTP session, that of a client that
+    /// predates TLS, gets each with an ID, as [`DatabasePeer::plain_http_ids`] numbers them,
+    /// without the peers that have no name, which such clients can't read. Such a client takes a
+    /// peer that it no longer sees for disabled.
     pub async fn state(session: Session) -> Result<Response<Body>, ServerError> {
         let conn = session.context.db.lock();
         let selected_peer = session.peer.reload(&conn)?;
@@ -80,7 +82,7 @@ mod handlers {
             json_response(LegacyState {
                 peers: peers
                     .iter()
-                    .map(|peer| peer.legacy(ids[&peer.public_key]))
+                    .filter_map(|peer| peer.legacy(ids[&peer.public_key]))
                     .collect(),
                 cidrs,
                 invalid_peer_keys: vec![],
@@ -182,7 +184,10 @@ mod tests {
 
         let whole_body = hyper::body::aggregate(res).await?;
         let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-        let mut peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
+        let mut peer_names = peers
+            .iter()
+            .map(|p| p.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
         peer_names.sort_unstable();
         // Developers should see only peers in infra CIDR and developer CIDR.
         assert_eq!(
@@ -336,7 +341,10 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
             let whole_body = hyper::body::aggregate(res).await?;
             let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
-            let mut peer_names = peers.iter().map(|p| &*p.name).collect::<Vec<_>>();
+            let mut peer_names = peers
+                .iter()
+                .map(|p| p.name.as_deref().unwrap())
+                .collect::<Vec<_>>();
             peer_names.sort_unstable();
             // Developers should see only peers in infra CIDR and developer CIDR.
             assert_eq!(

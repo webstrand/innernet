@@ -130,14 +130,8 @@ pub async fn rename_peer(
     log::info!("Fetching peers");
     let peers = rest_client.get_peers().await?;
 
-    if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
+    if let Some((peer_request, listed)) = prompts::rename_peer(&peers, &sub_opts)? {
         log::info!("Renaming peer...");
-
-        let listed = peers
-            .iter()
-            .find(|p| p.name == old_name)
-            .ok_or_else(|| anyhow!("Peer not found."))?;
-
         rest_client.update_peer(listed, &peer_request).await?;
         log::info!("Peer renamed.");
     } else {

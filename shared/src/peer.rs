@@ -13,7 +13,7 @@ pub struct NewPeerInfo {
 impl NewPeerInfo {
     pub fn into_peer_contents(self, keypair: &KeyPair) -> PeerContents {
         PeerContents {
-            name: self.name,
+            name: Some(self.name),
             ip: self.ip,
             cidr_id: self.cidr_id,
             public_key: keypair.public.to_base64(),
