@@ -27,13 +27,12 @@ clap_complete = "4.3"
 colored.workspace = true
 dialoguer.workspace = true
 indoc = "2.0.1"
-innernet-node = { version = "2.0.0", path = "../node" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 innernet-client-core = { version = "2.0.0", path = "../client-core" }
+innernet-node = { version = "2.0.0", path = "../node" }
 log = "0.4"
 tokio = { version = "1.28.0", features = ["macros", "rt", "time"] }
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
-
 
 [package.metadata.deb]
 assets = [

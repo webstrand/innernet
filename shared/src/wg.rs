@@ -185,8 +185,8 @@ pub use super::netlink::add_route;
 
 pub trait DeviceExt {
     /// Diff the output of a wgctrl device with a list of peers, of which the disabled peers and
-    /// those without a delegation are removed from the device. The endpoint of a peer whose canonical base64 public key is in
-    /// `endpoint_overrides` is replaced with its override.
+    /// those without a delegation are removed from the device. The endpoint of a peer whose
+    /// canonical base64 public key is in `endpoint_overrides` is replaced with its override.
     fn diff<'a>(
         &'a self,
         peers: &'a [PeerContents],

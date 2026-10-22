@@ -328,7 +328,8 @@ mod tests {
         } else {
             "10.80.64.4"
         };
-        let mut invalid = serde_json::to_value(test::developer_peer_contents("developer3", ip)?)?;
+        let mut invalid =
+            cbor_core::Value::serialized(&test::developer_peer_contents("developer3", ip)?)?;
         invalid["name"] = "devel oper".into();
         let res = server
             .form_request(test::ADMIN_PEER_IP, "POST", "/admin/peers", &invalid)
@@ -336,7 +337,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         let path = key_path(&server, test::DEVELOPER1_PEER_ID);
-        let mut rename = serde_json::to_value(unchanged(&server, &path).await)?;
+        let mut rename = cbor_core::Value::serialized(&unchanged(&server, &path).await)?;
         rename["name"] = "devel oper".into();
         let res = server
             .form_request(test::ADMIN_PEER_IP, "PUT", &path, &rename)
