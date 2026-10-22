@@ -579,6 +579,7 @@ pub fn peer_contents(name: &str, ip_str: &str, is_admin: bool) -> Result<PeerCon
         announcement: None,
         allowed_ips: None,
         primary_ip: None,
+        nameserver: None,
     })
 }
 

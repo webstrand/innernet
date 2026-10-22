@@ -773,6 +773,11 @@ pub struct PeerContents {
     /// address of its delegations. It is never transferred.
     #[serde(skip)]
     pub primary_ip: Option<IpAddr>,
+    /// The nameserver that the peer offers for the names under its own, as its announcement
+    /// states it, once [`Self::effective_with`] has made the peer of its announcement. It is
+    /// never transferred.
+    #[serde(skip)]
+    pub nameserver: Option<crate::announcement::Nameserver>,
 }
 
 impl PeerContents {
@@ -1062,6 +1067,7 @@ impl From<LegacyPeerContents> for PeerContents {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }
     }
 }
@@ -1712,6 +1718,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1746,6 +1753,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1780,6 +1788,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let builder =
             PeerConfigBuilder::new(&Key::from_base64(PUBKEY).unwrap()).add_allowed_ip(ip, 32);
@@ -1824,6 +1833,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let endpoint_override: Endpoint = "2.2.2.2:2222".parse().unwrap();
 
@@ -1871,6 +1881,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let encoded = crate::cbor::to_vec(&peer).unwrap();
         let value = cbor_core::Value::decode(&encoded).unwrap();
@@ -2029,6 +2040,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }
     }
 

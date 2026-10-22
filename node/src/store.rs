@@ -224,6 +224,7 @@ pub fn write_announcement(
         allowed_ips,
         primary_ip,
         endpoints,
+        nameserver: _,
     } = announcement;
     let timestamp = i64::try_from(*timestamp)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -589,6 +590,7 @@ fn load_peers_where(
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         });
     }
     peers.sort_by(|a, b| {

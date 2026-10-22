@@ -107,6 +107,7 @@ fn populate_database(store: &Store, db_init_data: DbInitData) -> Result<(), Erro
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         },
     )
     .map_err(|_| anyhow!("failed to create innernet peer."))?;

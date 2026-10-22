@@ -893,6 +893,7 @@ fn introduced_peers(
         announcement: None,
         allowed_ips: None,
         primary_ip: None,
+        nameserver: None,
     };
     // Public keys are compared in their canonical encoding, as a state's are deserialized.
     let server_key = Key::from_base64(&config.server.public_key)?.to_base64();
@@ -931,6 +932,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }]
     });
     static BASE_CIDRS: Lazy<Vec<Cidr>> = Lazy::new(|| {
@@ -1923,6 +1925,7 @@ mod tests {
                 "peer.example.com:1".parse().unwrap(),
                 "192.0.2.1:51820".parse().unwrap(),
             ],
+            nameserver: None,
         };
         let signed = sign(&first);
         assert!(store
@@ -2180,6 +2183,7 @@ mod tests {
             allowed_ips: prefixes(delegation),
             primary_ip: Some(prefixes(delegation)[0].first()),
             endpoints: vec![endpoint.parse().unwrap()],
+            ..Default::default()
         };
         let state = |announcement: &Announcement| {
             vec![PeerContents {

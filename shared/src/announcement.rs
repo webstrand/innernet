@@ -16,7 +16,8 @@
 //! take what the peer claims, whatever the server reports. A statement is any other field: what
 //! the peer states about itself, which recipients check against its claims. A peer states its
 //! allowed IPs, the prefixes that it accepts traffic for, its primary IP, the address at which its
-//! name resolves, and the endpoints at which it is reached, in the order in which peers try them.
+//! name resolves, the endpoints at which it is reached, in the order in which peers try them, and
+//! the nameserver that it offers for the names under its own.
 //!
 //! For a peer that has never announced, such as one whose client predates announcements, the
 //! server makes an unsigned announcement of what it records of the peer, as
@@ -43,7 +44,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     fmt::{self, Display, Formatter},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime},
 };
 use wireguard_control::Key;
@@ -100,6 +101,51 @@ pub struct Announcement {
     /// `0.0.0.0:51820`, can't be reached, and takes no effect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<Endpoint>,
+
+    /// The nameserver that the peer offers for its own name and the names under it. A recipient
+    /// takes it only if it lies within the delegation that the peer claims; one that the allowed
+    /// IPs don't route is merely unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameserver: Option<Nameserver>,
+}
+
+/// A nameserver that a peer offers for its own name and the names under it.
+///
+/// Each recipient names the peer by its own hostname for it, such as `peer.wg0.wg`, which differs
+/// between recipients with different host suffixes. The nameserver answers for `zone` instead: a
+/// recipient that forwards a query replaces its hostname of the peer with `zone`, and `zone` with
+/// its hostname again in the response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nameserver {
+    /// The address and port at which the nameserver answers, within the delegation of the peer,
+    /// so that queries reach it through the tunnel to the peer. The address isn't unspecified,
+    /// and the port isn't 0.
+    #[serde(with = "socket_addr_as_text")]
+    pub address: SocketAddr,
+
+    /// The domain that the nameserver answers for, a canonical domain as
+    /// [`innernet_domain::is_canonical_domain`] accepts it, so at most 253 bytes long.
+    pub zone: String,
+}
+
+impl Nameserver {
+    /// Checks that the address is neither unspecified nor at port 0, and that the zone is a
+    /// canonical domain.
+    pub fn check(&self) -> Result<(), String> {
+        if self.address.ip().is_unspecified() || self.address.port() == 0 {
+            return Err(format!(
+                "the nameserver address {} can't be reached",
+                self.address
+            ));
+        }
+        if !innernet_domain::is_canonical_domain(&self.zone) {
+            return Err(format!(
+                "the zone {} is not a canonical domain",
+                self.zone.escape_debug()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The claims of an announcement, each type under its key of [`CLAIM_TYPES`]. A claim that an
@@ -209,6 +255,7 @@ impl Announcement {
             allowed_ips: peer.delegations.clone(),
             primary_ip: hosts_fallback(&peer.delegations),
             endpoints: legacy_endpoints(peer.endpoint.as_ref(), &peer.candidates),
+            nameserver: None,
         }
     }
 
@@ -400,6 +447,9 @@ impl SignedAnnouncement {
                 "it has more than {MAX_ENDPOINTS} endpoints"
             )));
         }
+        if let Some(nameserver) = &announcement.nameserver {
+            nameserver.check().map_err(AnnouncementError::Malformed)?;
+        }
         Ok(announcement)
     }
 
@@ -467,18 +517,24 @@ impl PeerContents {
     /// or as the server records it, without an announcement. Its delegations are those that it
     /// claims, its allowed IPs those that it states shrunk to them, its primary IP and name those
     /// that it states and claims, its endpoint the first of the endpoints that it states, and its
-    /// candidates the others, in their order, but for those whose host is unspecified. What the
-    /// server reports of the delegations and the name of a peer that has announced takes no
-    /// effect.
+    /// candidates the others, in their order, but for those whose host is unspecified, and its
+    /// nameserver the one that it states, if it lies within its delegations. What the server
+    /// reports of the delegations and the name of a peer that has announced takes no effect.
     pub fn effective_with(&self, announcement: Option<&Announcement>) -> PeerContents {
         let Some(announcement) = announcement else {
             return PeerContents {
                 allowed_ips: None,
                 primary_ip: None,
+                nameserver: None,
                 ..self.clone()
             };
         };
         let delegations = announcement.claims.delegation.clone();
+        let nameserver = announcement.nameserver.clone().filter(|nameserver| {
+            delegations
+                .iter()
+                .any(|d| d.contains_addr(&nameserver.address.ip()))
+        });
         let mut candidates: Vec<Endpoint> = announcement
             .endpoints
             .iter()
@@ -493,6 +549,7 @@ impl PeerContents {
             endpoint,
             candidates,
             primary_ip: announcement.primary_ip,
+            nameserver,
             ..self.clone()
         }
     }
@@ -591,6 +648,24 @@ mod option_bytes {
     }
 }
 
+/// A socket address as text, whatever the format, as the TLS API transfers it.
+mod socket_addr_as_text {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        address: &SocketAddr,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(address)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
 /// An address as text, whatever the format, as the TLS API transfers it.
 mod ip_as_text {
     use super::*;
@@ -650,6 +725,14 @@ mod tests {
                 "192.0.2.2:51820".parse().unwrap(),
                 "peer.example.com:51820".parse().unwrap(),
             ],
+            nameserver: Some(nameserver("10.0.0.34:53", "example.com")),
+        }
+    }
+
+    fn nameserver(address: &str, zone: &str) -> Nameserver {
+        Nameserver {
+            address: address.parse().unwrap(),
+            zone: zone.into(),
         }
     }
 
@@ -668,6 +751,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }
     }
 
@@ -1030,6 +1114,79 @@ mod tests {
         let mut beyond = announcement();
         beyond.allowed_ips = prefixes(&["10.0.0.0/8"]);
         assert_eq!(check(&beyond), Ok(()));
+    }
+
+    #[test]
+    fn test_nameserver() {
+        let (keypair, private_key) = keys();
+        let open = |nameserver: Nameserver| {
+            let announcement = Announcement {
+                nameserver: Some(nameserver),
+                ..announcement()
+            };
+            sign_raw(&keypair, &private_key, cbor::to_vec(&announcement).unwrap())
+                .open(&keypair.public)
+        };
+
+        // The nameserver is a statement, its address text, as everywhere on the wire.
+        #[derive(Deserialize)]
+        struct Text {
+            address: String,
+            zone: String,
+        }
+        #[derive(Deserialize)]
+        struct Payload {
+            nameserver: Text,
+        }
+        let payload: Payload = cbor::from_slice(&cbor::to_vec(&announcement()).unwrap()).unwrap();
+        assert_eq!(payload.nameserver.address, "10.0.0.34:53");
+        assert_eq!(payload.nameserver.zone, "example.com");
+        assert!(open(nameserver("[fd00::1]:5353", "a.example.com")).is_ok());
+
+        // A nameserver that can't be reached, or a zone that isn't a canonical domain, makes the
+        // announcement malformed.
+        for (address, zone) in [
+            ("0.0.0.0:53", "example.com"),
+            ("10.0.0.34:0", "example.com"),
+            ("10.0.0.34:53", "Example.com"),
+            ("10.0.0.34:53", "example.com."),
+            ("10.0.0.34:53", ""),
+            ("10.0.0.34:53", "10.0.0.1"),
+        ] {
+            assert!(
+                matches!(
+                    open(nameserver(address, zone)),
+                    Err(AnnouncementError::Malformed(_))
+                ),
+                "{address} {zone}"
+            );
+        }
+        let long = vec!["a".repeat(63); 4].join(".");
+        assert!(matches!(
+            open(nameserver("10.0.0.34:53", &long)),
+            Err(AnnouncementError::Malformed(_))
+        ));
+
+        // The server doesn't check where it lies, but it takes effect only within the claimed
+        // delegation, whatever the allowed IPs route.
+        let peer = peer(&keypair.public);
+        assert_eq!(
+            announcement().check_assigned(&peer.delegations, peer.name.as_ref()),
+            Ok(())
+        );
+        let mut announced = announcement();
+        announced.allowed_ips = vec![];
+        assert_eq!(
+            peer.effective_with(Some(&announced)).nameserver,
+            announcement().nameserver
+        );
+        announced.nameserver = Some(nameserver("10.0.0.1:53", "example.com"));
+        assert_eq!(
+            announced.check_assigned(&peer.delegations, peer.name.as_ref()),
+            Ok(())
+        );
+        assert_eq!(peer.effective_with(Some(&announced)).nameserver, None);
+        assert_eq!(peer.effective_with(None).nameserver, None);
     }
 
     #[test]

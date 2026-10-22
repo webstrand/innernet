@@ -166,6 +166,7 @@ pub fn own_announcement(
         allowed_ips,
         primary_ip: Some(primary_ip),
         endpoints,
+        nameserver: None,
     }
 }
 
@@ -258,6 +259,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }
     }
 

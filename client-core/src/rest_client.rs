@@ -960,6 +960,7 @@ fn same_but_untagged(a: &PeerContents, b: &PeerContents) -> bool {
         announcement: None,
         allowed_ips: None,
         primary_ip: None,
+        nameserver: None,
         ..peer.clone()
     };
     tagged(a) == tagged(b)
@@ -1646,6 +1647,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         }
     }
 

@@ -120,6 +120,7 @@ fn peer_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
         announcement: None,
         allowed_ips: None,
         primary_ip: None,
+        nameserver: None,
         ..peer.clone()
     };
     tag("peer", &peer)

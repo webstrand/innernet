@@ -456,6 +456,7 @@ mod tests {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         let snapshot = crate::snapshot::Snapshot {
             peers: vec![

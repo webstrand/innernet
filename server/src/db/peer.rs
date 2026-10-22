@@ -613,6 +613,7 @@ impl DatabasePeer {
             announcement: None,
             allowed_ips: None,
             primary_ip: None,
+            nameserver: None,
         };
         Ok(Self {
             inner,

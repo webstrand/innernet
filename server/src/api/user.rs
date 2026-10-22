@@ -245,7 +245,7 @@ mod tests {
     use super::*;
     use crate::{db::DatabaseAssociation, test};
     use innernet_shared::{
-        announcement::{Announcement, Claims},
+        announcement::{Announcement, Claims, Nameserver},
         media_type, Association, Endpoint, EndpointContents, Error, LegacyPeer, LegacyState,
         PeerContents, Prefix,
     };
@@ -1059,6 +1059,7 @@ mod tests {
                 "198.51.100.1:51820".parse().unwrap(),
                 "192.0.2.1:51820".parse().unwrap(),
             ],
+            nameserver: None,
         }
     }
 
@@ -1213,6 +1214,7 @@ mod tests {
             },
             Announcement {
                 primary_ip: None,
+                nameserver: None,
                 ..developer1_announcement()
             },
             Announcement {
@@ -1235,6 +1237,31 @@ mod tests {
         };
         let res = announce(server.sign(&keypair, &stale_unassigned)).await;
         test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_UNASSIGNED).await?;
+
+        // A nameserver is a statement, which the server doesn't place, but whose zone it checks.
+        let res = announce(server.sign(
+            &keypair,
+            &Announcement {
+                nameserver: Some(Nameserver {
+                    address: "10.0.0.0:53".parse().unwrap(),
+                    zone: "Example.com".into(),
+                }),
+                ..developer1_announcement()
+            },
+        ))
+        .await;
+        test::problem(res, &innernet_shared::problem::ANNOUNCEMENT_INVALID).await?;
+        let elsewhere = Announcement {
+            nameserver: Some(Nameserver {
+                address: (user_ip, 53).into(),
+                zone: "example.com".into(),
+            }),
+            ..developer1_announcement()
+        };
+        let res = announce(server.sign(&keypair, &elsewhere)).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let stored = DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public)?;
+        assert_eq!(stored.effective().nameserver, None);
 
         // Allowed IPs beyond the delegation are no reason to refuse it: every peer shrinks them.
         let wider = Announcement {
