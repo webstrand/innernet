@@ -320,23 +320,45 @@ pub fn gather_new_peer_info(
         choose_cidr(&leaves[..], "Eligible CIDRs for peer")?
     };
 
-    let mut available_ip = None;
-    let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
-    for ip in candidate_ips {
-        if !peers.iter().any(|peer| peer.holds(ip)) {
-            available_ip = Some(ip);
-            break;
-        }
-    }
-
-    let available_ip = available_ip.expect("No IPs in this CIDR are avavilable");
-
-    let ip = if let Some(ip) = args.ip {
-        ip
-    } else if args.auto_ip {
-        available_ip
+    let delegation = if let Some(delegation) = args.delegation {
+        // A wider delegation is checked as the server checks it, so that a refusal is explained
+        // before the server is asked.
+        let others: Vec<(Prefix, String)> = peers
+            .iter()
+            .flat_map(|peer| {
+                peer.delegations
+                    .iter()
+                    .map(move |prefix| (*prefix, format!("peer {}", peer.display_name())))
+            })
+            .collect();
+        check_delegations(
+            &[delegation],
+            &cidr.cidr,
+            others
+                .iter()
+                .map(|(prefix, holder)| (prefix, holder.as_str())),
+        )?;
+        delegation
     } else {
-        input("IP", Prefill::Default(available_ip))?
+        let mut available_ip = None;
+        let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
+        for ip in candidate_ips {
+            if !peers.iter().any(|peer| peer.holds(ip)) {
+                available_ip = Some(ip);
+                break;
+            }
+        }
+
+        let available_ip = available_ip.expect("No IPs in this CIDR are avavilable");
+
+        let ip = if let Some(ip) = args.ip {
+            ip
+        } else if args.auto_ip {
+            available_ip
+        } else {
+            input("IP", Prefill::Default(available_ip))?
+        };
+        Prefix::host(ip)
     };
 
     let name = if let Some(name) = &args.name {
@@ -372,7 +394,7 @@ pub fn gather_new_peer_info(
     if args.yes || confirm(&format!("Create peer {}?", name.yellow()))? {
         let input = NewPeerInfo {
             name,
-            delegations: vec![Prefix::host(ip)],
+            delegations: vec![delegation],
             cidr_id: cidr.id,
             is_admin,
             invite_expires,
@@ -856,6 +878,84 @@ mod tests {
             prefix: Some(prefix.parse().unwrap()),
             yes: true,
         }
+    }
+
+    #[test]
+    fn test_new_peer_with_a_delegation() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Command {
+            #[clap(flatten)]
+            opts: AddPeerOpts,
+        }
+        let parse = |args: &[&str]| {
+            Command::try_parse_from(
+                [
+                    "add-peer",
+                    "--name",
+                    "peer3",
+                    "--cidr",
+                    "cidr",
+                    "--admin",
+                    "false",
+                    "--invite-expires",
+                    "1h",
+                    "--save-config",
+                    "peer3.toml",
+                    "--yes",
+                ]
+                .iter()
+                .chain(args),
+            )
+            .map(|command| command.opts)
+        };
+        let peers = [peer(
+            "peer1",
+            "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=",
+            &["10.0.0.16/28"],
+        )];
+        let cidrs = [Cidr {
+            id: 1,
+            contents: CidrContents {
+                name: "cidr".into(),
+                cidr: "10.0.0.0/24".parse().unwrap(),
+                parent: None,
+            },
+        }];
+        let tree = CidrTree::new(&cidrs);
+        let offered = |args: &[&str]| {
+            gather_new_peer_info(&peers, &tree, &parse(args).unwrap())
+                .map(|info| info.unwrap().0.delegations)
+        };
+
+        // A new peer is offered the prefix it is given, a single IP, or the first free IP.
+        assert_eq!(
+            offered(&["--delegation", "10.0.0.32/28"]).unwrap(),
+            ["10.0.0.32/28".parse::<Prefix>().unwrap()]
+        );
+        assert_eq!(
+            offered(&["--ip", "10.0.0.7"]).unwrap(),
+            ["10.0.0.7/32".parse::<Prefix>().unwrap()]
+        );
+        assert_eq!(
+            offered(&["--auto-ip"]).unwrap(),
+            ["10.0.0.1/32".parse::<Prefix>().unwrap()]
+        );
+
+        // A prefix that another peer holds is refused with an explanation, and the prefix goes
+        // with neither an IP nor an automatic one.
+        let error = offered(&["--delegation", "10.0.0.0/27"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("network or broadcast"), "{error}");
+        let error = offered(&["--delegation", "10.0.0.24/29"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("delegated to peer peer1"), "{error}");
+        assert!(parse(&["--delegation", "10.0.0.32/28", "--ip", "10.0.0.7"]).is_err());
+        assert!(parse(&["--delegation", "10.0.0.32/28", "--auto-ip"]).is_err());
+        assert!(parse(&["--delegation", "10.0.0.33/28"]).is_err());
     }
 
     #[test]

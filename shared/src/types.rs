@@ -356,13 +356,19 @@ pub struct AddPeerOpts {
     #[clap(long)]
     pub name: Option<Hostname>,
 
-    /// Specify desired IP of new peer (within parent CIDR)
+    /// Specify desired IP of new peer (within parent CIDR), which the peer is offered as a /32 or
+    /// /128 delegation
     #[clap(long, conflicts_with = "auto_ip")]
     pub ip: Option<IpAddr>,
 
     /// Auto-assign the peer the first available IP within the CIDR
     #[clap(long = "auto-ip")]
     pub auto_ip: bool,
+
+    /// Offer the new peer this prefix of its CIDR as its delegation, rather than a single IP
+    /// (eg. '10.42.5.16/28')
+    #[clap(long, conflicts_with_all = ["ip", "auto_ip"])]
+    pub delegation: Option<Prefix>,
 
     /// Name of CIDR to add new peer under
     #[clap(long)]
