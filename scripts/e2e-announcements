@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# End-to-end test of signed announcements, run unprivileged in network namespaces.
+#
+# Usage: scripts/e2e-announcements [--keep]
+#
+# Topology, inside a private user, mount and network namespace:
+#
+#   198.18.0.0/24 "internet" (bridge in the outer namespace)
+#     srv     198.18.0.1   innernet-server
+#     a       198.18.0.2   peer with a current client, which announces
+#     b       198.18.0.3   admin with a current client, which checks a's announcements
+#     old     198.18.0.4   peer with a client that predates TLS, which never announces
+#
+# The client that predates TLS is played by wg(8) and curl(1) speaking plain HTTP. A compromised
+# coordination server is played by changes to the server's database. The binaries are those of
+# the workspace, built into $CARGO_TARGET_DIR, or target/ if it is unset.
+#
+# Requires: unshare, ip, wg, curl, sqlite3, python3 (3.11+), and the kernel WireGuard module.
+set -euo pipefail
+
+if [ -z "${E2E_INSIDE:-}" ]; then
+    top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    cargo build --offline --bins --manifest-path "$top/Cargo.toml" >&2
+    exec unshare --user --map-root-user --mount --net \
+        env E2E_INSIDE=1 E2E_BIN="${CARGO_TARGET_DIR:-$top/target}/debug" "$0" "$@"
+fi
+
+keep=0
+[ "${1:-}" = --keep ] && keep=1
+
+mount -t tmpfs tmpfs /run
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/innernet-e2e.XXXXXX")
+pids=()
+cleanup() {
+    local status=$?
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    if [ "$status" -ne 0 ]; then
+        echo "--- server log" >&2
+        tail -n 30 "$work/srv.log" >&2 || true
+    fi
+    if [ "$keep" -eq 1 ] || [ "$status" -ne 0 ]; then
+        echo "work directory kept: $work" >&2
+    else
+        rm -rf "$work"
+    fi
+}
+trap cleanup EXIT
+
+step() { printf '\n=== %s\n' "$*"; }
+pass() { printf 'ok: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+ns() { local name=$1; shift; ip netns exec "$name" "$@"; }
+
+server() { ns srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" "$@"; }
+client() {
+    local peer=$1; shift
+    ns "$peer" "$E2E_BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" "$@" \
+        >"$work/$peer.log" 2>&1 || { cat "$work/$peer.log" >&2; return 1; }
+}
+
+# Waits until the coordinator of the server in the namespace `$1`, whose config is `$2`, listens
+# for its API, which the admin commands of innernet-server reach it at.
+await_coordinator() { # <namespace> <config>
+    local port
+    for _ in $(seq 50); do
+        port=$(python3 -I -c 'import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+print(c.get("coordinator", c).get("quic-port", ""))' "$2")
+        if [ -n "$port" ] && ip netns exec "$1" ss -Hlun "sport = :$port" | grep -q .; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "FAIL: the coordinator in $1 doesn't listen" >&2
+    exit 1
+}
+
+db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
+# Queries the data store of a client.
+store() { # <peer> <SQL>
+    sqlite3 "$work/$1/data/e2e.db" "$2"
+}
+
+# Prints the public key in base64 as hex, as sqlite3 prints a blob.
+key_hex() { python3 -I -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).hex().upper())' "$1"; }
+by_key() { echo "hex(public_key) = '$(key_hex "$1")'"; }
+# Selects, in the server's database, the peer to which the server offers the name `$1`.
+offered() { echo "public_key = (SELECT public_key FROM offered_names WHERE name = '$1')"; }
+
+# Prints a field of an invitation or a config.
+field() { # <file> <table> <key>
+    python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$@"
+}
+
+# Sets, or with no value removes, a key of the interface section of a client's config.
+set_interface() { # <peer> <key> [TOML value]
+    python3 -I - "$work/$1/conf/e2e.conf" "$2" "${3:-}" <<'EOF'
+import re, sys
+path, key, value = sys.argv[1:]
+# Only the [interface] table changes: [server] has keys of the same names.
+head, interface, rest = re.split(r'(?ms)^(\[interface\]\n.*?)(?=^\[|\Z)', open(path).read(), maxsplit=1)
+interface = re.sub(rf'(?m)^{re.escape(key)} = .*\n', '', interface)
+if value:
+    interface = interface.replace('[interface]\n', f'[interface]\n{key} = {value}\n', 1)
+open(path, "w").write(head + interface + rest)
+EOF
+}
+
+# Prints the allowed IPs that the interface of a namespace routes to a key.
+routed() { # <namespace> <key>
+    ns "$1" wg show e2e allowed-ips | awk -v key="$2" '$1 == key { $1 = ""; print substr($0, 2) }'
+}
+# Prints the endpoint that the interface of a namespace sends to a key.
+endpoint_of() { # <namespace> <key>
+    ns "$1" wg show e2e endpoints | awk -v key="$2" '$1 == key { print $2 }'
+}
+
+step "network"
+ip link set lo up
+ip link add br0 type bridge
+ip link set br0 up
+address=1
+for name in srv a b old; do
+    ip netns add "$name"
+    ns "$name" ip link set lo up
+    ip link add "v-$name" type veth peer name eth0 netns "$name"
+    ip link set "v-$name" master br0 up
+    ns "$name" ip addr add "198.18.0.$address/24" dev eth0
+    ns "$name" ip link set eth0 up
+    address=$((address + 1))
+done
+
+step "server"
+mkdir -p "$work/srv"
+server new --network-name e2e --network-cidr 10.66.0.0/16 \
+    --external-endpoint 198.18.0.1:51820 --listen-port 51820 >/dev/null
+# The admin commands of innernet-server go through the running server's coordinator.
+ip netns exec srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" \
+    serve e2e >>"$work/srv.log" 2>&1 &
+pids+=("$!")
+await_coordinator srv "$work/srv/conf/e2e.conf"
+server add-cidr e2e --name peers --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null
+for peer in a b old; do
+    admin=false
+    [ "$peer" = b ] && admin=true
+    server add-peer e2e --name "$peer" --auto-ip --cidr peers --admin "$admin" \
+        --invite-expires 1h --save-config "$work/$peer.toml" --yes >/dev/null
+done
+# old's invitation predates TLS: the operator cleared its latch, so that a client that predates
+# TLS can redeem it.
+db "UPDATE peers SET tls = 0 WHERE $(offered old)"
+server_key=$(field "$work/a.toml" server public-key)
+api=$(field "$work/a.toml" server internal-endpoint)
+
+step "current clients announce when they install"
+for peer in a b; do
+    mkdir -p "$work/$peer"
+    client "$peer" install "$work/$peer.toml" --default-name --listen-port 51820 \
+        --delete-invite || fail "install $peer"
+done
+a_key=$(field "$work/a/conf/e2e.conf" interface private-key | wg pubkey)
+a_ip=$(field "$work/a/conf/e2e.conf" interface address)
+a_ip=${a_ip%/*}
+for peer in a b; do
+    [ "$(db "SELECT count(*) FROM relayed_announcements WHERE $(offered "$peer")")" = 1 ] ||
+        fail "the server holds no announcement of $peer"
+done
+pass "the server holds the announcements of a and b"
+client b fetch e2e || fail "fetch as b"
+[ "$(store b "SELECT announces FROM peers WHERE $(by_key "$a_key")")" = 1 ] ||
+    fail "b didn't accept a's announcement"
+[ "$(store b "SELECT timestamp FROM announcements WHERE $(by_key "$a_key")")" = \
+    "$(db "SELECT timestamp FROM announcements WHERE $(offered a)")" ] ||
+    fail "b doesn't hold the announcement of a that the server holds"
+pass "b accepted the announcement of a that the server holds"
+[ "$(routed b "$a_key")" = "$a_ip/32" ] || fail "b doesn't route a's address to a"
+pass "b routes to a what a announces"
+[ "$(store b "SELECT name FROM peers WHERE $(by_key "$a_key")")" = a ] ||
+    fail "b didn't pin the name that a claims"
+[ "$(store b "SELECT count(*) FROM prefix_pins WHERE $(by_key "$a_key")")" = 1 ] ||
+    fail "b didn't pin the delegation that a claims"
+pass "b pins the name and the delegation that a claims"
+
+# The coordinator is a peer like any other: the server signs its own announcement, which states
+# its internal address as its primary IP, and b accepts it as it accepts every peer's.
+[ "$(db "SELECT signed FROM announcements WHERE $(by_key "$server_key")")" = 1 ] ||
+    fail "the server holds no signed announcement of its own"
+[ "$(store b "SELECT announces FROM peers WHERE $(by_key "$server_key")")" = 1 ] ||
+    fail "b didn't accept the coordinator's signed announcement"
+[ "$(store b "SELECT hex(primary_ip) FROM announcements WHERE $(by_key "$server_key")")" = \
+    "$(python3 -I -c 'import ipaddress, sys; print(ipaddress.ip_address(sys.argv[1]).packed.hex().upper())' "${api%:*}")" ] ||
+    fail "b doesn't reach the coordinator at the primary IP that it announces"
+pass "the coordinator signs its announcement, which b accepts as any peer's"
+
+step "a coordination server can't change the endpoint that a peer announces"
+# a announces an endpoint other than the one at which the server observes it, and doesn't announce
+# the observed one, so that the announced endpoint alone reaches b. Each check first removes a
+# from b's interface, so that the fetch configures a again, rather than leave the endpoint of a
+# recent handshake as it is, and skips NAT traversal, which would otherwise replace an endpoint
+# that doesn't answer with one of a's candidates that does.
+set_interface a announce-observed-endpoint false
+set_interface a external-endpoint '"198.18.0.2:51999"'
+client a fetch e2e || fail "fetch as a"
+refetch_b() {
+    ns b wg set e2e peer "$a_key" remove
+    client b fetch e2e --no-nat-traversal || fail "fetch as b"
+}
+refetch_b
+[ "$(endpoint_of b "$a_key")" = 198.18.0.2:51999 ] ||
+    fail "b doesn't send to a's announced endpoint: $(endpoint_of b "$a_key")"
+pass "b sends to the endpoint that a announces"
+
+# The server, compromised, sets an endpoint of its own for a, and alters the bytes of a's
+# announcement that it relays.
+db "INSERT INTO endpoints (public_key, kind, position, address, port)
+    SELECT public_key, 0, 0, x'C6120009', 51820 FROM peers WHERE $(by_key "$a_key")"
+db "UPDATE relayed_announcements SET payload = CAST(payload || x'00' AS BLOB)
+    WHERE $(by_key "$a_key")"
+refetch_b
+grep -qF "ignoring the announcement of peer $a_key" "$work/b.log" ||
+    fail "b didn't refuse the altered announcement"
+[ "$(endpoint_of b "$a_key")" = 198.18.0.2:51999 ] ||
+    fail "b sends to an endpoint that the server set: $(endpoint_of b "$a_key")"
+pass "b ignores the endpoint that the server sets, and refuses the altered announcement"
+# The server takes a from the announcement that it stored decoded, so the bytes that it relays
+# change nothing of how its own interface routes a.
+[ "$(routed srv "$a_key")" = "$a_ip/32" ] ||
+    fail "the server's interface no longer routes a's address to a: $(routed srv "$a_key")"
+pass "the bytes that the server relays don't change how it routes a"
+
+# The server leaves a's announcement out.
+db "DELETE FROM relayed_announcements WHERE $(by_key "$a_key")"
+refetch_b
+[ "$(store b "SELECT count(*) FROM announcements WHERE $(by_key "$a_key")")" = 1 ] ||
+    fail "b dropped a's announcement"
+[ "$(endpoint_of b "$a_key")" = 198.18.0.2:51999 ] ||
+    fail "b fell back to what the server alone assigns a: $(endpoint_of b "$a_key")"
+[ "$(routed b "$a_key")" = "$a_ip/32" ] || fail "b no longer routes a's address to a"
+pass "b keeps a's last announcement when the server leaves it out"
+
+db "DELETE FROM endpoints WHERE $(by_key "$a_key")"
+set_interface a announce-observed-endpoint
+set_interface a external-endpoint
+client a fetch e2e || fail "fetch as a"
+refetch_b
+[ "$(endpoint_of b "$a_key")" = 198.18.0.2:51820 ] ||
+    fail "b doesn't send to the endpoint at which the server observes a"
+pass "a announces again, with the endpoint at which the server observes it, which b sends to"
+
+step "a peer claims its ranges, and states what it accepts traffic for"
+client b add-delegation e2e --name a --prefix 10.66.1.64/28 --yes || fail "add-delegation as b"
+client a fetch e2e || fail "fetch as a"
+client b fetch e2e || fail "fetch as b"
+routed b "$a_key" | grep -qF 10.66.1.64/28 || fail "b doesn't route a's whole delegation to a"
+pass "a claims its new range whole by default, which b routes to it"
+
+# a accepts traffic for part of its delegation: a null route for the rest.
+set_interface a allowed-ips "[\"$a_ip/32\", \"10.66.1.64/29\"]"
+client a fetch e2e || fail "fetch as a"
+client b fetch e2e || fail "fetch as b"
+routes=$(routed b "$a_key")
+case $routes in *10.66.1.64/29*) ;; *) fail "b doesn't route the allowed part to a: $routes" ;; esac
+case $routes in *10.66.1.64/28*) fail "b routes the part that a doesn't allow: $routes" ;; esac
+pass "b routes only what a allows"
+srv_routes=$(routed srv "$a_key")
+case $srv_routes in
+    *10.66.1.64/29*) ;;
+    *) fail "the server doesn't route the allowed part to a: $srv_routes" ;;
+esac
+case $srv_routes in
+    *10.66.1.64/28*) fail "the server routes the part that a doesn't allow: $srv_routes" ;;
+esac
+pass "the server routes only what a allows"
+client b show e2e || fail "show as b"
+grep -q "10.66.1.64/28.*allowed in part" "$work/b.log" ||
+    fail "show doesn't list the prefix that a allows in part"
+pass "show lists the prefix that a allows in part, which stays pinned"
+
+# The server routes a its primary IP even when a allows none of its delegation.
+set_interface a allowed-ips "[\"10.66.1.64/29\"]"
+client a fetch e2e || fail "fetch as a"
+routed srv "$a_key" | grep -qF "$a_ip/32" || fail "the server doesn't route a's primary IP"
+pass "the server routes a its primary IP whatever a allows"
+set_interface a allowed-ips
+
+# A prefix beyond its ranges, which a selects, is never claimed.
+set_interface a delegation "[\"$a_ip/32\", \"10.66.1.128/28\"]"
+client a fetch e2e || fail "fetch as a"
+grep -q "not claiming 10.66.1.128/28" "$work/a.log" ||
+    fail "a didn't warn of a prefix beyond its ranges"
+client b fetch e2e || fail "fetch as b"
+if routed b "$a_key" | grep -qF 10.66.1.128/28; then
+    fail "b routes to a a prefix beyond its ranges"
+fi
+pass "a claims only within its ranges"
+set_interface a delegation
+client a fetch e2e || fail "fetch as a"
+
+step "the server never withdraws what a peer claims, but reclaims what it gives up"
+if client b withdraw-delegation e2e --name a --prefix 10.66.1.64/28 --yes; then
+    fail "the server withdrew a range that a claims"
+fi
+grep -q "claims .* in its announcement" "$work/b.log" ||
+    fail "the refusal doesn't explain that a claims the range"
+pass "the server refuses to withdraw a range that a claims"
+client b reclaim-delegation e2e --name a --prefix 10.66.1.64/28 --yes ||
+    fail "marking the range to be reclaimed as b"
+[ "$(db "SELECT reclaim FROM delegations WHERE prefix_len = 28")" = 1 ] ||
+    fail "the server didn't mark the range to be reclaimed"
+set_interface a delegation "[\"$a_ip/32\"]"
+client a fetch e2e || fail "fetch as a"
+[ "$(db "SELECT count(*) FROM delegations WHERE prefix_len = 28")" = 0 ] ||
+    fail "the server didn't reclaim the range that a gave up"
+pass "the server reclaims the marked range once a stops claiming it"
+client b fetch e2e || fail "fetch as b"
+[ "$(store b "SELECT count(*) FROM prefix_pins WHERE $(by_key "$a_key")")" = 1 ] ||
+    fail "b didn't release the prefix that a gave up"
+pass "b releases the prefix that a gave up"
+set_interface a delegation
+client a fetch e2e || fail "fetch as a"
+
+step "the server announces a peer that predates TLS unsigned, which pins but never releases"
+wg genkey >"$work/old.key"
+ns old ip link add wg0 type wireguard
+field "$work/old.toml" interface private-key |
+    ns old wg set wg0 private-key /dev/fd/0 listen-port 51820 \
+        peer "$server_key" endpoint 198.18.0.1:51820 allowed-ips "${api%:*}/32" \
+        persistent-keepalive 1
+old_delegation=$(field "$work/old.toml" interface delegations | tr -d "[]'")
+old_ip=${old_delegation%/*}
+ns old ip addr add "$old_ip/16" dev wg0
+ns old ip link set wg0 up
+old_key=$(wg pubkey <"$work/old.key")
+plain() { # <method> <path> <json body>
+    ns old curl -sS -o /dev/null -w '%{http_code}' -X "$1" \
+        -H "X-Innernet-Server-Key: $server_key" -H 'Content-Type: application/json' \
+        -d "$3" "http://$api$2"
+}
+[ "$(plain POST /v1/user/redeem "{\"public_key\": \"$old_key\"}")" = 204 ] ||
+    fail "old-style redemption failed"
+# wg reopens the path that it is given, which a redirected file refuses here, unlike a pipe.
+cat "$work/old.key" | ns old wg set wg0 private-key /dev/fd/0
+# The server switches to the new key 5 s after redeeming.
+sleep 6
+[ "$(plain PUT /v1/user/endpoint '{"option": "Set", "content": "198.18.0.4:51820"}')" = 204 ] ||
+    fail "old couldn't set its endpoint in plain HTTP"
+[ "$(plain PUT /v1/user/candidates '["198.18.0.4:51822", "198.18.0.4:51821"]')" = 204 ] ||
+    fail "old couldn't set its candidates in plain HTTP"
+pass "old redeems and sets its endpoint and candidates in plain HTTP"
+# NAT traversal would try the candidates, at which nothing answers, so it is skipped.
+client b fetch e2e --no-nat-traversal || fail "fetch as b"
+[ "$(store b "SELECT announces FROM peers WHERE $(by_key "$old_key")")" = 0 ] ||
+    fail "b latched old, which never signed an announcement"
+[ "$(store b "SELECT signed FROM announcements WHERE $(by_key "$old_key")")" = 0 ] ||
+    fail "b doesn't hold the unsigned announcement that the server makes of old"
+[ "$(routed b "$old_key")" = "$old_ip/32" ] || fail "b doesn't route old's delegation to old"
+[ "$(endpoint_of b "$old_key")" = 198.18.0.4:51820 ] ||
+    fail "b doesn't send to the endpoint that old set"
+# The unsigned announcement lists the endpoint first, then the candidates in the order that old
+# set them.
+[ "$(store b "SELECT group_concat(port, ' ') FROM (SELECT port FROM endpoints
+    WHERE kind = 2 AND $(by_key "$old_key") ORDER BY position LIMIT 3)")" = "51820 51822 51821" ] ||
+    fail "b doesn't hold old's endpoint and candidates in order as its announced endpoints"
+pass "b routes old as the server assigns it, at the endpoint that old set, then its candidates"
+# An unsigned announcement releases nothing: the server can't rename old for b.
+server rename-peer e2e --name old --new-name renamed --yes >/dev/null ||
+    fail "renaming old on the server"
+client b fetch e2e || fail "fetch as b"
+[ "$(store b "SELECT name FROM peers WHERE $(by_key "$old_key")")" = old ] ||
+    fail "b let the server rename old, which never signed an announcement"
+pass "b keeps the name pinned to old, which only old could release"
