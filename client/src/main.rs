@@ -798,7 +798,11 @@ fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> R
         });
 
         print_interface(&device_info, short || tree)?;
-        peer_states.sort_by_key(|peer| peer.peer.ip);
+        // Peers without an address come last.
+        peer_states.sort_by_key(|peer| {
+            let fallback = peer.peer.hosts_fallback();
+            (fallback.is_none(), fallback)
+        });
         let verbose = opts.verbose > 0;
 
         if tree {
@@ -903,7 +907,7 @@ fn print_peer(
             } else {
                 "◯".dimmed()
             },
-            peer.ip.to_string().yellow().bold(),
+            peer.display_address().yellow().bold(),
             peer.display_name().yellow(),
             if is_you { "you, " } else { "" },
             public_key.dimmed(),
@@ -916,7 +920,7 @@ fn print_peer(
             peer.display_name().yellow(),
             public_key.yellow(),
         );
-        println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);
+        println_pad!(pad, "  {}: {}", "ip".bold(), peer.display_address());
         if let Some(info) = info {
             if let Some(endpoint) = info.config.endpoint {
                 println_pad!(

@@ -364,7 +364,7 @@ impl Link for RemoteLink<'_> {
                 "{}: dropping peer {} at {} from the update: {}",
                 self.interface.as_str_lossy().yellow(),
                 peer.public_key,
-                peer.ip,
+                peer.display_address(),
                 e
             );
         }

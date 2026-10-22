@@ -1,4 +1,4 @@
-use crate::wg::PeerInfoExt;
+use crate::{wg::PeerInfoExt, Prefix};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
@@ -654,6 +654,30 @@ impl PeerContents {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("[unnamed]")
     }
+
+    /// The address at which the name of the peer resolves, or `None` if the peer has none.
+    pub fn hosts_fallback(&self) -> Option<IpAddr> {
+        Some(self.ip)
+    }
+
+    /// The address of the peer for display: its hosts fallback address, or "[no delegation]" if
+    /// it has none.
+    pub fn display_address(&self) -> String {
+        match self.hosts_fallback() {
+            Some(ip) => ip.to_string(),
+            None => "[no delegation]".to_string(),
+        }
+    }
+
+    /// The prefixes that WireGuard routes to the peer.
+    pub fn allowed_ips(&self) -> Vec<AllowedIp> {
+        vec![Prefix::host(self.ip).allowed_ip()]
+    }
+
+    /// Whether the address `ip` is the peer's.
+    pub fn holds(&self, ip: IpAddr) -> bool {
+        self.ip == ip
+    }
 }
 
 impl AsRef<PeerContents> for PeerContents {
@@ -983,17 +1007,22 @@ impl<'a> PeerDiff<'a> {
         // diff.new is now guaranteed to be a Some(_) variant.
         let new = new.unwrap();
 
-        let new_allowed_ips = &[AllowedIp {
-            address: new.ip,
-            cidr: if new.ip.is_ipv4() { 32 } else { 128 },
-        }];
-        if old.is_none() || matches!(old, Some(old) if old.allowed_ips != new_allowed_ips) {
+        let new_allowed_ips = new.allowed_ips();
+        // The interface doesn't necessarily list allowed IPs in the order they were added.
+        let sorted = |ips: &[AllowedIp]| {
+            let mut ips = ips.to_vec();
+            ips.sort_by_key(|ip| (ip.address, ip.cidr));
+            ips
+        };
+        if old.is_none()
+            || matches!(old, Some(old) if sorted(&old.allowed_ips) != sorted(&new_allowed_ips))
+        {
             builder = builder
                 .replace_allowed_ips()
-                .add_allowed_ips(new_allowed_ips);
+                .add_allowed_ips(&new_allowed_ips);
             changes.push(PeerChange::AllowedIPs {
                 old: old.map(|o| o.allowed_ips.clone()).unwrap_or_default(),
-                new: new_allowed_ips.to_vec(),
+                new: new_allowed_ips,
             });
         }
 

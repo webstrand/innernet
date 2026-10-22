@@ -294,7 +294,7 @@ fn get_session(
 
         // WireGuard only delivers the peer's traffic from its own IP, so anything else means the
         // connection didn't come through the tunnel.
-        if peer.ip != addr {
+        if !peer.holds(addr) {
             log::warn!("refusing {} connecting from {addr}.", *peer);
             return Err(ServerError::Unauthorized);
         }

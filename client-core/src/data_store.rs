@@ -332,7 +332,7 @@ fn import_legacy(scope: &innernet_node::db::Scope, path: &Path) -> Result<(), Er
                 "{}: failed to import peer {} at {}: {refusal}",
                 path.display(),
                 peer.public_key,
-                peer.ip
+                peer.display_address()
             );
         }
     }

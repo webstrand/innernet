@@ -323,7 +323,7 @@ pub fn gather_new_peer_info(
     let mut available_ip = None;
     let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
     for ip in candidate_ips {
-        if !peers.iter().any(|peer| peer.ip == ip) {
+        if !peers.iter().any(|peer| peer.holds(ip)) {
             available_ip = Some(ip);
             break;
         }
@@ -404,7 +404,7 @@ pub fn rename_peer<'a>(
             "Peer to rename",
             &eligible_peers
                 .iter()
-                .map(|ep| format!("{} ({})", ep.display_name(), ep.ip))
+                .map(|ep| format!("{} ({})", ep.display_name(), ep.display_address()))
                 .collect::<Vec<_>>(),
         )?;
         eligible_peers[peer_index]
@@ -455,7 +455,7 @@ pub fn enable_or_disable_peer(
     } else {
         let peer_selection: Vec<_> = enabled_peers
             .iter()
-            .map(|peer| format!("{} ({})", peer.display_name(), peer.ip))
+            .map(|peer| format!("{} ({})", peer.display_name(), peer.display_address()))
             .collect();
         let (index, _) = select(
             &format!("Peer to {}able", if enable { "en" } else { "dis" }),
@@ -613,7 +613,7 @@ pub fn override_peer_endpoint_prompt(
             message,
             &eligible_peers
                 .iter()
-                .map(|ep| format!("{} ({})", ep.display_name(), ep.ip))
+                .map(|ep| format!("{} ({})", ep.display_name(), ep.display_address()))
                 .collect::<Vec<_>>(),
         )?;
         eligible_peers[peer_index].clone()
@@ -631,14 +631,14 @@ pub fn override_peer_endpoint_prompt(
         &format!(
             "Override endpoint for peer {} ({}) to {}?",
             peer.display_name().yellow(),
-            peer.ip,
+            peer.display_address(),
             endpoint,
         )
     } else {
         &format!(
             "Unset endpoint override for peer {} ({})?",
             peer.display_name().yellow(),
-            peer.ip,
+            peer.display_address(),
         )
     };
 

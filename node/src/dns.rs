@@ -63,13 +63,14 @@ pub struct Names {
 
 impl Names {
     /// The names that `snapshot` publishes for `interface`, in the zone of `host_suffix`, as
-    /// [`host_zone`] makes it: the hostnames of the enabled peers that have a name.
+    /// [`host_zone`] makes it: the hostnames of the enabled peers that have a name and an address
+    /// to name, at their hosts fallback addresses.
     pub fn of(interface: &InterfaceName, host_suffix: Option<&str>, snapshot: &Snapshot) -> Self {
         let peers = snapshot
             .peers
             .iter()
             .filter(|peer| !peer.is_disabled)
-            .filter_map(|peer| Some((peer.name.as_ref()?.to_string(), peer.ip)));
+            .filter_map(|peer| Some((peer.name.as_ref()?.to_string(), peer.hosts_fallback()?)));
         Self {
             zone: fqdn(&host_zone(interface, host_suffix)),
             hosts: hosts(interface, host_suffix, peers),
