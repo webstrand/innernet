@@ -323,6 +323,9 @@ pub fn gather_new_peer_info(
     let delegation = if let Some(delegation) = args.delegation {
         // A wider delegation is checked as the server checks it, so that a refusal is explained
         // before the server is asked.
+        if !cidr.prefix().contains(&delegation) {
+            bail!("{delegation} is outside the CIDR {}", cidr.cidr);
+        }
         let others: Vec<(Prefix, String)> = peers
             .iter()
             .flat_map(|peer| {
@@ -333,7 +336,7 @@ pub fn gather_new_peer_info(
             .collect();
         check_delegations(
             &[delegation],
-            &cidr.cidr,
+            &cidr_tree.prefixes(),
             others
                 .iter()
                 .map(|(prefix, holder)| (prefix, holder.as_str())),
@@ -573,10 +576,7 @@ pub fn add_delegation<'a>(
             peer.display_name()
         );
     }
-    let cidr = cidrs
-        .iter()
-        .find(|cidr| cidr.id == peer.cidr_id)
-        .ok_or_else(|| anyhow!("The CIDR of peer {} is unknown", peer.display_name()))?;
+    let cidrs: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
     let others: Vec<(Prefix, String)> = peers
         .iter()
         .filter(|other| other.public_key != peer.public_key)
@@ -592,7 +592,7 @@ pub fn add_delegation<'a>(
     delegations.sort();
     check_delegations(
         &delegations,
-        &cidr.cidr,
+        &cidrs,
         others
             .iter()
             .map(|(prefix, holder)| (prefix, holder.as_str())),

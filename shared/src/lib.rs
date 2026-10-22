@@ -24,7 +24,10 @@ pub mod wg;
 pub mod xeddsa;
 
 pub use anyhow::Error;
-pub use prefix::{check_delegations, hosts_fallback, Prefix};
+pub use prefix::{
+    check_delegations, cidr_of_delegations, hosts_fallback, parent_cidr, smallest_cidr_holding,
+    Prefix,
+};
 pub use types::*;
 
 pub const REDEEM_TRANSITION_WAIT: Duration = Duration::from_secs(5);

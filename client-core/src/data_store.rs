@@ -5,8 +5,8 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents, IoErrorContext,
-    LegacyPeer, PeerContents, Prefix, State,
+    cidr_of_delegations, ensure_dirs_exist, interface_config::InterfaceConfig, Cidr, CidrContents,
+    IoErrorContext, LegacyPeer, PeerContents, Prefix, State,
 };
 use ipnet::IpNet;
 use rusqlite::OptionalExtension as _;
@@ -293,17 +293,14 @@ impl DataStore {
     /// smallest CIDR that holds all its delegations as its CIDR.
     pub fn peers(&self) -> Result<Vec<PeerContents>, Error> {
         let cidrs = self.cidrs()?;
+        let prefixes: Vec<Prefix> = cidrs.iter().map(|cidr| cidr.prefix()).collect();
         Ok(store::load_peers(&self.store)?
             .into_iter()
             .map(|mut peer| {
-                peer.cidr_id = smallest_containing(&cidrs, |cidr| {
-                    !peer.delegations.is_empty()
-                        && peer
-                            .delegations
-                            .iter()
-                            .all(|delegation| cidr.contains(&delegation.net()))
-                })
-                .unwrap_or(UNKNOWN_ID);
+                peer.cidr_id = cidr_of_delegations(&peer.delegations, &prefixes)
+                    .and_then(|prefix| cidrs.iter().find(|cidr| cidr.prefix() == prefix))
+                    .map(|cidr| cidr.id)
+                    .unwrap_or(UNKNOWN_ID);
                 peer
             })
             .collect())

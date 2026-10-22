@@ -151,7 +151,7 @@ impl From<Prefix> for IpNet {
 }
 
 /// The hosts fallback address of a peer whose delegations are `delegations`: the lowest address
-/// of all of them, or `None` for a peer without a delegation. The hosts file names the peer at
+/// of all of them, or `None` for a peer without a delegation. The name of the peer resolves to
 /// this address, and the view of plain-HTTP sessions gives it as the peer's IP.
 ///
 /// Delegations hold neither network nor broadcast addresses, so the lowest address of a
@@ -160,22 +160,93 @@ pub fn hosts_fallback(delegations: &[Prefix]) -> Option<IpAddr> {
     delegations.iter().map(Prefix::first).min()
 }
 
-/// Checks that a peer of the CIDR `cidr` may hold `delegations` together, while `others`, each
-/// with the name by which an error names its holder, are delegated to other peers.
+/// The smallest of `cidrs` that holds `prefix`, which may be `prefix` itself. Aligned prefixes
+/// either nest or share no address, so the CIDRs that hold a prefix form a chain, and the smallest
+/// of them is the one with the longest prefix.
+pub fn smallest_cidr_holding(prefix: &Prefix, cidrs: &[Prefix]) -> Option<Prefix> {
+    cidrs
+        .iter()
+        .filter(|cidr| cidr.contains(prefix))
+        .max_by_key(|cidr| cidr.prefix_len())
+        .copied()
+}
+
+/// The parent of the CIDR `cidr` among `cidrs`: the smallest of them that holds it, other than
+/// itself, or `None` for a CIDR that no other holds, such as the root of the network.
+pub fn parent_cidr(cidr: &Prefix, cidrs: &[Prefix]) -> Option<Prefix> {
+    cidrs
+        .iter()
+        .filter(|other| *other != cidr && other.contains(cidr))
+        .max_by_key(|other| other.prefix_len())
+        .copied()
+}
+
+/// The CIDR of a peer whose delegations are `delegations`, among `cidrs`: the smallest CIDR that
+/// holds them all, or `None` for a peer without a delegation, or one whose delegations no CIDR
+/// holds. A peer whose delegations follow the rules of [`check_delegations`] has its delegations
+/// all in this CIDR, which has no child CIDR.
+pub fn cidr_of_delegations(delegations: &[Prefix], cidrs: &[Prefix]) -> Option<Prefix> {
+    if delegations.is_empty() {
+        return None;
+    }
+    cidrs
+        .iter()
+        .filter(|cidr| {
+            delegations
+                .iter()
+                .all(|delegation| cidr.contains(delegation))
+        })
+        .max_by_key(|cidr| cidr.prefix_len())
+        .copied()
+}
+
+/// Checks that a peer may hold `delegations` together, in the network whose CIDRs are `cidrs`,
+/// while `others`, each with the name by which an error names its holder, are delegated to other
+/// peers. Returns the CIDR of the peer, which its delegations determine, or `None` for a peer
+/// without a delegation.
 ///
-/// Each delegation must lie within `cidr`, and its first and last addresses must be assignable
-/// there, so that a delegation never holds the network or broadcast address of the CIDR. No two
-/// delegations may share an address, whether they are delegated to the same peer or not.
+/// The delegations of a peer all lie within one CIDR, the smallest CIDR that holds each of them,
+/// and that CIDR must have no child CIDR, since peers belong only to CIDRs without children. The
+/// first and last addresses of each delegation must be assignable in the CIDR, so that a
+/// delegation never holds the network or broadcast address of the CIDR. No two delegations may
+/// share an address, whether they are delegated to the same peer or not.
+///
+/// That a peer's delegations lie in one CIDR is a rule of this check, rather than a property of
+/// the server's schema, so that it can be lifted for peers that span CIDRs.
 pub fn check_delegations<'a>(
     delegations: &[Prefix],
-    cidr: &IpNet,
+    cidrs: &[Prefix],
     others: impl IntoIterator<Item = (&'a Prefix, &'a str)>,
-) -> Result<(), Error> {
-    for (i, prefix) in delegations.iter().enumerate() {
-        if !cidr.contains(&prefix.net()) {
-            bail!("{prefix} is outside the CIDR {cidr}");
+) -> Result<Option<Prefix>, Error> {
+    let mut peer_cidr: Option<(Prefix, Prefix)> = None;
+    for prefix in delegations {
+        let Some(cidr) = smallest_cidr_holding(prefix, cidrs) else {
+            bail!("{prefix} is outside every CIDR");
+        };
+        match peer_cidr {
+            Some((first, first_cidr)) if first_cidr != cidr => bail!(
+                "{first} lies in the CIDR {first_cidr} and {prefix} in the CIDR {cidr}, but the \
+                 delegations of a peer all lie in one CIDR"
+            ),
+            Some(_) => {},
+            None => peer_cidr = Some((*prefix, cidr)),
         }
-        if !cidr.is_assignable(&prefix.first()) || !cidr.is_assignable(&prefix.last()) {
+    }
+    let Some((_, cidr)) = peer_cidr else {
+        return Ok(None);
+    };
+    if let Some(child) = cidrs
+        .iter()
+        .find(|other| parent_cidr(other, cidrs) == Some(cidr))
+    {
+        bail!(
+            "the CIDR {cidr} has a child CIDR, {child}, and peers belong only to CIDRs without \
+             children"
+        );
+    }
+    let net = cidr.net();
+    for (i, prefix) in delegations.iter().enumerate() {
+        if !net.is_assignable(&prefix.first()) || !net.is_assignable(&prefix.last()) {
             bail!("{prefix} includes the network or broadcast address of the CIDR {cidr}");
         }
         if let Some(other) = delegations[..i].iter().find(|other| other.overlaps(prefix)) {
@@ -187,7 +258,7 @@ pub fn check_delegations<'a>(
             bail!("{prefix} overlaps {other}, which is delegated to {holder}");
         }
     }
-    Ok(())
+    Ok(Some(cidr))
 }
 
 #[cfg(test)]
@@ -285,8 +356,37 @@ mod tests {
     }
 
     #[test]
+    fn test_cidr_tree() {
+        let cidrs = [
+            prefix("10.0.0.0/16"),
+            prefix("10.0.1.0/24"),
+            prefix("10.0.1.0/26"),
+            prefix("fd00::/64"),
+        ];
+        assert_eq!(parent_cidr(&cidrs[0], &cidrs), None);
+        assert_eq!(parent_cidr(&cidrs[1], &cidrs), Some(cidrs[0]));
+        assert_eq!(parent_cidr(&cidrs[2], &cidrs), Some(cidrs[1]));
+        assert_eq!(parent_cidr(&cidrs[3], &cidrs), None);
+        assert_eq!(
+            smallest_cidr_holding(&prefix("10.0.1.7/32"), &cidrs),
+            Some(cidrs[2])
+        );
+        assert_eq!(
+            smallest_cidr_holding(&prefix("10.0.1.0/24"), &cidrs),
+            Some(cidrs[1])
+        );
+        assert_eq!(smallest_cidr_holding(&prefix("10.1.0.0/32"), &cidrs), None);
+        assert_eq!(
+            cidr_of_delegations(&[prefix("10.0.1.7/32"), prefix("10.0.1.64/26")], &cidrs),
+            Some(cidrs[1])
+        );
+        assert_eq!(cidr_of_delegations(&[], &cidrs), None);
+    }
+
+    #[test]
     fn test_check_delegation() {
-        let cidr: IpNet = "10.0.0.0/24".parse().unwrap();
+        let cidr = prefix("10.0.0.0/24");
+        let cidrs = [prefix("10.0.0.0/8"), cidr];
         let others = [
             (prefix("10.0.0.1/32"), "peer1"),
             (prefix("10.0.0.32/28"), "peer1"),
@@ -295,17 +395,20 @@ mod tests {
         let others = || others.iter().map(|(prefix, holder)| (prefix, *holder));
         let check = |delegations: &[&str]| {
             let delegations: Vec<Prefix> = delegations.iter().map(|d| prefix(d)).collect();
-            check_delegations(&delegations, &cidr, others())
+            check_delegations(&delegations, &cidrs, others())
         };
 
-        assert!(check(&[]).is_ok());
-        assert!(check(&["10.0.0.64/28"]).is_ok());
+        // The CIDR of the delegations is returned.
+        assert_eq!(check(&[]).unwrap(), None);
+        assert_eq!(check(&["10.0.0.64/28"]).unwrap(), Some(cidr));
         assert!(check(&["10.0.0.3/32", "10.0.0.64/28"]).is_ok());
         assert!(check(&["10.0.0.254/32"]).is_ok());
         for (delegations, reason) in [
-            (&["10.0.1.0/28"][..], "outside"),
-            (&["fd00::/120"], "outside"),
-            (&["10.0.0.0/23"], "outside"),
+            (&["10.0.1.0/28"][..], "has a child CIDR"),
+            (&["fd00::/120"], "outside every CIDR"),
+            (&["10.0.0.0/23"], "has a child CIDR"),
+            (&["10.0.0.3/32", "10.0.1.0/28"], "lie in one CIDR"),
+            (&["11.0.0.0/24"], "outside every CIDR"),
             (&["10.0.0.0/32"], "network or broadcast"),
             (&["10.0.0.240/28"], "network or broadcast"),
             (&["10.0.0.0/24"], "network or broadcast"),
@@ -329,14 +432,14 @@ mod tests {
         }
 
         // A CIDR of one or two addresses has neither a network nor a broadcast address.
-        let cidr: IpNet = "10.0.0.1/32".parse().unwrap();
-        assert!(check_delegations(&[prefix("10.0.0.1/32")], &cidr, []).is_ok());
-        let cidr: IpNet = "10.0.0.2/31".parse().unwrap();
-        assert!(check_delegations(&[prefix("10.0.0.2/31")], &cidr, []).is_ok());
+        let cidrs = [prefix("10.0.0.1/32")];
+        assert!(check_delegations(&[prefix("10.0.0.1/32")], &cidrs, []).is_ok());
+        let cidrs = [prefix("10.0.0.2/31")];
+        assert!(check_delegations(&[prefix("10.0.0.2/31")], &cidrs, []).is_ok());
 
         // In IPv6, only the network address is unassignable.
-        let cidr: IpNet = "fd00::/112".parse().unwrap();
-        let check = |delegation: &str| check_delegations(&[prefix(delegation)], &cidr, []);
+        let cidrs = [prefix("fd00::/112")];
+        let check = |delegation: &str| check_delegations(&[prefix(delegation)], &cidrs, []);
         assert!(check("fd00::ffff/128").is_ok());
         assert!(check("fd00::ff00/120").is_ok());
         assert!(check("fd00::/128").is_err());

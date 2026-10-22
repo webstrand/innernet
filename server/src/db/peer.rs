@@ -6,10 +6,9 @@ use innernet_node::{
     Store,
 };
 use innernet_shared::{
-    check_delegations, xeddsa, Cidr, Endpoint, LegacyPeer, LegacyPeerContents, PeerContents,
-    Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+    check_delegations, cidr_of_delegations, xeddsa, Cidr, Endpoint, LegacyPeer, LegacyPeerContents,
+    PeerContents, Prefix, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
-use ipnet::IpNet;
 use rusqlite::{params, Connection};
 use std::{
     collections::{HashMap, HashSet},
@@ -70,10 +69,10 @@ impl DatabasePeer {
     }
 
     /// Creates the peer `contents`, offering it its delegations, of which it must have at least
-    /// one. The delegations must follow the rules of [`check_delegations`] within the CIDR that
-    /// the peer names, a CIDR without child CIDRs, and the server's node must accept the peer: a
-    /// name, if it has one, that no other peer has, and delegations that overlap no prefix pinned
-    /// to another key.
+    /// one. The delegations must follow the rules of [`check_delegations`], which give the peer
+    /// its CIDR, the CIDR that the peer names, and the server's node must accept the peer: a name,
+    /// if it has one, that no other peer has, and delegations that overlap no prefix pinned to
+    /// another key.
     pub fn create(store: &Store, mut contents: PeerContents) -> Result<Self, ServerError> {
         contents.delegations.sort();
         log::info!("creating peer {:?}", contents);
@@ -84,19 +83,17 @@ impl DatabasePeer {
         }
 
         let cidr = DatabaseCidr::get(store, contents.cidr_id)?;
-        if DatabaseCidr::list(store)?
-            .iter()
-            .any(|other| other.parent == Some(cidr.id))
-        {
-            log::warn!("tried to add peer to a CIDR that has child CIDRs.");
-            return Err(ServerError::InvalidQuery);
-        }
         if contents.delegations.is_empty() {
             return Err(ServerError::Delegation(
                 "a new peer must be offered at least one delegation".into(),
             ));
         }
-        check_new_delegations(store, &contents.delegations, &cidr.cidr, None)?;
+        if check_new_delegations(store, &contents.delegations, None)? != Some(cidr.prefix()) {
+            return Err(ServerError::Delegation(format!(
+                "the delegations of a new peer must lie in its CIDR {}",
+                cidr.cidr
+            )));
+        }
 
         let key = key_to_bytes(&contents.public_key).map_err(|_| ServerError::InvalidQuery)?;
         let tx = store.unchecked_transaction()?;
@@ -153,9 +150,10 @@ impl DatabasePeer {
     }
 
     /// Replaces the delegations of the peer with `delegations` as a whole, together or not at
-    /// all. The delegations must follow the rules of [`check_delegations`] within the peer's CIDR,
-    /// that of its current delegations, or for a peer without one, that of the new ones, with the
-    /// delegations of the other peers. The server's node must accept them: no delegation may
+    /// all. The delegations must follow the rules of [`check_delegations`], with the delegations
+    /// of the other peers. A peer with delegations keeps its CIDR: the new delegations, if any,
+    /// must lie in the CIDR of the current ones, so that a change never moves the peer to another
+    /// CIDR, and so changes what it sees. The server's node must accept them: no delegation may
     /// overlap a prefix pinned to another key, as one that was delegated to another peer stays.
     /// The peer may be left without a delegation, which leaves it in effect disabled, except the
     /// server's own peer, the one with the public key `server_key`, which must keep the delegation
@@ -179,15 +177,16 @@ impl DatabasePeer {
                  internal address of the server"
             )));
         }
-        let cidrs = DatabaseCidr::list(store)?;
-        if let Some(cidr) =
-            cidr_of(&self.delegations, &cidrs).or_else(|| cidr_of(&delegations, &cidrs))
-        {
-            check_new_delegations(store, &delegations, &cidr.cidr, Some(&key))?;
-        } else if let Some(delegation) = delegations.first() {
-            return Err(ServerError::Delegation(format!(
-                "{delegation} is outside every CIDR"
-            )));
+        let new_cidr = check_new_delegations(store, &delegations, Some(&key))?;
+        let cidrs = prefixes(&DatabaseCidr::list(store)?);
+        match (cidr_of_delegations(&self.delegations, &cidrs), new_cidr) {
+            (Some(old), Some(new)) if old != new => {
+                return Err(ServerError::Delegation(format!(
+                    "the delegations of the peer lie in its CIDR {old}, and a change of them \
+                     can't move it to the CIDR {new}"
+                )))
+            },
+            _ => {},
         }
 
         let updated = PeerContents {
@@ -384,8 +383,8 @@ impl DatabasePeer {
         Ok(Self::list_enabled(conn)?
             .into_iter()
             .filter(|peer| {
-                cidr_of(&peer.delegations, &cidrs)
-                    .is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr.cidr)))
+                cidr_of_delegations(&peer.delegations, &prefixes(&cidrs))
+                    .is_some_and(|cidr| visible.iter().any(|seen| seen.contains(&cidr.net())))
             })
             .collect())
     }
@@ -397,7 +396,8 @@ impl DatabasePeer {
         Ok(store::load_peers(conn)?
             .into_iter()
             .map(|mut contents| {
-                contents.cidr_id = cidr_of(&contents.delegations, &cidrs)
+                contents.cidr_id = cidr_of_delegations(&contents.delegations, &prefixes(&cidrs))
+                    .and_then(|prefix| cidrs.iter().find(|cidr| cidr.prefix() == prefix))
                     .map(|cidr| cidr.id)
                     .unwrap_or(0);
                 contents.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
@@ -458,32 +458,22 @@ fn refused(refusal: Refusal) -> ServerError {
     }
 }
 
-/// The CIDR of a peer whose delegations are `delegations`, among `cidrs`: the smallest that holds
-/// them all, or `None` for a peer without a delegation.
-fn cidr_of<'a>(delegations: &[Prefix], cidrs: &'a [Cidr]) -> Option<&'a Cidr> {
-    if delegations.is_empty() {
-        return None;
-    }
-    cidrs
-        .iter()
-        .filter(|cidr| {
-            delegations
-                .iter()
-                .all(|delegation| cidr.cidr.contains(&delegation.net()))
-        })
-        .max_by_key(|cidr| cidr.cidr.prefix_len())
+/// The prefixes of `cidrs`.
+fn prefixes(cidrs: &[Cidr]) -> Vec<Prefix> {
+    cidrs.iter().map(|cidr| cidr.prefix()).collect()
 }
 
-/// Checks that `delegations` may be delegated together to a peer of the CIDR `cidr`, as
-/// [`check_delegations`] does, given the delegations that the database holds for other peers than
-/// the one with the public key `holder`, if any. A delegation that breaks the rules is refused as
-/// [`ServerError::Delegation`], which explains why.
+/// Checks that `delegations` may be delegated together to a peer, as [`check_delegations`] does,
+/// given the CIDRs of the database and the delegations that it holds for other peers than the one
+/// with the public key `holder`, if any. Returns the CIDR of the peer, which its delegations
+/// determine, or `None` for a peer without a delegation. A delegation that breaks the rules is
+/// refused as [`ServerError::Delegation`], which explains why.
 pub(crate) fn check_new_delegations(
     conn: &Connection,
     delegations: &[Prefix],
-    cidr: &IpNet,
     holder: Option<&[u8; 32]>,
-) -> Result<(), ServerError> {
+) -> Result<Option<Prefix>, ServerError> {
+    let cidrs = prefixes(&DatabaseCidr::list(conn)?);
     let mut stmt = conn.prepare_cached(
         "SELECT d.address, d.prefix_len, p.public_key, p.name
          FROM delegations d JOIN peers p ON p.public_key = d.public_key
@@ -509,7 +499,7 @@ pub(crate) fn check_new_delegations(
     let others = others
         .iter()
         .map(|(prefix, holder)| (prefix, holder.as_str()));
-    check_delegations(delegations, cidr, others).map_err(|e| {
+    check_delegations(delegations, &cidrs, others).map_err(|e| {
         log::warn!("refusing delegations {delegations:?}: {e}");
         ServerError::Delegation(e.to_string())
     })

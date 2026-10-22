@@ -245,6 +245,12 @@ impl CidrContents {
             parent: Some(parent.id),
         }
     }
+
+    /// The CIDR as an aligned prefix. A CIDR whose address has host bits set, as a server that
+    /// predates TLS may hold, is the prefix of its network.
+    pub fn prefix(&self) -> Prefix {
+        Prefix::new(self.cidr.trunc()).expect("a truncated prefix is aligned")
+    }
 }
 
 impl Deref for CidrContents {
@@ -323,6 +329,11 @@ impl<'a> CidrTree<'a> {
         } else {
             self.children().flat_map(|child| child.leaves()).collect()
         }
+    }
+
+    /// The prefixes of every CIDR of the tree, not only of this subtree.
+    pub fn prefixes(&self) -> Vec<Prefix> {
+        self.cidrs.iter().map(|cidr| cidr.prefix()).collect()
     }
 
     pub fn ip_net_for(&self, ip: IpAddr) -> Result<IpNet, PrefixLenError> {
