@@ -1373,6 +1373,15 @@ mod tests {
         responses: Vec<Vec<u8>>,
     ) -> (SocketAddr, mpsc::Receiver<Recorded>) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tls_server_recording_at(socket, server, responses)
+    }
+
+    /// Answers each connection to `socket` as [`tls_server_recording`] does.
+    fn tls_server_recording_at(
+        socket: std::net::UdpSocket,
+        server: &KeyPair,
+        responses: Vec<Vec<u8>>,
+    ) -> (SocketAddr, mpsc::Receiver<Recorded>) {
         let addr = socket.local_addr().unwrap();
         let config = tls::server_config(&server.private.to_base64()).unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -2338,6 +2347,32 @@ mod tests {
         for request in requests.iter() {
             assert!(request.starts_with("GET /user/state "), "{request}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_reaches_a_server_at_an_ipv6_address() -> Result<(), anyhow::Error> {
+        // A server whose internal address is IPv6 is reached in plain HTTP and over QUIC at that
+        // address, which URLs hold in brackets, from a socket of the same family.
+        let server_key = KeyPair::generate();
+        let socket = std::net::UdpSocket::bind("[::1]:0")?;
+        let (quic, requests) =
+            tls_server_recording_at(socket, &server_key, vec![NO_CONTENT.into()]);
+        let listener = TcpListener::bind("[::1]:0")?;
+        let (addr, server) =
+            plain_http_server_at(listener, vec![capabilities_response(quic.port())]);
+        let config = config(addr, &server_key);
+        let ports = Arc::new(Mutex::new(vec![]));
+        let client = recording_client(&config, true, &ports);
+        assert_eq!(client.address(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        client.http::<()>("GET", "/user/state").await?;
+        assert_eq!(client.quic_port(), Some(quic.port()));
+        let server = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("the plain-HTTP server panicked"))?;
+        assert_eq!(server, ["GET /v1/user/capabilities HTTP/1.1"]);
+        let request = requests.recv()?;
+        assert!(request.starts_with("GET /user/state "), "{request}");
+        Ok(())
     }
 
     #[tokio::test]
