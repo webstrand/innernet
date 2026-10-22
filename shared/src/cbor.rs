@@ -13,9 +13,6 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-/// The media type of CBOR, which the bodies of TLS sessions carry in `Content-Type`.
-pub const CONTENT_TYPE: &str = "application/cbor";
-
 /// The error of a value that fails to encode, or of bytes that fail to decode: bytes that are not
 /// a single data item in the deterministic encoding, or one that doesn't deserialize as the type
 /// that is read.
@@ -42,13 +39,6 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
 pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
     let value = cbor_core::Value::decode(bytes).map_err(|e| Error(e.to_string()))?;
     value.deserialized().map_err(|e| Error(e.to_string()))
-}
-
-/// Whether the value of a `Content-Type` header names CBOR, whatever the case of the media type
-/// and whatever its parameters.
-pub fn is_content_type(header: &str) -> bool {
-    let essence = header.split(';').next().unwrap_or_default().trim();
-    essence.eq_ignore_ascii_case(CONTENT_TYPE)
 }
 
 /// Bytes that deserialize from a byte string only.
@@ -205,13 +195,5 @@ mod tests {
             );
         }
         assert!(from_slice::<u8>(&unhex("05")).is_ok());
-    }
-
-    #[test]
-    fn test_content_type() {
-        assert!(is_content_type("application/cbor"));
-        assert!(is_content_type("Application/CBOR; charset=binary"));
-        assert!(!is_content_type("application/json"));
-        assert!(!is_content_type("application/cbor-seq"));
     }
 }

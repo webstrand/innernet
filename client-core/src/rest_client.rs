@@ -1,11 +1,12 @@
 use crate::data_store::DataStore;
 use hyper::{client::HttpConnector, header, Body, Client, Method, Request, Response, StatusCode};
 use innernet_shared::{
+    cbor,
     interface_config::{InterfaceConfig, ServerInfo},
-    parent_cidr, smallest_cidr_holding, tls, Association, Cidr, CidrDeletion, LegacyAssociation,
-    LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer, LegacyPeerContents,
-    LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr, TaggedPeer,
-    TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
+    media_type, parent_cidr, smallest_cidr_holding, tls, Association, Cidr, CidrDeletion,
+    LegacyAssociation, LegacyAssociationContents, LegacyCidr, LegacyCidrContents, LegacyPeer,
+    LegacyPeerContents, LegacyState, PeerContents, PeerUpdate, Prefix, State, TaggedCidr,
+    TaggedPeer, TaggedPeerDelegations, INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{cell::Cell, io, path::Path, time::Duration};
@@ -116,8 +117,8 @@ impl<'a> RestClient<'a> {
     pub async fn get_cidrs(&self) -> Result<Vec<Cidr>, RestError> {
         let (transport, body) = self.request_raw::<()>("GET", "/admin/cidrs", None).await?;
         match transport {
-            Transport::Tls => decode(&body),
-            Transport::Plain => decode::<Vec<LegacyCidr>>(&body)
+            Transport::Tls => decode(transport, &body),
+            Transport::Plain => decode::<Vec<LegacyCidr>>(transport, &body)
                 .map(|cidrs| cidrs.into_iter().map(Cidr::from).collect()),
         }
     }
@@ -213,9 +214,9 @@ impl<'a> RestClient<'a> {
             .request_raw::<()>("GET", "/admin/associations", None)
             .await?;
         match transport {
-            Transport::Tls => decode(&body),
+            Transport::Tls => decode(transport, &body),
             Transport::Plain => {
-                let associations: Vec<LegacyAssociation> = decode(&body)?;
+                let associations: Vec<LegacyAssociation> = decode(transport, &body)?;
                 let cidrs = self.get_legacy_cidrs().await?;
                 let prefix = |id: i64| {
                     cidrs
@@ -327,8 +328,8 @@ impl<'a> RestClient<'a> {
     pub async fn get_state(&self) -> Result<State, RestError> {
         let (transport, body) = self.request_raw::<()>("GET", "/user/state", None).await?;
         match transport {
-            Transport::Tls => decode(&body),
-            Transport::Plain => decode::<LegacyState>(&body).map(State::from),
+            Transport::Tls => decode(transport, &body),
+            Transport::Plain => decode::<LegacyState>(transport, &body).map(State::from),
         }
     }
 
@@ -337,8 +338,8 @@ impl<'a> RestClient<'a> {
     pub async fn get_peers(&self) -> Result<Vec<PeerContents>, RestError> {
         let (transport, body) = self.request_raw::<()>("GET", "/admin/peers", None).await?;
         match transport {
-            Transport::Tls => decode(&body),
-            Transport::Plain => decode::<Vec<LegacyPeer>>(&body)
+            Transport::Tls => decode(transport, &body),
+            Transport::Plain => decode::<Vec<LegacyPeer>>(transport, &body)
                 .map(|peers| peers.into_iter().map(|peer| peer.contents.into()).collect()),
         }
     }
@@ -502,14 +503,16 @@ impl<'a> RestClient<'a> {
         endpoint: &str,
         form: Option<S>,
     ) -> Result<T, RestError> {
-        let (_, body) = self.request_raw(verb, endpoint, form).await?;
-        decode(&body)
+        let (transport, body) = self.request_raw(verb, endpoint, form).await?;
+        decode(transport, &body)
     }
 
     /// Performs a `verb` HTTP request at `endpoint`, with `form` as its body, and returns the
     /// transport that the server answered in, with the body of the answer. The form of the
     /// answer can depend on the transport, since a server in plain HTTP serves the API as clients
-    /// that predate TLS know it.
+    /// that predate TLS know it. The body of the request, and that of the answer, is CBOR over TLS
+    /// and JSON in plain HTTP. Over TLS, every request accepts the newest version of the API, the
+    /// body of a request states it, and the body of an answer of another version is refused.
     async fn request_raw<S: Serialize>(
         &self,
         verb: &str,
@@ -517,36 +520,65 @@ impl<'a> RestClient<'a> {
         form: Option<S>,
     ) -> Result<(Transport, Vec<u8>), RestError> {
         let method = Method::from_bytes(verb.as_bytes()).map_err(|_| RestError::Method)?;
-        let payload = form
-            .map(|form| serde_json::to_vec(&form))
-            .transpose()
-            .map_err(RestError::RequestSerialize)?;
-        let request = |uri: String| {
-            let request = Request::builder()
+        // The body is encoded for each attempt, since a request that falls back to plain HTTP is
+        // sent again in JSON.
+        let request = |uri: String, transport: Transport| {
+            let mut request = Request::builder()
                 .method(method.clone())
                 .uri(uri)
                 .header(header::HOST, self.server.internal_endpoint.to_string())
                 .header(INNERNET_PUBKEY_HEADER, &self.server.public_key);
-            match &payload {
-                Some(payload) => request
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(payload.clone())),
-                None => request.body(Body::empty()),
-            }
-            .map_err(|_| RestError::Method)
+            let body = match transport {
+                // Every request names the version that it reads in Accept, which the server
+                // requires of every change, so that it never takes a change for one of another
+                // version. A body states its version, and a request without a form carries
+                // neither a body nor a content type.
+                Transport::Tls => {
+                    request = request.header(header::ACCEPT, media_type::accept());
+                    let body = form
+                        .as_ref()
+                        .map(cbor::to_vec)
+                        .transpose()
+                        .map_err(|e| RestError::RequestSerialize(e.into()))?;
+                    if body.is_some() {
+                        request = request.header(
+                            header::CONTENT_TYPE,
+                            media_type::content_type(media_type::VERSION),
+                        );
+                    }
+                    body
+                },
+                Transport::Plain => {
+                    let body = form
+                        .as_ref()
+                        .map(serde_json::to_vec)
+                        .transpose()
+                        .map_err(|e| RestError::RequestSerialize(e.into()))?;
+                    if body.is_some() {
+                        request = request.header(header::CONTENT_TYPE, "application/json");
+                    }
+                    body
+                },
+            };
+            request
+                .body(body.map_or_else(Body::empty, Body::from))
+                .map_err(|_| RestError::Method)
         };
 
-        let (transport, (status, body)) = loop {
+        loop {
             if self.predates_tls.get() {
                 let uri = format!("http://{}/v1{endpoint}", self.server.internal_endpoint);
-                let answer = timed(self.plain_exchange(request(uri)?)).await?;
-                break (Transport::Plain, answer);
+                let answer = timed(self.plain_exchange(request(uri, Transport::Plain)?)).await?;
+                return answer
+                    .into_plain_body()
+                    .map(|body| (Transport::Plain, body));
             }
-            match timed(self.tls_exchange(request(format!("/v1{endpoint}"))?)).await {
+            let request = request(format!("/v1{endpoint}"), Transport::Tls)?;
+            match timed(self.tls_exchange(request)).await {
                 // The server authenticated with its key and answered over TLS.
                 Ok(answer) => {
                     self.record_tls();
-                    break (Transport::Tls, answer);
+                    return answer.into_tls_body().map(|body| (Transport::Tls, body));
                 },
                 // The server answered the handshake without reading the request, so the request
                 // is sent again in plain HTTP, unless the server is known to speak TLS.
@@ -563,25 +595,11 @@ impl<'a> RestClient<'a> {
                 },
                 Err(e) => return Err(e),
             }
-        };
-        if !status.is_success() {
-            // The server explains refusals that a client can't make sense of on its own.
-            let message = explanation(&body);
-            return Err(if message.is_empty() {
-                RestError::Status(status)
-            } else {
-                RestError::Refused { status, message }
-            });
         }
-
-        Ok((transport, body))
     }
 
     /// Exchanges `request` for an answer in plain HTTP.
-    async fn plain_exchange(
-        &self,
-        request: Request<Body>,
-    ) -> Result<(StatusCode, Vec<u8>), RestError> {
+    async fn plain_exchange(&self, request: Request<Body>) -> Result<Answer, RestError> {
         let response = self
             .plain_client
             .request(request)
@@ -591,10 +609,7 @@ impl<'a> RestClient<'a> {
     }
 
     /// Exchanges `request` for an answer over TLS, on a connection of its own to the server.
-    async fn tls_exchange(
-        &self,
-        request: Request<Body>,
-    ) -> Result<(StatusCode, Vec<u8>), RestError> {
+    async fn tls_exchange(&self, request: Request<Body>) -> Result<Answer, RestError> {
         let address = self.server.internal_endpoint;
         let stream = TcpStream::connect(address)
             .await
@@ -658,11 +673,19 @@ fn legacy_cidr_id(cidrs: &[LegacyCidr], prefix: &Prefix) -> Result<i64, RestErro
         .ok_or(RestError::NoSuchCidr)
 }
 
-/// Decodes the body of an answer as JSON. An empty body decodes as `null`, so that it decodes as
-/// `()`.
-fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, RestError> {
-    let body: &[u8] = if body.is_empty() { b"null" } else { body };
-    serde_json::from_slice(body).map_err(RestError::ResponseDeserialize)
+/// Decodes the body of an answer in `transport`: as CBOR in its deterministic encoding over TLS,
+/// and as JSON in plain HTTP. An empty body decodes as `null`, so that it decodes as `()`.
+fn decode<T: DeserializeOwned>(transport: Transport, body: &[u8]) -> Result<T, RestError> {
+    match transport {
+        Transport::Tls => {
+            let body = if body.is_empty() { &[0xf6][..] } else { body };
+            cbor::from_slice(body).map_err(|e| RestError::ResponseDeserialize(e.into()))
+        },
+        Transport::Plain => {
+            let body = if body.is_empty() { b"null" } else { body };
+            serde_json::from_slice(body).map_err(|e| RestError::ResponseDeserialize(e.into()))
+        },
+    }
 }
 
 /// The transport that a server answered a request in.
@@ -693,17 +716,79 @@ async fn timed<T>(
         .map_err(|_| RestError::Timeout)?
 }
 
-/// The status and the body of `response`, of which only the explanation, the first
+/// An answer of the server.
+#[derive(Debug)]
+struct Answer {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+impl Answer {
+    /// The body of the answer, an answer of the TLS API, or the refusal that it is. A body must
+    /// state the version of the API that the client reads, so that the client never reads a body
+    /// of another version as one of its own.
+    fn into_tls_body(self) -> Result<Vec<u8>, RestError> {
+        if !self.status.is_success() {
+            return Err(self.refusal());
+        }
+        let version = self
+            .content_type
+            .as_deref()
+            .and_then(|header| media_type::body_version(header, &[media_type::VERSION]));
+        if !self.body.is_empty() && version.is_none() {
+            return Err(RestError::ResponseDeserialize(anyhow::anyhow!(
+                "the response is of the content type {:?}, not of version {} of the API",
+                self.content_type,
+                media_type::VERSION
+            )));
+        }
+        Ok(self.body)
+    }
+
+    /// The body of the answer, an answer in plain HTTP, or the refusal that it is.
+    fn into_plain_body(self) -> Result<Vec<u8>, RestError> {
+        if !self.status.is_success() {
+            return Err(self.refusal());
+        }
+        Ok(self.body)
+    }
+
+    /// The refusal that the answer is, explained if the server explains it.
+    fn refusal(self) -> RestError {
+        // The server explains refusals that a client can't make sense of on its own.
+        let message = explanation(&self.body);
+        if message.is_empty() {
+            RestError::Status(self.status)
+        } else {
+            RestError::Refused {
+                status: self.status,
+                message,
+            }
+        }
+    }
+}
+
+/// The status, content type and body of `response`, of which only the explanation, the first
 /// [`MAX_EXPLANATION_LEN`] bytes, is read for a refusal.
-async fn read_answer(response: Response<Body>) -> Result<(StatusCode, Vec<u8>), RestError> {
+async fn read_answer(response: Response<Body>) -> Result<Answer, RestError> {
     use hyper::body::HttpBody as _;
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let mut body = response.into_body();
     if status.is_success() {
         let body = hyper::body::to_bytes(body)
             .await
             .map_err(|e| RestError::RequestSend(Box::new(e)))?;
-        return Ok((status, body.to_vec()));
+        return Ok(Answer {
+            status,
+            content_type,
+            body: body.to_vec(),
+        });
     }
     let mut explanation = vec![];
     while explanation.len() < MAX_EXPLANATION_LEN {
@@ -713,7 +798,11 @@ async fn read_answer(response: Response<Body>) -> Result<(StatusCode, Vec<u8>), 
         }
     }
     explanation.truncate(MAX_EXPLANATION_LEN);
-    Ok((status, explanation))
+    Ok(Answer {
+        status,
+        content_type,
+        body: explanation,
+    })
 }
 
 /// How many bytes of the server's explanation of a refusal the client reads.
@@ -805,9 +894,9 @@ pub enum RestError {
     #[error("Invalid request method")]
     Method,
     #[error("Error serializing request: {0}")]
-    RequestSerialize(serde_json::Error),
+    RequestSerialize(anyhow::Error),
     #[error("Error deserializing response: {0}")]
-    ResponseDeserialize(serde_json::Error),
+    ResponseDeserialize(anyhow::Error),
 }
 
 impl RestError {
@@ -863,7 +952,7 @@ impl RestError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innernet_shared::Tag;
+    use innernet_shared::{RedeemContents, Tag};
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{SocketAddr, TcpListener},
@@ -962,16 +1051,60 @@ mod tests {
     }
 
     /// Answers each connection over TLS, authenticated with `server`'s key, with `response`.
-    fn tls_server_answering(server: &KeyPair, connections: usize, response: String) -> SocketAddr {
+    fn tls_server_answering(server: &KeyPair, connections: usize, response: Vec<u8>) -> SocketAddr {
         tls_server_recording(server, vec![response; connections]).0
+    }
+
+    /// A request that a test server received: its head, which it reads as, and its body.
+    struct Recorded {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl std::ops::Deref for Recorded {
+        type Target = str;
+
+        fn deref(&self) -> &str {
+            &self.head
+        }
+    }
+
+    impl std::fmt::Display for Recorded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.head)
+        }
+    }
+
+    impl Recorded {
+        /// The body, decoded from CBOR, which the head must state as its content type, in the
+        /// newest version of the API.
+        fn cbor<T: DeserializeOwned>(&self) -> T {
+            assert_eq!(
+                self.header("content-type").as_deref(),
+                Some("application/vnd.innernet+cbor; version=1"),
+                "{}",
+                self.head
+            );
+            cbor::from_slice(&self.body).unwrap()
+        }
+
+        /// The value of the header `name` of the request, if it has one.
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().find_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                header
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+        }
     }
 
     /// Answers each connection over TLS, authenticated with `server`'s key, with the next of
     /// `responses`, and sends each request, its head and its body, to the receiver.
     fn tls_server_recording(
         server: &KeyPair,
-        responses: Vec<String>,
-    ) -> (SocketAddr, mpsc::Receiver<String>) {
+        responses: Vec<Vec<u8>>,
+    ) -> (SocketAddr, mpsc::Receiver<Recorded>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let config = tls::server_config(&server.private.to_base64()).unwrap();
@@ -981,12 +1114,12 @@ mod tests {
                 let connection = rustls::ServerConnection::new(config.clone()).unwrap();
                 let mut stream = rustls::StreamOwned::new(connection, stream.unwrap());
                 let mut reader = BufReader::new(&mut stream);
-                let mut request = String::new();
+                let mut head = String::new();
                 // A client that refuses the handshake ends the connection.
-                while matches!(reader.read_line(&mut request), Ok(read) if read > 0)
-                    && !request.ends_with("\r\n\r\n")
+                while matches!(reader.read_line(&mut head), Ok(read) if read > 0)
+                    && !head.ends_with("\r\n\r\n")
                 {}
-                let content_length = request
+                let content_length = head
                     .lines()
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
@@ -995,11 +1128,11 @@ mod tests {
                     })
                     .unwrap_or(0);
                 let mut body = vec![0; content_length];
-                if reader.read_exact(&mut body).is_ok() {
-                    request.push_str(&String::from_utf8_lossy(&body));
+                if reader.read_exact(&mut body).is_err() {
+                    body.clear();
                 }
-                let _ = sender.send(request);
-                let _ = stream.write_all(response.as_bytes());
+                let _ = sender.send(Recorded { head, body });
+                let _ = stream.write_all(&response);
                 stream.conn.send_close_notify();
                 let _ = stream.flush();
             }
@@ -1014,6 +1147,26 @@ mod tests {
              Connection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    /// A response with the status `status` and the body `body`, in CBOR, in the newest version of
+    /// the API.
+    fn cbor_response(status: &str, body: &impl Serialize) -> Vec<u8> {
+        cbor_response_as(status, "application/vnd.innernet+cbor; version=1", body)
+    }
+
+    /// A response with the status `status` and the body `body`, in CBOR, stated to be of the
+    /// content type `content_type`.
+    fn cbor_response_as(status: &str, content_type: &str, body: &impl Serialize) -> Vec<u8> {
+        let body = cbor::to_vec(body).unwrap();
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend(body);
+        response
     }
 
     const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
@@ -1060,12 +1213,12 @@ mod tests {
     }
 
     /// The server's answer to a read of `peer` with the tag `tag`.
-    fn tagged_response(peer: &PeerContents, tag: &str) -> String {
+    fn tagged_response(peer: &PeerContents, tag: &str) -> Vec<u8> {
         let tagged = TaggedPeer {
             peer: peer.clone(),
             tag: test_tag(tag),
         };
-        json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
+        cbor_response("200 OK", &tagged)
     }
 
     #[tokio::test]
@@ -1080,7 +1233,7 @@ mod tests {
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
-                json_response("200 OK", "{}"),
+                cbor_response("200 OK", &serde_json::json!({})),
                 tagged_response(&observed, "ab"),
                 NO_CONTENT.into(),
             ],
@@ -1113,7 +1266,7 @@ mod tests {
             put.starts_with(&format!("PUT /v1/admin/peers/{segment} ")),
             "{put}"
         );
-        let body: PeerUpdate = serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let body: PeerUpdate = put.cbor();
         assert_eq!(body, PeerUpdate::new(test_tag("ab"), &renamed));
     }
 
@@ -1125,8 +1278,8 @@ mod tests {
             is_admin: true,
             ..peer.clone()
         };
-        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
-        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".to_string();
+        let not_found: Vec<u8> = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into();
+        let conflict: Vec<u8> = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into();
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
@@ -1281,6 +1434,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_speaks_cbor_over_tls() {
+        // Over TLS, the client sends and reads CBOR, in which a key is text in base64, as in JSON.
+        let peer = listed_peer();
+        let state = State {
+            peers: vec![peer.clone()],
+            cidrs: vec![users_cidr()],
+            invalid_peer_keys: vec![],
+        };
+        let server_key = KeyPair::generate();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![cbor_response("200 OK", &state), NO_CONTENT.into()],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+        let received = client.get_state().await.unwrap();
+        assert_eq!((received.peers, received.cidrs), (state.peers, state.cidrs));
+        let redeem = RedeemContents {
+            public_key: peer.public_key.clone(),
+        };
+        client
+            .http_form::<_, ()>("POST", "/user/redeem", &redeem)
+            .await
+            .unwrap();
+        let get = requests.recv().unwrap();
+        assert_eq!(get.header("content-type"), None, "{get}");
+        let post = requests.recv().unwrap();
+        assert_eq!(post.cbor::<RedeemContents>(), redeem);
+        assert_eq!(post.body[..14], *b"\xa1jpublic_keyx\x2c");
+        assert_eq!(post.body[14..], *peer.public_key.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_states_the_version_over_tls() {
+        let peer = listed_peer();
+        let state = State {
+            peers: vec![peer.clone()],
+            cidrs: vec![],
+            invalid_peer_keys: vec![],
+        };
+        let server_key = KeyPair::generate();
+        let (addr, requests) = tls_server_recording(
+            &server_key,
+            vec![
+                cbor_response("200 OK", &state),
+                NO_CONTENT.into(),
+                NO_CONTENT.into(),
+                cbor_response_as("200 OK", "application/cbor", &state),
+                cbor_response_as("200 OK", "application/vnd.innernet+cbor; version=2", &state),
+                cbor_response_as("200 OK", "application/vnd.innernet+cbor", &state),
+            ],
+        );
+        let config = config(addr, &server_key);
+        let client = RestClient::new(&config, true).unwrap();
+
+        // Every request accepts the newest version, and every body states it. A change without a
+        // form carries neither a body nor a content type.
+        client.get_state().await.unwrap();
+        let association = Association {
+            cidr_1: "10.0.1.0/24".parse().unwrap(),
+            cidr_2: "10.0.2.0/24".parse().unwrap(),
+        };
+        client.delete_association(&association).await.unwrap();
+        client
+            .http_form::<_, ()>("PUT", "/user/candidates", Vec::<String>::new())
+            .await
+            .unwrap();
+        let accept = Some("application/vnd.innernet+cbor; version=1".to_string());
+        let get = requests.recv().unwrap();
+        assert_eq!(get.header("accept"), accept, "{get}");
+        assert_eq!(get.header("content-type"), None, "{get}");
+        let delete = requests.recv().unwrap();
+        assert_eq!(delete.header("accept"), accept, "{delete}");
+        assert_eq!(delete.header("content-type"), None, "{delete}");
+        assert!(delete.body.is_empty(), "{delete}");
+        let put = requests.recv().unwrap();
+        assert_eq!(put.header("accept"), accept, "{put}");
+        assert!(put.cbor::<Vec<String>>().is_empty());
+
+        // An answer that doesn't state the version that the client reads is refused.
+        for _ in 0..3 {
+            let error = client.get_state().await.unwrap_err();
+            assert!(
+                matches!(error, RestError::ResponseDeserialize(_)),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_sets_delegations_by_key_over_tls() {
         let server_key = KeyPair::generate();
         let peer = listed_peer();
@@ -1289,7 +1532,7 @@ mod tests {
                 delegations: delegations.to_vec(),
                 tag: test_tag("ab"),
             };
-            json_response("200 OK", &serde_json::to_string(&body).unwrap())
+            cbor_response("200 OK", &body)
         };
         let wider: Vec<Prefix> = vec![
             "10.0.0.7/32".parse().unwrap(),
@@ -1316,8 +1559,7 @@ mod tests {
             .starts_with(&format!("GET {path} ")));
         let put = requests.recv().unwrap();
         assert!(put.starts_with(&format!("PUT {path} ")), "{put}");
-        let body: TaggedPeerDelegations =
-            serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let body: TaggedPeerDelegations = put.cbor();
         assert_eq!(
             body,
             TaggedPeerDelegations {
@@ -1333,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn test_cidrs_and_associations_by_prefix_over_tls() {
         let server_key = KeyPair::generate();
-        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+        let not_found: Vec<u8> = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into();
         let users = users_cidr();
         let (addr, requests) = tls_server_recording(
             &server_key,
@@ -1360,7 +1602,7 @@ mod tests {
         assert!(get.starts_with("GET /v1/admin/cidrs/10.0.1.0_24 "), "{get}");
         let put = requests.recv().unwrap();
         assert!(put.starts_with("PUT /v1/admin/cidrs/10.0.1.0_24 "), "{put}");
-        let body: TaggedCidr = serde_json::from_str(put.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let body: TaggedCidr = put.cbor();
         assert_eq!(
             body,
             TaggedCidr {
@@ -1395,12 +1637,12 @@ mod tests {
     }
 
     /// The server's answer to a read of `cidr` with the tag `tag`.
-    fn tagged_cidr_response(cidr: &Cidr, tag: &str) -> String {
+    fn tagged_cidr_response(cidr: &Cidr, tag: &str) -> Vec<u8> {
         let tagged = TaggedCidr {
             cidr: cidr.clone(),
             tag: test_tag(tag),
         };
-        json_response("200 OK", &serde_json::to_string(&tagged).unwrap())
+        cbor_response("200 OK", &tagged)
     }
 
     #[tokio::test]
@@ -1423,8 +1665,7 @@ mod tests {
             delete.starts_with("DELETE /v1/admin/cidrs/10.0.1.0_24 "),
             "{delete}"
         );
-        let body: CidrDeletion =
-            serde_json::from_str(delete.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let body: CidrDeletion = delete.cbor();
         assert_eq!(
             body,
             CidrDeletion {
@@ -1441,8 +1682,8 @@ mod tests {
             name: "people".into(),
             ..users.clone()
         };
-        let conflict = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".to_string();
-        let bad_request = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_string();
+        let conflict: Vec<u8> = "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n".into();
+        let bad_request: Vec<u8> = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".into();
         let (addr, requests) = tls_server_recording(
             &server_key,
             vec![
@@ -1658,7 +1899,7 @@ mod tests {
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let addr = tls_server_answering(&server_key, 1, response);
+        let addr = tls_server_answering(&server_key, 1, response.into_bytes());
         let config = config(addr, &server_key);
         let client = RestClient::new(&config, false).unwrap();
         match client.http::<()>("GET", "/user/state").await.unwrap_err() {

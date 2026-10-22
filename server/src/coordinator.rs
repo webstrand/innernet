@@ -4,11 +4,11 @@
 //! shares with its node, a listener that the host has bound, and the hooks through which it tells
 //! the node of a change and learns where the node's tunnel observes the peers.
 
-use crate::{api, db::DatabasePeer, ServerError};
+use crate::{api, db::DatabasePeer, util, ServerError};
 use anyhow::{anyhow, Error};
 use hyper::{http, service::service_fn, Body, Request, Response};
 use innernet_node::{runtime::StoreChanged, Store};
-use innernet_shared::{tls, INNERNET_PUBKEY_HEADER};
+use innernet_shared::{media_type::Representation, tls, INNERNET_PUBKEY_HEADER};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, VecDeque},
@@ -149,6 +149,9 @@ pub struct Session {
     /// Whether the peer authenticated with its key over TLS. Plain-HTTP sessions are those of
     /// clients that predate TLS, and are served the API as those clients know it.
     pub over_tls: bool,
+    /// The representation of the responses of a TLS session, as its `Accept` chose it, or `None`
+    /// in plain HTTP, which answers in JSON.
+    pub representation: Option<Representation>,
 }
 
 impl Session {
@@ -268,7 +271,10 @@ async fn routes(
         if component.as_deref() == Some("admin") && client_key.is_none() {
             return Err(ServerError::NotFound);
         }
-        let session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
+        let mut session = get_session(&req, context, remote_addr.ip(), client_key.as_ref())?;
+        if session.over_tls {
+            session.representation = Some(util::negotiate(&req)?);
+        }
         match component.as_deref() {
             Some("user") => api::user::routes(req, components, session).await,
             Some("admin") => api::admin::routes(req, components, session).await,
@@ -334,6 +340,7 @@ fn get_session(
         context,
         peer,
         over_tls: client_key.is_some(),
+        representation: None,
     })
 }
 

@@ -131,8 +131,7 @@ mod tests {
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/associations")
             .await;
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        let listed: Vec<Association> = serde_json::from_slice(&body)?;
+        let listed: Vec<Association> = test::cbor_body(res).await?;
         assert_eq!(listed, [flipped]);
 
         // A deletion names the CIDRs in either order, and an unknown association is not found.

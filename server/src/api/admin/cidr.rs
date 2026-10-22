@@ -1,13 +1,13 @@
+use innernet_node::Store;
 use std::collections::VecDeque;
 
 use crate::{
     db::DatabaseCidr,
-    util::{form_body, json_response, status_response},
+    util::{form_body, form_response, status_response},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{Cidr, CidrDeletion, Prefix, Tag, TaggedCidr};
-use rusqlite::Connection;
 
 /// Serves `/admin/cidrs`, in which a path names a CIDR by its prefix, as
 /// [`Prefix::api_path_segment`] writes it.
@@ -26,16 +26,16 @@ pub async fn routes(
     match (req.method(), prefix) {
         (&Method::GET, None) => handlers::list(session).await,
         (&Method::POST, None) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::create(form, session).await
         },
         (&Method::GET, Some(prefix)) => handlers::get(prefix, session).await,
         (&Method::PUT, Some(prefix)) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::update(prefix, form, session).await
         },
         (&Method::DELETE, Some(prefix)) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::delete(prefix, form, session).await
         },
         _ => Err(ServerError::NotFound),
@@ -49,12 +49,8 @@ fn cidr_tag(cidr: &Cidr) -> Result<Tag, ServerError> {
 
 /// The CIDR `prefix`, if its tag is still `tag`. A CIDR that has changed since it was tagged is
 /// refused as [`ServerError::CidrChanged`], and one that doesn't exist is not found.
-fn get_unchanged(
-    conn: &Connection,
-    prefix: &Prefix,
-    tag: &Tag,
-) -> Result<DatabaseCidr, ServerError> {
-    let cidr = DatabaseCidr::get(conn, prefix)?;
+fn get_unchanged(store: &Store, prefix: &Prefix, tag: &Tag) -> Result<DatabaseCidr, ServerError> {
+    let cidr = DatabaseCidr::get(store, prefix)?;
     if cidr_tag(&cidr.contents())? != *tag {
         return Err(ServerError::CidrChanged);
     }
@@ -62,25 +58,25 @@ fn get_unchanged(
 }
 
 mod handlers {
-    use crate::util::json_status_response;
+    use crate::util::form_status_response;
 
     use super::*;
 
     /// Creates the CIDR `contents`, under the parent that its prefix gives it.
     pub async fn create(contents: Cidr, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
+        let store = session.context.db.lock();
 
-        let cidr = DatabaseCidr::create(&conn, contents.name, contents.cidr)?;
+        let cidr = DatabaseCidr::create(&store, contents.name, contents.cidr)?;
 
-        json_status_response(cidr.contents(), StatusCode::CREATED)
+        form_status_response(&session, cidr.contents(), StatusCode::CREATED)
     }
 
     /// The CIDR `prefix`, with its tag.
     pub async fn get(prefix: Prefix, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let cidr = DatabaseCidr::get(&conn, &prefix)?.contents();
+        let store = session.context.db.lock();
+        let cidr = DatabaseCidr::get(&store, &prefix)?.contents();
         let tag = cidr_tag(&cidr)?;
-        json_response(TaggedCidr { cidr, tag })
+        form_response(&session, TaggedCidr { cidr, tag })
     }
 
     /// Renames the CIDR `prefix` to the name of `form`, which names the CIDR by its prefix too,
@@ -95,21 +91,21 @@ mod handlers {
             log::warn!("tried to move the CIDR {prefix} to {}.", form.cidr.cidr);
             return Err(ServerError::InvalidQuery);
         }
-        let conn = session.context.db.lock();
-        let mut cidr = get_unchanged(&conn, &prefix, &form.tag)?;
-        cidr.rename(&conn, form.cidr.name)?;
+        let store = session.context.db.lock();
+        let mut cidr = get_unchanged(&store, &prefix, &form.tag)?;
+        cidr.rename(&store, form.cidr.name)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
 
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let cidrs: Vec<_> = DatabaseCidr::list(&conn)?
+        let store = session.context.db.lock();
+        let cidrs: Vec<_> = DatabaseCidr::list(&store)?
             .iter()
             .map(DatabaseCidr::contents)
             .collect();
 
-        json_response(cidrs)
+        form_response(&session, cidrs)
     }
 
     /// Deletes the CIDR `prefix`, if the CIDR hasn't changed since the admin read it with the tag
@@ -119,9 +115,9 @@ mod handlers {
         form: CidrDeletion,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        get_unchanged(&conn, &prefix, &form.tag)?;
-        DatabaseCidr::delete(&conn, &prefix)?;
+        let store = session.context.db.lock();
+        get_unchanged(&store, &prefix, &form.tag)?;
+        DatabaseCidr::delete(&store, &prefix)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
@@ -132,8 +128,8 @@ mod tests {
     use super::*;
     use crate::{test, DatabasePeer};
     use anyhow::Result;
-    use innernet_shared::{Error, LegacyCidr};
-    use serde::de::{DeserializeOwned, IgnoredAny};
+    use innernet_shared::{cbor, Error, LegacyCidr};
+    use serde::de::IgnoredAny;
     use std::collections::BTreeMap;
 
     /// The CIDR named `name` at `cidr`.
@@ -152,19 +148,13 @@ mod tests {
         ))
     }
 
-    /// The body of `res`, decoded from JSON.
-    async fn json_body<T: DeserializeOwned>(res: Response<Body>) -> Result<T, Error> {
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        Ok(serde_json::from_slice(&body)?)
-    }
-
     /// Reads the CIDR `cidr` with its tag, as the admin.
     async fn get_tagged(server: &test::Server, cidr: &str) -> Result<TaggedCidr, Error> {
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", &path(cidr)?)
             .await;
         assert_eq!(res.status(), StatusCode::OK);
-        json_body(res).await
+        test::cbor_body(res).await
     }
 
     /// Sends `body` to rename the CIDR at `path`, as the admin.
@@ -203,7 +193,7 @@ mod tests {
 
         assert_eq!(res.status(), 201);
 
-        let cidr_res: Cidr = json_body(res).await?;
+        let cidr_res: Cidr = test::cbor_body(res).await?;
         assert_eq!(contents, cidr_res);
 
         let new_cidrs = DatabaseCidr::list(&server.db().lock())?;
@@ -214,9 +204,9 @@ mod tests {
             .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/cidrs")
             .await;
         let body = hyper::body::to_bytes(res.into_body()).await?;
-        let listed: Vec<Cidr> = serde_json::from_slice(&body)?;
+        let listed: Vec<Cidr> = cbor::from_slice(&body)?;
         assert!(listed.contains(&contents));
-        let fields: Vec<BTreeMap<String, IgnoredAny>> = serde_json::from_slice(&body)?;
+        let fields: Vec<BTreeMap<String, IgnoredAny>> = cbor::from_slice(&body)?;
         assert!(fields
             .iter()
             .all(|cidr| cidr.keys().eq(["cidr", "name"].iter())));

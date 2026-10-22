@@ -13,6 +13,7 @@ use wireguard_control::InterfaceName;
 
 pub mod cbor;
 pub mod interface_config;
+pub mod media_type;
 #[cfg(target_os = "linux")]
 mod netlink;
 pub mod peer;

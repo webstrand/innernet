@@ -57,6 +57,24 @@ pub enum ServerError {
     #[error("JSON parsing/serialization error")]
     Json(#[from] serde_json::Error),
 
+    #[error("CBOR parsing/serialization error")]
+    Cbor(#[from] innernet_shared::cbor::Error),
+
+    /// A request of a TLS session whose content type is not that of a version of the API that the
+    /// server reads, or that reads a body without a content type.
+    #[error("unsupported media type")]
+    UnsupportedMediaType,
+
+    /// A request of a TLS session that accepts no version of the API that the server writes, or a
+    /// change that names no version in `Accept`.
+    #[error("not acceptable")]
+    NotAcceptable,
+
+    /// A request of a TLS session that states a content type but carries no body, which is no
+    /// CBOR.
+    #[error("the request states a content type but carries no body")]
+    EmptyBody,
+
     #[error("Generic HTTP error")]
     Http(#[from] http::Error),
 
@@ -73,7 +91,10 @@ impl From<&ServerError> for StatusCode {
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
             PeerChanged | CidrChanged => StatusCode::CONFLICT,
-            InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
+            InvalidQuery | Json(_) | Cbor(_) => StatusCode::BAD_REQUEST,
+            UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            NotAcceptable => StatusCode::NOT_ACCEPTABLE,
+            EmptyBody => StatusCode::BAD_REQUEST,
             // Special-case the constraint violation situation.
             Database(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..))
                 if *code == rusqlite::ErrorCode::ConstraintViolation =>

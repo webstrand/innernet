@@ -840,6 +840,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "cbor-core",
  "clap",
  "clap_complete",
  "colored",
@@ -888,6 +889,7 @@ dependencies = [
  "ipnet",
  "libc",
  "log",
+ "mime",
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-request",
@@ -1068,6 +1070,12 @@ checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mio"

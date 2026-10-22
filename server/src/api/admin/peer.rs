@@ -1,9 +1,10 @@
+use innernet_node::Store;
 use std::collections::VecDeque;
 
 use crate::{
     api::inject_endpoints,
     db::DatabasePeer,
-    util::{form_body, json_response, json_status_response, status_response},
+    util::{decode, form_body, form_response, form_status_response, read_body, status_response},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -11,7 +12,6 @@ use innernet_shared::{
     Hostname, PeerContents, PeerEndpoints, PeerUpdate, Tag, TaggedPeer, TaggedPeerDelegations,
     TaggedPeerEndpoints,
 };
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use wireguard_control::Key;
@@ -32,22 +32,22 @@ pub async fn routes(
     match (req.method(), key, resource.as_deref()) {
         (&Method::GET, None, None) => handlers::list(session).await,
         (&Method::POST, None, None) => {
-            let form = peer_form_body(req).await?;
+            let form = peer_form_body(req, &session).await?;
             handlers::create(form, session).await
         },
         (&Method::GET, Some(key), None) => handlers::get_by_key(key, session).await,
         (&Method::PUT, Some(key), None) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::update_by_key(key, form, session).await
         },
         (&Method::GET, Some(key), Some("endpoints")) => handlers::endpoints(key, session).await,
         (&Method::PUT, Some(key), Some("endpoints")) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::set_endpoints(key, form, session).await
         },
         (&Method::GET, Some(key), Some("delegations")) => handlers::delegations(key, session).await,
         (&Method::PUT, Some(key), Some("delegations")) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::set_delegations(key, form, session).await
         },
         _ => Err(ServerError::NotFound),
@@ -67,19 +67,22 @@ fn parse_path_key(segment: &str) -> Result<Key, ServerError> {
     }
 }
 
-/// Reads a peer from the body of `req`. A [`PeerContents`] reads an invalid name as no name, so
-/// that clients can read peers from servers that allow other names, but the server refuses a peer
-/// whose name is not a valid [`Hostname`], with 400.
-async fn peer_form_body(req: Request<Body>) -> Result<PeerContents, ServerError> {
+/// Reads a peer from the body of `req`, a request of `session`. A [`PeerContents`] reads an
+/// invalid name as no name, so that clients can read peers from servers that allow other names,
+/// but the server refuses a peer whose name is not a valid [`Hostname`], with 400.
+async fn peer_form_body(
+    req: Request<Body>,
+    session: &Session,
+) -> Result<PeerContents, ServerError> {
     #[derive(Deserialize)]
     struct Name {
         #[serde(default, rename = "name")]
         _name: Option<Hostname>,
     }
 
-    let form: serde_json::Value = form_body(req).await?;
-    Name::deserialize(&form)?;
-    Ok(PeerContents::deserialize(form)?)
+    let body = read_body(req, session).await?;
+    decode::<Name>(session, &body)?;
+    decode(session, &body)
 }
 
 /// The tag of `value`, a resource of the kind `kind`, such as a peer or a CIDR: a hash of the kind
@@ -131,12 +134,12 @@ fn delegations_tag(peer: &PeerContents) -> Result<Tag, ServerError> {
 /// changed since, as a redeemed invitation's does, is not found, like a peer that never existed:
 /// a tag doesn't identify the peer it was computed for.
 fn get_unchanged(
-    conn: &Connection,
+    store: &Store,
     key: &Key,
     tag: &Tag,
     tag_of: impl Fn(&PeerContents) -> Result<Tag, ServerError>,
 ) -> Result<DatabasePeer, ServerError> {
-    match DatabasePeer::get_from_public_key(conn, key) {
+    match DatabasePeer::get_from_public_key(store, key) {
         Ok(peer) if tag_of(&peer)? == *tag => Ok(peer),
         Ok(_) => Err(ServerError::PeerChanged),
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(ServerError::NotFound),
@@ -152,25 +155,25 @@ mod handlers {
         form: PeerContents,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
+        let store = session.context.db.lock();
 
-        let peer = DatabasePeer::create(&conn, form)?;
+        let peer = DatabasePeer::create(&store, form)?;
         log::info!("adding peer {}", *peer);
         session.context.changed.notify();
         if !peer.is_redeemed {
             session.context.invitations.notify_one();
         }
 
-        json_status_response(&peer.inner, StatusCode::CREATED)
+        form_status_response(&session, &peer.inner, StatusCode::CREATED)
     }
 
     /// The peer with the public key `key` as the listing reports it, with its tag.
     pub async fn get_by_key(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let mut peer = DatabasePeer::get_from_public_key(&conn, &key)?.inner;
+        let store = session.context.db.lock();
+        let mut peer = DatabasePeer::get_from_public_key(&store, &key)?.inner;
         let tag = peer_tag(&peer)?;
         inject_endpoints(&session, [&mut peer]);
-        json_response(TaggedPeer { peer, tag })
+        form_response(&session, TaggedPeer { peer, tag })
     }
 
     /// Applies an admin's changes to the peer with the public key `key`, if the peer hasn't
@@ -180,15 +183,15 @@ mod handlers {
         form: PeerUpdate,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let mut peer = get_unchanged(&conn, &key, &form.tag, peer_tag)?;
+        let store = session.context.db.lock();
+        let mut peer = get_unchanged(&store, &key, &form.tag, peer_tag)?;
         let contents = PeerContents {
             name: form.name,
             is_admin: form.is_admin,
             is_disabled: form.is_disabled,
             ..peer.inner.clone()
         };
-        peer.update(&conn, contents)?;
+        peer.update(&store, contents)?;
         // The update may have enabled or disabled the peer.
         session.context.changed.notify();
 
@@ -199,12 +202,15 @@ mod handlers {
     /// endpoint that the server observes, so that they can be written back as they are read, and
     /// their tag.
     pub async fn endpoints(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let peer = DatabasePeer::get_from_public_key(&conn, &key)?;
-        json_response(TaggedPeerEndpoints {
-            endpoints: peer_endpoints(&peer),
-            tag: endpoints_tag(&peer)?,
-        })
+        let store = session.context.db.lock();
+        let peer = DatabasePeer::get_from_public_key(&store, &key)?;
+        form_response(
+            &session,
+            TaggedPeerEndpoints {
+                endpoints: peer_endpoints(&peer),
+                tag: endpoints_tag(&peer)?,
+            },
+        )
     }
 
     /// Sets the endpoint and candidates of the peer with the public key `key` on its behalf, if
@@ -221,9 +227,9 @@ mod handlers {
         if candidates.len() > 10 {
             return status_response(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        let conn = session.context.db.lock();
-        let mut peer = get_unchanged(&conn, &key, &form.tag, endpoints_tag)?;
-        peer.set_endpoints(&conn, endpoint, candidates)?;
+        let store = session.context.db.lock();
+        let mut peer = get_unchanged(&store, &key, &form.tag, endpoints_tag)?;
+        peer.set_endpoints(&store, endpoint, candidates)?;
         log::info!("set the endpoints of peer {}", *peer);
         session.context.changed.notify();
 
@@ -232,12 +238,15 @@ mod handlers {
 
     /// The delegations of the peer with the public key `key`, and their tag.
     pub async fn delegations(key: Key, session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let peer = DatabasePeer::get_from_public_key(&conn, &key)?;
-        json_response(TaggedPeerDelegations {
-            delegations: peer.delegations.clone(),
-            tag: delegations_tag(&peer)?,
-        })
+        let store = session.context.db.lock();
+        let peer = DatabasePeer::get_from_public_key(&store, &key)?;
+        form_response(
+            &session,
+            TaggedPeerDelegations {
+                delegations: peer.delegations.clone(),
+                tag: delegations_tag(&peer)?,
+            },
+        )
     }
 
     /// Replaces the delegations of the peer with the public key `key` as a whole, if they
@@ -267,13 +276,13 @@ mod handlers {
 
     /// List all peers, including disabled ones, without IDs. This is an admin-only endpoint.
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let mut peers = DatabasePeer::list(&conn)?
+        let store = session.context.db.lock();
+        let mut peers = DatabasePeer::list(&store)?
             .into_iter()
             .map(|peer| peer.inner)
             .collect::<Vec<_>>();
         inject_endpoints(&session, &mut peers);
-        json_response(&peers)
+        form_response(&session, &peers)
     }
 }
 
@@ -281,7 +290,6 @@ mod handlers {
 mod tests {
     use super::*;
     use crate::{db::DatabaseCidr, test};
-    use bytes::Buf;
     use innernet_shared::{Endpoint, Error, LegacyPeer, Prefix, State};
     use wireguard_control::KeyPair;
 
@@ -303,8 +311,7 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::CREATED);
         // The response contains the new peer information.
-        let whole_body = hyper::body::aggregate(res).await?;
-        let peer_res: PeerContents = serde_json::from_reader(whole_body.reader())?;
+        let peer_res: PeerContents = test::cbor_body(res).await?;
 
         assert_eq!(peer, peer_res);
 
@@ -529,8 +536,7 @@ mod tests {
     async fn get_tagged(server: &test::Server, path: &str) -> TaggedPeer {
         let res = server.request(test::ADMIN_PEER_IP, "GET", path).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = hyper::body::aggregate(res).await.unwrap();
-        serde_json::from_reader(body.reader()).unwrap()
+        test::cbor_body(res).await.unwrap()
     }
 
     /// The changes that leave the peer at `path` as it is, with its current tag.
@@ -660,8 +666,7 @@ mod tests {
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &peer)
             .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        let created: PeerContents = serde_json::from_slice(&body)?;
+        let created: PeerContents = test::cbor_body(res).await?;
         let mut sorted = peer.delegations.clone();
         sorted.sort();
         assert_eq!(created.delegations, sorted);
@@ -795,8 +800,7 @@ mod tests {
             async move {
                 let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
                 assert_eq!(res.status(), StatusCode::OK);
-                let body = hyper::body::aggregate(res).await.unwrap();
-                serde_json::from_reader::<_, TaggedPeerDelegations>(body.reader()).unwrap()
+                test::cbor_body::<TaggedPeerDelegations>(res).await.unwrap()
             }
         };
         // The delegations are sent as text, so that a misaligned prefix can be sent.
@@ -940,8 +944,7 @@ mod tests {
         let server = test::Server::new()?;
         let path = format!("{}/delegations", key_path(&server, test::SERVER_PEER_ID));
         let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
-        let body = hyper::body::to_bytes(res.into_body()).await?;
-        let seen: TaggedPeerDelegations = serde_json::from_slice(&body)?;
+        let seen: TaggedPeerDelegations = test::cbor_body(res).await?;
         let res = server
             .form_request(
                 test::ADMIN_PEER_IP,
@@ -971,8 +974,7 @@ mod tests {
         let get = || async {
             let res = server.request(test::ADMIN_PEER_IP, "GET", &path).await;
             assert_eq!(res.status(), StatusCode::OK);
-            let body = hyper::body::aggregate(res).await.unwrap();
-            serde_json::from_reader::<_, TaggedPeerEndpoints>(body.reader()).unwrap()
+            test::cbor_body::<TaggedPeerEndpoints>(res).await.unwrap()
         };
         let put = |endpoints: &TaggedPeerEndpoints| {
             server.form_request(test::ADMIN_PEER_IP, "PUT", &path, endpoints.clone())
@@ -1190,8 +1192,7 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let whole_body = hyper::body::aggregate(res).await?;
-        let peers: Vec<PeerContents> = serde_json::from_reader(whole_body.reader())?;
+        let peers: Vec<PeerContents> = test::cbor_body(res).await?;
         let peer_names = peers
             .iter()
             .map(|p| p.name.as_deref().unwrap())
@@ -1220,16 +1221,16 @@ mod tests {
         } else {
             "10.80.64.4"
         };
-        let json = |res: Response<Body>| async {
+        let cbor = |res: Response<Body>| async {
             let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            cbor_core::Value::decode_owned(&body).unwrap()
         };
 
         // The admin API lists and creates peers without IDs.
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
             .await;
-        let peers = json(res).await;
+        let peers = cbor(res).await;
         assert_eq!(peers.as_array().unwrap().len(), 6);
         assert!(peers
             .as_array()
@@ -1241,7 +1242,7 @@ mod tests {
             .form_request(test::ADMIN_PEER_IP, "POST", "/v1/admin/peers", &contents)
             .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        assert!(json(res).await.get("id").is_none());
+        assert!(cbor(res).await.get("id").is_none());
         Ok(())
     }
 
@@ -1298,16 +1299,7 @@ mod tests {
         let server = test::Server::new()?;
         let json = |res: Response<Body>| async {
             assert_eq!(res.status(), StatusCode::OK);
-            let body = hyper::body::to_bytes(res.into_body()).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
-        };
-        let names = |peers: &serde_json::Value| -> Vec<serde_json::Value> {
-            peers
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|peer| peer["name"].clone())
-                .collect()
+            test::json_body::<serde_json::Value>(res).await.unwrap()
         };
 
         // An admin removes the names of both user peers over TLS: any number of peers can be
@@ -1328,16 +1320,27 @@ mod tests {
         let res = server
             .request(test::ADMIN_PEER_IP, "GET", "/v1/admin/peers")
             .await;
-        let listed = json(res).await;
-        assert_eq!(names(&listed).len(), 6);
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(res.into_body()).await?;
+        let listed = cbor_core::Value::decode_owned(&body).unwrap();
+        let names: Vec<_> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| &peer["name"])
+            .collect();
+        assert_eq!(names.len(), 6);
         assert_eq!(
-            names(&listed).iter().filter(|name| name.is_null()).count(),
+            names
+                .iter()
+                .filter(|name| name.data_type().is_null())
+                .count(),
             2
         );
         let res = server
             .request(test::USER1_PEER_IP, "GET", "/v1/user/state")
             .await;
-        let state: State = serde_json::from_value(json(res).await)?;
+        let state: State = test::cbor_body(res).await?;
         assert_eq!(state.peers.iter().filter(|p| p.name.is_none()).count(), 2);
 
         // The view of plain-HTTP sessions leaves out the peers without a name, which clients that

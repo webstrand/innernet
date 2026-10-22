@@ -7,9 +7,9 @@ use crate::{
 use anyhow::anyhow;
 use hyper::{header::HeaderValue, http, Body, Request, Response};
 use innernet_node::Store;
-use innernet_shared::{Error, LegacyPeerContents, PeerContents, Prefix};
+use innernet_shared::{cbor, Error, LegacyPeerContents, PeerContents, Prefix};
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -295,12 +295,18 @@ impl Server {
         } else {
             format!("http://{WG_MANAGE_PEER_IP}{path}")
         };
-        Request::builder().uri(path).method(verb).header(
-            innernet_shared::INNERNET_PUBKEY_HEADER,
-            HeaderValue::from_str(&self.public_key.to_base64()).unwrap(),
-        )
+        Request::builder()
+            .uri(path)
+            .method(verb)
+            .header(
+                innernet_shared::INNERNET_PUBKEY_HEADER,
+                HeaderValue::from_str(&self.public_key.to_base64()).unwrap(),
+            )
+            .header(hyper::header::ACCEPT, innernet_shared::media_type::accept())
     }
 
+    /// Sends a request without a body and without a content type, as [`Self::raw_request`] does.
+    /// A change names the newest version of the API in `Accept`, as every request does.
     pub async fn request(&self, ip_str: &str, verb: &str, path: &str) -> Response<Body> {
         let req = self
             .base_request_builder(verb, path)
@@ -309,15 +315,23 @@ impl Server {
         self.raw_request(ip_str, req).await
     }
 
-    fn form_request_builder<F: Serialize>(&self, verb: &str, path: &str, form: F) -> Request<Body> {
-        let json = serde_json::to_string(&form).unwrap();
+    /// A request with the body `body`, of the content type `content_type`.
+    pub fn body_request(
+        &self,
+        verb: &str,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Request<Body> {
         self.base_request_builder(verb, path)
-            .header("Content-Type", "application/json")
-            .header("Content-Length", json.len().to_string())
-            .body(Body::from(json))
+            .header("Content-Type", content_type)
+            .header("Content-Length", body.len().to_string())
+            .body(Body::from(body))
             .unwrap()
     }
 
+    /// Sends `form` in CBOR, in the newest version of the API, as a client connecting over TLS
+    /// does, as [`Self::raw_request`] does.
     pub async fn form_request<F: Serialize>(
         &self,
         ip_str: &str,
@@ -325,10 +339,12 @@ impl Server {
         path: &str,
         form: F,
     ) -> Response<Body> {
-        let req = self.form_request_builder(verb, path, form);
+        let body = cbor::to_vec(&form).unwrap();
+        let req = self.body_request(verb, path, &content_type(), body);
         self.raw_request(ip_str, req).await
     }
 
+    /// Sends `form` in JSON, as a client connecting in plain HTTP does, identified by its IP.
     pub async fn plain_form_request<F: Serialize>(
         &self,
         ip_str: &str,
@@ -336,9 +352,35 @@ impl Server {
         path: &str,
         form: F,
     ) -> Response<Body> {
-        let req = self.form_request_builder(verb, path, form);
+        let body = serde_json::to_vec(&form).unwrap();
+        let req = self.body_request(verb, path, "application/json", body);
         self.raw_request_as(ip_str, None, req).await
     }
+}
+
+/// The media type of the newest version of the API, which the bodies of requests and responses of
+/// TLS sessions state in tests.
+pub fn content_type() -> String {
+    innernet_shared::media_type::content_type(innernet_shared::media_type::VERSION)
+}
+
+/// The body of `res`, a response to a TLS session, decoded from CBOR, which its content type must
+/// state, in the newest version of the API.
+pub async fn cbor_body<T: DeserializeOwned>(res: Response<Body>) -> Result<T, Error> {
+    assert_eq!(res.headers().get("Content-Type").unwrap(), &content_type());
+    let body = hyper::body::to_bytes(res.into_body()).await?;
+    Ok(cbor::from_slice(&body)?)
+}
+
+/// The body of `res`, a response to a plain-HTTP session, decoded from JSON, which its content type
+/// must state.
+pub async fn json_body<T: DeserializeOwned>(res: Response<Body>) -> Result<T, Error> {
+    assert_eq!(
+        res.headers().get("Content-Type").unwrap(),
+        "application/json"
+    );
+    let body = hyper::body::to_bytes(res.into_body()).await?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// The ID by which the API of plain-HTTP sessions names the CIDR `cidr`.

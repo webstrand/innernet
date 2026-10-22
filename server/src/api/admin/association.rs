@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 
 use crate::{
     db::DatabaseAssociation,
-    util::{form_body, json_response, status_response},
+    util::{form_body, form_response, status_response},
     ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
@@ -27,7 +27,7 @@ pub async fn routes(
     match (req.method(), &prefixes[..]) {
         (&Method::GET, []) => handlers::list(session).await,
         (&Method::POST, []) => {
-            let form = form_body(req).await?;
+            let form = form_body(req, &session).await?;
             handlers::create(form, session).await
         },
         (&Method::DELETE, [a, b]) => handlers::delete(a, b, session).await,
@@ -42,21 +42,21 @@ mod handlers {
         contents: Association,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
+        let store = session.context.db.lock();
 
-        DatabaseAssociation::create(&conn, contents.cidr_1, contents.cidr_2)?;
+        DatabaseAssociation::create(&store, contents.cidr_1, contents.cidr_2)?;
 
         status_response(StatusCode::CREATED)
     }
 
     pub async fn list(session: Session) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        let auths: Vec<_> = DatabaseAssociation::list(&conn)?
+        let store = session.context.db.lock();
+        let auths: Vec<_> = DatabaseAssociation::list(&store)?
             .iter()
             .map(DatabaseAssociation::contents)
             .collect();
 
-        json_response(auths)
+        form_response(&session, auths)
     }
 
     pub async fn delete(
@@ -64,8 +64,8 @@ mod handlers {
         b: &Prefix,
         session: Session,
     ) -> Result<Response<Body>, ServerError> {
-        let conn = session.context.db.lock();
-        DatabaseAssociation::delete(&conn, a, b)?;
+        let store = session.context.db.lock();
+        DatabaseAssociation::delete(&store, a, b)?;
 
         status_response(StatusCode::NO_CONTENT)
     }
