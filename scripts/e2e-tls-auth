@@ -21,18 +21,47 @@
 # server's config; the legacy API runs in plain HTTP over TCP, on the listen port. Clients that
 # predate TLS are played by wg(8) and curl(1) speaking plain HTTP, which is also what anything
 # else on a peer's machine can do from the peer's innernet IP. The server that predates TLS is
-# innernet-server 2.0.0, from the directory that E2E_ORIGIN_BIN names; without it, the steps that
-# need it are skipped. The probe connects without a client key, as curl presents none, pins the
-# server's key with --pinnedpubkey, and inspects the CBOR of the TLS API with Python's cbor2
-# module.
+# innernet-server 2.0.0, from the directory that E2E_ORIGIN_BIN names. When E2E_ORIGIN_BIN is
+# unset, the script builds it from the tag v2.0.0: the tag's tree is exported, without history,
+# to target/e2e-origin/v2.0.0/src, and built there into target/e2e-origin/v2.0.0/target, with
+# its crates in a CARGO_HOME of its own beside them, which the first build fetches and later
+# builds reuse offline. When E2E_ORIGIN_BIN is set but empty, or the build fails, the steps that
+# need the server that predates TLS are skipped. The probe connects without a client key, as curl
+# presents none, pins the server's key with --pinnedpubkey, and inspects the CBOR of the TLS API
+# with Python's cbor2 module.
 #
 # Requires: unshare, ip, wg, curl (with HTTP3), sqlite3, python3 (3.11+) with cbor2, and the
-# kernel WireGuard module.
+# kernel WireGuard module; to build innernet-server 2.0.0 the first time, network access.
 set -euo pipefail
+
+# Builds innernet-server from the tag `$1` into the target directory of the workspace `$2`, and
+# prints the directory that holds the binary. The build's own CARGO_HOME lets it run where the
+# user's is read-only.
+build_origin() { # <tag> <workspace>
+    local tag=$1 top=$2 origin offline=()
+    origin="${CARGO_TARGET_DIR:-$top/target}/e2e-origin/$tag"
+    if [ ! -e "$origin/src/Cargo.toml" ]; then
+        rm -rf "$origin/src" "$origin/src.tmp"
+        mkdir -p "$origin/src.tmp"
+        git -C "$top" archive "$tag" | tar -x -C "$origin/src.tmp"
+        mv "$origin/src.tmp" "$origin/src"
+    fi
+    [ -d "$origin/cargo-home/registry" ] && offline=(--offline)
+    CARGO_HOME="$origin/cargo-home" CARGO_TARGET_DIR="$origin/target" \
+        cargo build "${offline[@]}" --locked --release --bin innernet-server \
+        --manifest-path "$origin/src/Cargo.toml" >&2 || return 1
+    echo "$origin/target/release"
+}
 
 if [ -z "${E2E_INSIDE:-}" ]; then
     top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
     cargo build --offline --bins --manifest-path "$top/Cargo.toml" >&2
+    if [ -z "${E2E_ORIGIN_BIN+set}" ]; then
+        E2E_ORIGIN_BIN=$(build_origin v2.0.0 "$top") || {
+            echo "building innernet-server 2.0.0 failed" >&2
+            E2E_ORIGIN_BIN=
+        }
+    fi
     exec unshare --user --map-root-user --mount --net \
         env E2E_INSIDE=1 E2E_BIN="${CARGO_TARGET_DIR:-$top/target}/debug" \
         E2E_ORIGIN_BIN="${E2E_ORIGIN_BIN:-}" \
@@ -541,7 +570,7 @@ client old fetch e2e || fail "fetch as the upgraded old"
 pass "the upgraded old keeps fetching over TLS"
 
 if [ -z "$E2E_ORIGIN_BIN" ]; then
-    step "SKIPPED: a server that predates TLS (E2E_ORIGIN_BIN is unset)"
+    step "SKIPPED: a server that predates TLS (no innernet-server 2.0.0)"
     exit 0
 fi
 
