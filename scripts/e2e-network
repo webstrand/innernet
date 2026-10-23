@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# End-to-end test of a network's life cycle: an admin client that builds the network out, CIDRs
+# renamed from either side, invitations that expire, peers that redeem their invitations at once,
+# and traffic between peers of associated CIDRs, run unprivileged in network namespaces.
+#
+# Usage: scripts/e2e-network [--keep] [--userspace]
+#
+# Topology, inside a private user, mount and network namespace:
+#
+#   198.18.0.0/24 "internet" (bridge in the outer namespace)
+#     srv     198.18.0.1   innernet-server, which creates the CIDR humans and invites adm
+#     adm     198.18.0.2   admin in humans, listening on 51821, which creates the CIDR robots,
+#                          associates it with humans, and invites the other peers
+#     peer2   198.18.0.3   peer in robots
+#     peer4   198.18.0.4   peer in robots, which redeems its invitation at the same time as peer5
+#     peer5   198.18.0.5   peer in robots, which redeems its invitation at the same time as peer4
+#
+# The admin client also invites peer3, whose invitation expires unredeemed. Every client that
+# installs runs `innernet up --daemon`, which fetches every second. The clients other than adm
+# install without a listen port. The binaries are those of the workspace, built into
+# $CARGO_TARGET_DIR, or target/ if it is unset.
+#
+# With --userspace, the server and every client run the userspace backend, with neptun-cli as the
+# userspace implementation. Each namespace then has a directory of its own in place of
+# /run/wireguard, since every namespace names its interface e2e. The test runs in a PID namespace
+# of its own, so that no daemon that neptun-cli forks outlives it.
+#
+# Requires: unshare, ip, wg, ping, sqlite3, python3 (3.11+), and the kernel WireGuard module, or
+# with --userspace, neptun-cli and /dev/net/tun.
+set -euo pipefail
+
+if [ -z "${E2E_INSIDE:-}" ]; then
+    top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+    cargo build --offline --bins --manifest-path "$top/Cargo.toml" >&2
+    exec unshare --user --map-root-user --mount --net --pid --fork --mount-proc \
+        env E2E_INSIDE=1 E2E_BIN="${CARGO_TARGET_DIR:-$top/target}/debug" "$0" "$@"
+fi
+
+keep=0
+userspace=0
+for arg in "$@"; do
+    case $arg in
+        --keep) keep=1 ;;
+        --userspace) userspace=1 ;;
+        *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+backend=()
+if [ "$userspace" -eq 1 ]; then
+    command -v neptun-cli >/dev/null || { echo "neptun-cli not found" >&2; exit 2; }
+    [ -c /dev/net/tun ] || { echo "/dev/net/tun not found" >&2; exit 2; }
+    backend=(--backend userspace)
+    export WG_USERSPACE_IMPLEMENTATION=neptun-cli WG_SUDO=true
+fi
+
+mount -t tmpfs tmpfs /run
+mkdir /run/wireguard
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/innernet-e2e.XXXXXX")
+pids=()
+cleanup() {
+    local status=$?
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    if [ "$status" -ne 0 ]; then
+        echo "--- server log" >&2
+        tail -n 30 "$work/srv.log" >&2 || true
+    fi
+    if [ "$keep" -eq 1 ] || [ "$status" -ne 0 ]; then
+        echo "work directory kept: $work" >&2
+    else
+        rm -rf "$work"
+    fi
+}
+trap cleanup EXIT
+
+step() { printf '\n=== %s\n' "$*"; }
+pass() { printf 'ok: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+# Runs a command in a namespace. With --userspace, the command sees the namespace's own directory
+# as /run/wireguard, and neptun-cli logs to a file of the namespace's own. Each step execs the
+# next, so that the PID of a command in the background is the command's own.
+ns() {
+    local name=$1; shift
+    if [ "$userspace" -eq 1 ]; then
+        mkdir -p "$work/run/$name"
+        ip netns exec "$name" unshare --mount \
+            sh -c 'mount --bind "$0" /run/wireguard && exec "$@"' "$work/run/$name" \
+            env WG_LOG_FILE="$work/$name.neptun.log" "$@"
+    else
+        ip netns exec "$name" "$@"
+    fi
+}
+
+server() { ns srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" "$@"; }
+client() {
+    local peer=$1; shift
+    ns "$peer" env NO_COLOR=1 "$E2E_BIN/innernet" -c "$work/$peer/conf" -d "$work/$peer/data" \
+        "${backend[@]}" "$@" >"$work/$peer.log" 2>&1 || { cat "$work/$peer.log" >&2; return 1; }
+}
+
+# Waits until the coordinator of the server in the namespace `$1`, whose config is `$2`, listens
+# for its API, which the admin commands of innernet-server reach it at.
+await_coordinator() { # <namespace> <config>
+    local port
+    for _ in $(seq 50); do
+        port=$(python3 -I -c 'import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+print(c.get("coordinator", c).get("quic-port", ""))' "$2")
+        if [ -n "$port" ] && ip netns exec "$1" ss -Hlun "sport = :$port" | grep -q .; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "FAIL: the coordinator in $1 doesn't listen" >&2
+    exit 1
+}
+
+db() { sqlite3 "$work/srv/data/e2e.db" "$@"; }
+# Selects, in the server's database, the peer to which the server offers the name `$1`.
+offered() { echo "public_key = (SELECT public_key FROM offered_names WHERE name = '$1')"; }
+
+# Prints a field of an invitation or a config.
+field() { # <file> <table> <key>
+    python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))[sys.argv[2]][sys.argv[3]])' "$@"
+}
+
+# Prints the innernet IP of an installed peer.
+address_of() { # <peer>
+    local address
+    address=$(field "$work/$1/conf/e2e.conf" interface address)
+    echo "${address%/*}"
+}
+
+# Installs a peer from its invitation, as `innernet install` with the interface named after the
+# network.
+install() { # <peer> [install option...]
+    local peer=$1; shift
+    mkdir -p "$work/$peer"
+    client "$peer" install "$work/$peer.toml" --name e2e --delete-invite "$@"
+}
+
+# Runs the daemon of an installed peer in the background, which fetches every second. The daemon
+# is started directly, not through a function, so that the PID is the daemon's own.
+daemon() { # <peer>
+    ns "$1" "$E2E_BIN/innernet" -c "$work/$1/conf" -d "$work/$1/data" "${backend[@]}" \
+        up e2e --daemon --interval 1 >>"$work/$1.daemon.log" 2>&1 &
+    pids+=("$!")
+}
+
+# Prints the port on which the WireGuard interface of a namespace listens. With --userspace, the
+# port is read from the userspace implementation's UAPI socket, since an AppArmor profile of wg(8)
+# may refuse it the socket.
+listen_port() { # <namespace>
+    if [ "$userspace" -eq 1 ]; then
+        ns "$1" python3 -I -c 'import socket
+s = socket.socket(socket.AF_UNIX)
+s.connect("/run/wireguard/e2e.sock")
+s.sendall(b"get=1\n\n")
+reply = b""
+while not reply.endswith(b"\n\n"):
+    reply += s.recv(4096)
+print(dict(l.split("=", 1) for l in reply.decode().split("\n") if "=" in l).get("listen_port", ""))'
+    else
+        ns "$1" wg show e2e listen-port
+    fi
+}
+
+# Waits until a peer reaches an innernet IP, or fails.
+await_ping() { # <peer> <IP> <description>
+    for _ in $(seq 20); do
+        ns "$1" ping -c1 -W1 "$2" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    fail "$1 can't reach $3 at $2"
+}
+
+# Prints the names of the CIDRs that adm lists, from what its daemon last fetched.
+listed_cidrs() {
+    client adm list-cidrs e2e || fail "list-cidrs as adm"
+    awk '{ print $2 }' "$work/adm.log" | sort | tr '\n' ' '
+}
+# Waits until adm lists the CIDRs named `$1`, or fails.
+await_cidrs() { # <names, sorted, each followed by a space> <description>
+    for _ in $(seq 20); do
+        [ "$(listed_cidrs)" = "$1" ] && return 0
+        sleep 0.5
+    done
+    fail "adm doesn't list $2: $(listed_cidrs)"
+}
+
+step "network"
+ip link set lo up
+ip link add br0 type bridge
+ip link set br0 up
+address=1
+for name in srv adm peer2 peer4 peer5; do
+    ip netns add "$name"
+    ns "$name" ip link set lo up
+    ip link add "v-$name" type veth peer name eth0 netns "$name"
+    ip link set "v-$name" master br0 up
+    ns "$name" ip addr add "198.18.0.$address/24" dev eth0
+    ns "$name" ip link set eth0 up
+    address=$((address + 1))
+done
+
+step "the server creates the network, the CIDR humans, and an admin invitation"
+mkdir -p "$work/srv"
+server new --network-name e2e --network-cidr 10.66.0.0/16 \
+    --external-endpoint 198.18.0.1:51820 --listen-port 51820 >/dev/null
+# The admin commands of innernet-server go through the running server's coordinator.
+ns srv "$E2E_BIN/innernet-server" -c "$work/srv/conf" -d "$work/srv/data" \
+    serve e2e "${backend[@]}" >>"$work/srv.log" 2>&1 &
+pids+=("$!")
+await_coordinator srv "$work/srv/conf/e2e.conf"
+server add-cidr e2e --name humans --cidr 10.66.1.0/24 --parent e2e --yes >/dev/null 2>&1 ||
+    fail "add-cidr humans on the server"
+server add-peer e2e --name adm --cidr humans --admin true --auto-ip \
+    --invite-expires 30d --save-config "$work/adm.toml" --yes >/dev/null ||
+    fail "add-peer adm on the server"
+server_ip=$(field "$work/adm.toml" server internal-endpoint)
+server_ip=${server_ip%:*}
+pass "the server invites adm"
+
+step "adm installs with the listen port that it requests"
+install adm --listen-port 51821 || fail "install adm"
+[ ! -e "$work/adm.toml" ] || fail "install didn't delete adm's invitation"
+pass "adm installs, and the install deletes its invitation"
+client adm show e2e || fail "show as adm"
+grep -Fq "listening port: 51821" "$work/adm.log" ||
+    fail "show doesn't list the listen port that adm requested: $(cat "$work/adm.log")"
+[ "$(listen_port adm)" = 51821 ] ||
+    fail "adm's interface doesn't listen on 51821: $(listen_port adm)"
+pass "adm's interface listens on the port that the install requested, which show lists"
+daemon adm
+adm_ip=$(address_of adm)
+
+step "adm creates the CIDR robots, associates it with humans, and invites peer2 into it"
+client adm add-cidr e2e --name robots --cidr 10.66.2.0/24 --parent e2e --yes ||
+    fail "add-cidr robots as adm"
+client adm add-association e2e humans robots --yes || fail "add-association as adm"
+client adm list-associations e2e || fail "list-associations as adm"
+grep -q "humans <=> robots" "$work/adm.log" || fail "adm doesn't list the association"
+pass "adm creates robots and associates it with humans"
+client adm add-peer e2e --name peer2 --cidr robots --admin false --auto-ip \
+    --invite-expires 30s --save-config "$work/peer2.toml" --yes || fail "add-peer peer2 as adm"
+install peer2 || fail "install peer2"
+daemon peer2
+peer2_ip=$(address_of peer2)
+case $peer2_ip in 10.66.2.*) ;; *) fail "peer2's address isn't in robots: $peer2_ip" ;; esac
+pass "peer2 installs in robots, at $peer2_ip"
+await_ping peer2 "$server_ip" "the server"
+await_ping peer2 "$adm_ip" "adm, in the associated CIDR humans"
+await_ping adm "$peer2_ip" "peer2"
+pass "peer2 reaches the server and adm, and adm reaches peer2"
+
+step "adm and the server rename a CIDR"
+client adm rename-cidr e2e --name robots --new-name coolbeans --yes || fail "rename-cidr as adm"
+await_cidrs "coolbeans e2e humans innernet-server " "the CIDR that it renamed"
+pass "adm renames robots to coolbeans, and lists it"
+server rename-cidr e2e --name coolbeans --new-name robots --yes >/dev/null ||
+    fail "rename-cidr on the server"
+await_cidrs "e2e humans innernet-server robots " "the CIDR that the server renamed"
+pass "the server renames coolbeans back to robots, which adm lists"
+
+step "the server deletes an expired invitation, and frees its name and address"
+client adm add-peer e2e --name peer3 --cidr robots --admin false --ip 10.66.2.100 \
+    --invite-expires 5s --save-config "$work/peer3.toml" --yes || fail "add-peer peer3 as adm"
+if client adm add-peer e2e --name peer3 --cidr robots --admin false --auto-ip \
+    --invite-expires 30m --save-config "$work/peer3.again.toml" --yes 2>/dev/null; then
+    fail "adm invited a second peer3 while the first invitation was pending"
+fi
+grep -qF "refused the request (400)" "$work/adm.log" ||
+    fail "the server didn't refuse peer3's name as a bad request: $(cat "$work/adm.log")"
+if client adm add-peer e2e --name peer3b --cidr robots --admin false --ip 10.66.2.100 \
+    --invite-expires 30m --save-config "$work/peer3b.toml" --yes 2>/dev/null; then
+    fail "adm invited peer3b at peer3's address while peer3's invitation was pending"
+fi
+grep -qF "which is delegated to peer peer3" "$work/adm.log" ||
+    fail "the server didn't refuse peer3's address as delegated to peer3: $(cat "$work/adm.log")"
+pass "the name and the address of peer3 are taken while its invitation is pending"
+for _ in $(seq 30); do
+    [ "$(db "SELECT count(*) FROM peers WHERE $(offered peer3)")" = 0 ] && break
+    sleep 0.5
+done
+[ "$(db "SELECT count(*) FROM peers WHERE $(offered peer3)")" = 0 ] ||
+    fail "the server didn't delete peer3's expired invitation"
+pass "the server deletes peer3's invitation once it expires"
+client adm add-peer e2e --name peer3 --cidr robots --admin false --ip 10.66.2.100 \
+    --invite-expires 30m --save-config "$work/peer3.again.toml" --yes ||
+    fail "adm can't invite peer3 again at the same address"
+pass "adm invites peer3 again, with the same name and address"
+
+step "two peers redeem their invitations at the same time"
+for peer in peer4 peer5; do
+    client adm add-peer e2e --name "$peer" --cidr robots --admin false --auto-ip \
+        --invite-expires 30s --save-config "$work/$peer.toml" --yes || fail "add-peer $peer as adm"
+done
+install peer4 &
+peer4_install=$!
+install peer5 &
+peer5_install=$!
+wait "$peer4_install" || fail "install peer4"
+wait "$peer5_install" || fail "install peer5"
+for peer in peer4 peer5; do
+    [ "$(db "SELECT is_redeemed FROM peers WHERE $(offered "$peer")")" = 1 ] ||
+        fail "the server doesn't hold $peer's invitation as redeemed"
+done
+pass "peer4 and peer5 install at the same time, and the server holds both as redeemed"
+peer4_ip=$(address_of peer4)
+peer5_ip=$(address_of peer5)
+[ "$peer4_ip" != "$peer5_ip" ] || fail "peer4 and peer5 share the address $peer4_ip"
+for peer in peer4 peer5; do daemon "$peer"; done
+await_ping peer4 "$peer5_ip" "peer5"
+await_ping peer5 "$peer4_ip" "peer4"
+await_ping peer4 "$adm_ip" "adm"
+await_ping peer2 "$peer4_ip" "peer4"
+pass "peer4 and peer5 reach each other, adm, and peer2"
+await_ping peer2 "$server_ip" "the server"
+await_ping peer2 "$adm_ip" "adm"
+pass "peer2 still reaches the server and adm"

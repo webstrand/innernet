@@ -357,18 +357,13 @@ The resulting binary will be located at `./target/release/innernet`
 
 ### Testing
 
-You can manually invoke Docker-based tests assuming you have Docker daemon running. If you specify
-`--interactive` flag, it allows you to attach to the server and client innernet Docker
-containers, so you can test various innernet commands inside a sandboxed environment.
+The scripts `scripts/e2e-network`, `scripts/e2e-tls-auth`, `scripts/e2e-announcements` and `scripts/e2e-dns` run end-to-end tests unprivileged, in network namespaces. `e2e-network` covers a network's life cycle: an admin client that builds the network out, CIDRs renamed from either side, invitations that expire, peers that redeem their invitations at once, and traffic between peers of associated CIDRs. The scripts need user namespaces and the kernel WireGuard module; `e2e-dns` also needs dnsmasq and dig. Each builds the workspace's binaries, and `--keep` keeps its work directory, with the configs, data stores and logs.
 
 ```
-docker-tests/build-docker-images.sh
-docker-tests/run-docker-tests.sh [--interactive]
+scripts/e2e-network [--keep]
 ```
 
-If you are developing a new feature, please consider adding a new test case to `run-docker-tests.sh` ([example PR](https://github.com/tonarino/innernet/pull/310/files#diff-5d47ea0d379e45f35471e2afa48fdba09d2ca4bcf090e16bb1adccebea080081)).
-
-The scripts `scripts/e2e-tls-auth`, `scripts/e2e-announcements` and `scripts/e2e-dns` run end-to-end tests unprivileged, in network namespaces. They need user namespaces and the kernel WireGuard module; `e2e-dns` also needs dnsmasq and dig.
+A new feature should come with a test case in one of these scripts.
 
 ### Releases
 
