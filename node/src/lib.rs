@@ -13,7 +13,8 @@
 //!   which the adapters of [`realize`] realize, the tunnel and the DNS server of [`dns`].
 //! - [`own`] makes and signs the node's own announcement.
 //! - [`runtime`] runs the rounds of a node through its link to the coordinator, on the events of
-//!   [`addresses`] and [`events`], with the NAT traversal of [`nat`].
+//!   [`addresses`] and [`events`], with the NAT traversal of [`nat`], which [`retry`] reattempts
+//!   for each peer that the node hasn't connected to.
 
 pub mod accept;
 pub mod addresses;
@@ -24,6 +25,7 @@ pub mod events;
 pub mod nat;
 pub mod own;
 pub mod realize;
+pub mod retry;
 pub mod runtime;
 pub mod snapshot;
 pub mod store;

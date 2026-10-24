@@ -20,8 +20,9 @@ use innernet_shared::{
     wg, Endpoint, EndpointContents, IoErrorContext, PeerChange, PeerContents, Prefix,
     RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
-use std::{io, path::Path};
+use std::{io, path::Path, time::Duration};
 use thiserror::Error;
+use tokio::time::Instant;
 use wireguard_control::{Backend, Device, DeviceUpdate};
 
 #[derive(Debug, Error)]
@@ -356,6 +357,7 @@ pub async fn fetch(
         config: &config,
         interface,
         state: None,
+        received: Instant::now(),
         claim_types: None,
     };
     let round = node.round(&mut link).await?;
@@ -364,7 +366,12 @@ pub async fn fetch(
     for realized in &round.realized {
         print_peer_diff(&peers, realized);
     }
-    if !round.realized.is_empty() || !interface_up {
+    if round
+        .realized
+        .iter()
+        .any(|realized| !realized.is_reattempt())
+        || !interface_up
+    {
         println!();
         log::info!("updated interface {}\n", interface.as_str_lossy().yellow());
     } else {
@@ -392,13 +399,17 @@ struct RemoteLink<'a> {
     /// The state that the coordinator reported in the last round, or `None` if the client could not
     /// reach the coordinator and goes on with what its data store holds.
     state: Option<State>,
+    /// When the client received `state`.
+    received: Instant,
     claim_types: Option<Vec<String>>,
 }
 
 impl Link for RemoteLink<'_> {
     async fn sync(&mut self) -> Result<(), Error> {
         let interface = self.interface;
-        self.state = match self.rest_client.get_state().await {
+        let state = self.rest_client.get_state().await;
+        self.received = Instant::now();
+        self.state = match state {
             Ok(state) => Some(state),
             Err(e) if e.is_transport_error() => {
                 if self.store.peers()?.is_empty() {
@@ -477,6 +488,13 @@ impl Link for RemoteLink<'_> {
 
     fn observed_endpoint(&self) -> Option<Endpoint> {
         self.state.as_ref()?.observed_endpoint.clone()
+    }
+
+    /// The server reports how long before it answered it last completed each handshake, which
+    /// is taken to be how long before the client received the state.
+    fn coordinator_handshake(&self, public_key: &str) -> Option<Instant> {
+        let age = *self.state.as_ref()?.handshake_ages.get(public_key)?;
+        self.received.checked_sub(Duration::from_secs(age))
     }
 
     /// The server relays this client's own announcement back in the state.
@@ -564,14 +582,8 @@ fn print_peer_diff(peers: &[PeerContents], diff: &Realized) {
     }
     .unwrap_or("[unknown]");
 
-    if change_action == ChangeAction::Modified
-        && diff
-            .changes
-            .iter()
-            .all(|c| *c == PeerChange::NatTraverseReattempt)
-    {
-        // If this peer was "modified" but the only change is a NAT Traversal Reattempt,
-        // don't bother printing this peer.
+    // A peer of which nothing changed but that its NAT traversal is reattempted isn't printed.
+    if diff.is_reattempt() {
         return;
     }
 

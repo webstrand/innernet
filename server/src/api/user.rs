@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    api::{inject_endpoints, observed_endpoint},
+    api::{handshake_ages, inject_endpoints, observed_endpoint},
     db::{DatabaseCidr, DatabasePeer},
     util::{form_body, form_response, status_response},
     ServerError, Session,
@@ -92,6 +92,7 @@ mod handlers {
         let mut peers = selected_peer.get_all_allowed_peers(&store, &session.context.public_key)?;
         inject_endpoints(&session, peers.iter_mut().map(|peer| &mut peer.inner));
         if session.over_tls {
+            let handshake_ages = handshake_ages(&session, peers.iter().map(|peer| &peer.inner));
             form_response(
                 &session,
                 State {
@@ -117,6 +118,7 @@ mod handlers {
                         .collect(),
                     cidrs: cidrs.iter().map(DatabaseCidr::contents).collect(),
                     observed_endpoint: observed_endpoint(&session, &selected_peer.public_key),
+                    handshake_ages,
                     invalid_peer_keys: vec![],
                 },
             )
@@ -1130,6 +1132,13 @@ mod tests {
             state.observed_endpoint,
             Some(test::DEVELOPER1_PEER_ENDPOINT.parse().unwrap())
         );
+        // Every peer is told how long ago the server's tunnel last completed a handshake with
+        // each peer, of those with which it completed one.
+        assert_eq!(
+            state.handshake_ages.keys().collect::<Vec<_>>(),
+            [&public_key]
+        );
+        assert!((60..120).contains(&state.handshake_ages[&public_key]));
 
         // A client that predates TLS can't check the announcement, so it gets the peer as the
         // announcement makes it, at its primary IP.

@@ -21,6 +21,7 @@ use ipnet::IpNet;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
+    time::SystemTime,
 };
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, PeerConfigBuilder};
 
@@ -48,6 +49,21 @@ pub struct Realized {
     /// The peer as the tunnel now holds it, or `None` if it was removed.
     pub new: Option<PeerContents>,
     pub changes: Vec<PeerChange>,
+    /// When the tunnel last completed a handshake with the peer, if it held the peer and has.
+    pub last_handshake: Option<SystemTime>,
+}
+
+impl Realized {
+    /// Whether the tunnel changed nothing of the peer, which it held, but reattempts its NAT
+    /// traversal, since it hasn't connected to the peer.
+    pub fn is_reattempt(&self) -> bool {
+        self.existed
+            && self.new.is_some()
+            && self
+                .changes
+                .iter()
+                .all(|change| *change == PeerChange::NatTraverseReattempt)
+    }
 }
 
 /// The tunnel of a node, which holds the peers of a snapshot.
@@ -111,6 +127,9 @@ impl TunnelBackend for WireGuard {
                 existed: diff.old.is_some(),
                 new: diff.new.cloned(),
                 changes: diff.changes().to_vec(),
+                last_handshake: device
+                    .get_peer(&diff.public_key().to_base64())
+                    .and_then(|peer| peer.stats.last_handshake_time),
             })
             .collect();
         let updates: Vec<PeerConfigBuilder> =

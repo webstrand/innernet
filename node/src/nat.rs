@@ -83,6 +83,11 @@ impl NatTraverse {
         self.remaining.len()
     }
 
+    /// Stops traversing to each peer for which `keep` doesn't hold.
+    pub fn retain(&mut self, keep: impl FnMut(&PeerContents) -> bool) {
+        self.remaining.retain(keep);
+    }
+
     /// Refreshes the current state of candidate traversal attempts, filtering out
     /// the peers that have been exhausted of all endpoint options.
     pub fn refresh_remaining(&mut self) -> Result<(), Error> {

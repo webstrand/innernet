@@ -16,6 +16,7 @@ use crate::{
     nat::{NatTraverse, STEP_INTERVAL},
     own,
     realize::{DnsService, Realized, TunnelBackend},
+    retry::{Retries, Sighting},
     snapshot::{Own, Snapshot, SnapshotConfig},
 };
 use anyhow::{Context as _, Error};
@@ -25,7 +26,13 @@ use innernet_shared::{
     interface_config::{DnsInfo, InterfaceInfo},
     peer_hostname, Endpoint, NatOpts, PeerContents, Prefix,
 };
-use std::{future::pending, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::pending,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::{sync::Notify, time::Instant};
 use wireguard_control::{InterfaceName, Key};
 
@@ -71,6 +78,12 @@ pub trait Link {
     /// The endpoint at which the coordinator observes the node, if any.
     fn observed_endpoint(&self) -> Option<Endpoint>;
 
+    /// When the coordinator last completed a handshake with the peer with `public_key`, as it
+    /// reported it, if it did.
+    fn coordinator_handshake(&self, _public_key: &str) -> Option<Instant> {
+        None
+    }
+
     /// The node's own last announcement, as the coordinator holds it.
     fn current_announcement(&self) -> Option<Announcement>;
 
@@ -105,6 +118,8 @@ pub struct Round {
     pub realized: Vec<Realized>,
     /// The NAT traversal of the peers that the round changed, unless NAT traversal is off.
     pub nat: Option<NatTraverse>,
+    /// When each source last saw each peer that the round changed, by public key.
+    pub sightings: HashMap<String, Sighting>,
     /// What the tunnel observes from the round on.
     pub events: TunnelEvents,
 }
@@ -145,10 +160,20 @@ impl Node {
             true => None,
             false => self.tunnel.traverse(&realized)?,
         };
+        let mut sightings = HashMap::new();
+        for peer in &realized {
+            let sighting = Sighting {
+                coordinator: link.coordinator_handshake(&peer.public_key),
+                announced: link.last_announced(&peer.public_key)?,
+                handshake: peer.last_handshake,
+            };
+            sightings.insert(peer.public_key.clone(), sighting);
+        }
         Ok(Round {
             snapshot,
             realized,
             nat,
+            sightings,
             events,
         })
     }
@@ -297,19 +322,37 @@ async fn sleep_until(deadline: Option<Instant>) {
 
 /// Runs the rounds that `round` makes, the first at once and then whenever `triggers` fire, and
 /// the steps of the NAT traversal that each starts, each [`STEP_INTERVAL`] after the last, until
-/// the peers connect or run out of candidates. A handshake that the tunnel reports ends the
-/// traversal of its peer at once. A round's traversal replaces the one under way. A round that
-/// fails is logged, and the node keeps what it configured last.
+/// the peers connect or run out of candidates. A peer that a round only reattempts is traversed
+/// when [`Retries`] finds a reattempt due. A handshake that the tunnel reports ends the traversal
+/// of its peer at once. A round's traversal replaces the one under way. A round that fails is
+/// logged, and the node keeps what it configured last.
 pub async fn run(mut triggers: Triggers, mut round: impl AsyncFnMut() -> Result<Round, Error>) {
     let mut nat: Option<(NatTraverse, Instant)> = None;
     let mut events = TunnelEvents::none();
+    let mut retries = Retries::new(Instant::now());
     loop {
         let started = Instant::now();
         match round().await {
             Ok(round) => {
                 events = round.events;
-                nat = round
-                    .nat
+                let mut traverse = round.nat;
+                if let Some(traverse) = &mut traverse {
+                    retry(
+                        traverse,
+                        &round.realized,
+                        &round.sightings,
+                        &mut retries,
+                        started,
+                    );
+                }
+                retries.retain(|public_key| {
+                    round
+                        .snapshot
+                        .peers
+                        .iter()
+                        .any(|peer| peer.public_key == public_key)
+                });
+                nat = traverse
                     .filter(|traverse| !traverse.is_finished())
                     .map(|traverse| (traverse, started + STEP_INTERVAL));
             },
@@ -344,6 +387,28 @@ pub async fn run(mut triggers: Triggers, mut round: impl AsyncFnMut() -> Result<
             }
         }
     }
+}
+
+/// Keeps in `traverse` each peer of `realized` that `retries` attempts at `now`, as `sightings`
+/// saw it: every peer that changed, and each that is only reattempted once a reattempt is due.
+fn retry(
+    traverse: &mut NatTraverse,
+    realized: &[Realized],
+    sightings: &HashMap<String, Sighting>,
+    retries: &mut Retries,
+    now: Instant,
+) {
+    let wall = SystemTime::now();
+    traverse.retain(|peer| {
+        let Some(realized) = realized.iter().find(|r| r.public_key == peer.public_key) else {
+            return true;
+        };
+        let Some(record) = &realized.new else {
+            return true;
+        };
+        let sighting = sightings.get(&peer.public_key).copied().unwrap_or_default();
+        retries.attempt(record, &sighting, realized.is_reattempt(), now, wall)
+    });
 }
 
 /// Takes the steps of `round`'s NAT traversal, each [`STEP_INTERVAL`] after the last, until the
@@ -408,6 +473,7 @@ mod tests {
                 snapshot: Snapshot::default(),
                 realized: vec![],
                 nat: None,
+                sightings: HashMap::new(),
                 events: TunnelEvents::none(),
             })
         });

@@ -1051,6 +1051,7 @@ mod tests {
             peers: vec![peer],
             cidrs: vec![],
             observed_endpoint: Some("203.0.113.9:4000".parse().unwrap()),
+            handshake_ages: Default::default(),
             invalid_peer_keys: vec![],
         };
         let read: crate::State = cbor::from_slice(&cbor::to_vec(&state).unwrap()).unwrap();

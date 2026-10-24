@@ -25,6 +25,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use wireguard_control::{InterfaceName, Key};
 
@@ -41,7 +42,7 @@ mod test;
 mod util;
 
 pub use config::{ConfigFile, V2Layout};
-pub(crate) use coordinator::{hyper_service, ConnectionMode, Db, Endpoints};
+pub(crate) use coordinator::{hyper_service, ConnectionMode, Db, Endpoints, Handshakes};
 pub use coordinator::{Context, Session};
 pub use error::ServerError;
 
@@ -273,7 +274,7 @@ pub async fn serve(
         endpoint_overrides: BTreeMap::new(),
         events: EventSource::default(),
     };
-    let endpoints = follow_endpoints(tunnel.events());
+    let (endpoints, handshakes) = follow_tunnel(tunnel.events());
     // QUIC never completes a handshake over an interface whose MTU can't carry its datagrams.
     tunnel
         .capabilities()
@@ -336,7 +337,11 @@ pub async fn serve(
         &config.interface.private_key,
         db,
         sockets,
-        Hooks { changed, endpoints },
+        Hooks {
+            changed,
+            endpoints,
+            handshakes,
+        },
     )?;
     tokio::select! {
         () = node_loop => unreachable!("the node's loop runs forever"),
@@ -344,24 +349,32 @@ pub async fn serve(
     }
 }
 
-/// The endpoints at which the tunnel observes the peers, as `events` report them.
-fn follow_endpoints(mut events: TunnelEvents) -> Endpoints {
+/// The endpoints at which the tunnel observes the peers, and when it last completed a handshake
+/// with each, as `events` report them. A handshake is taken to complete when it is reported, which
+/// lags it by no more than an interval of the poller.
+fn follow_tunnel(mut events: TunnelEvents) -> (Endpoints, Handshakes) {
     let endpoints: Endpoints = Arc::default();
+    let handshakes: Handshakes = Arc::default();
     tokio::spawn({
-        let endpoints = endpoints.clone();
+        let (endpoints, handshakes) = (endpoints.clone(), handshakes.clone());
         async move {
             while let Some(event) = events.next().await {
-                if let TunnelEvent::EndpointChanged {
-                    public_key,
-                    endpoint,
-                } = event
-                {
-                    endpoints.write().insert(public_key, endpoint);
+                match event {
+                    TunnelEvent::EndpointChanged {
+                        public_key,
+                        endpoint,
+                    } => {
+                        endpoints.write().insert(public_key, endpoint);
+                    },
+                    TunnelEvent::HandshakeCompleted { public_key } => {
+                        handshakes.write().insert(public_key, Instant::now());
+                    },
+                    TunnelEvent::PeerSilent { .. } => {},
                 }
             }
         }
     });
-    endpoints
+    (endpoints, handshakes)
 }
 
 /// `config` with the keys of `[coordinator]` that the server needs to start, and the keys that it

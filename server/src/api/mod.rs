@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use crate::Session;
 use innernet_shared::{Endpoint, PeerContents};
@@ -11,6 +11,22 @@ pub mod user;
 pub fn observed_endpoint(session: &Session, public_key: &str) -> Option<Endpoint> {
     let endpoints = session.context.endpoints.read();
     endpoints.get(public_key).map(|e| e.to_owned().into())
+}
+
+/// The whole seconds since the tunnel last completed a handshake with each of `peers` with which
+/// it has completed one, by public key.
+pub fn handshake_ages<'a>(
+    session: &Session,
+    peers: impl IntoIterator<Item = &'a PeerContents>,
+) -> BTreeMap<String, u64> {
+    let handshakes = session.context.handshakes.read();
+    peers
+        .into_iter()
+        .filter_map(|peer| {
+            let at = handshakes.get(&peer.public_key)?;
+            Some((peer.public_key.clone(), at.elapsed().as_secs()))
+        })
+        .collect()
 }
 
 /// Implements NAT traversal strategies, with the endpoint at which WireGuard last saw each peer.

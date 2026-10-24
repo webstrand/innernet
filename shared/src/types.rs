@@ -10,6 +10,7 @@ use clap::{
 use ipnet::{IpNet, PrefixLenError};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
+    collections::BTreeMap,
     fmt::{self, Display, Formatter},
     io,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
@@ -1320,6 +1321,13 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_endpoint: Option<Endpoint>,
 
+    /// The seconds since the server's tunnel last completed a handshake with each peer of the
+    /// state, by public key, as of when the server answered, so that the clocks of the server and
+    /// the client need not agree. A peer with which the server has completed no handshake since it
+    /// started is absent, as is every peer from a server that predates the field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub handshake_ages: BTreeMap<String, u64>,
+
     /// The public keys of the peers that failed to deserialize, which the server nonetheless
     /// reported. It is never sent.
     #[serde(skip)]
@@ -1336,18 +1344,22 @@ impl<'de> Deserialize<'de> for State {
             cidrs: Vec<Cidr>,
             #[serde(default)]
             observed_endpoint: Option<Endpoint>,
+            #[serde(default)]
+            handshake_ages: BTreeMap<String, u64>,
         }
 
         let Fields {
             peers,
             cidrs,
             observed_endpoint,
+            handshake_ages,
         } = Fields::deserialize(deserializer)?;
         let (peers, invalid_peer_keys) = split_valid_peers(peers);
         Ok(Self {
             peers,
             cidrs,
             observed_endpoint,
+            handshake_ages,
             invalid_peer_keys,
         })
     }
@@ -1405,6 +1417,7 @@ impl From<LegacyState> for State {
                 .collect(),
             cidrs,
             observed_endpoint: None,
+            handshake_ages: BTreeMap::new(),
             invalid_peer_keys: state.invalid_peer_keys,
         }
     }

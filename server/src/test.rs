@@ -2,7 +2,7 @@
 use crate::{
     db::{DatabaseCidr, DatabasePeer},
     initialize::{init_wizard, InitializeOpts},
-    ConnectionMode, Context, Db, Endpoints, ServerConfig,
+    ConnectionMode, Context, Db, Endpoints, Handshakes, ServerConfig,
 };
 use anyhow::anyhow;
 use bytes::Buf;
@@ -21,6 +21,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, LazyLock},
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use wireguard_control::{InterfaceName, Key, KeyPair};
@@ -125,6 +126,7 @@ pub fn peer(store: &Store, id: i64) -> DatabasePeer {
 pub struct Server {
     pub db: Db,
     endpoints: Endpoints,
+    handshakes: Handshakes,
     interface: InterfaceName,
     conf: ServerConfig,
     public_key: Key,
@@ -193,7 +195,7 @@ impl Server {
 
         let endpoints = [
             (
-                developer_1_public_key,
+                developer_1_public_key.clone(),
                 DEVELOPER1_PEER_ENDPOINT.parse().unwrap(),
             ),
             (
@@ -202,11 +204,19 @@ impl Server {
             ),
         ];
         let endpoints = Arc::new(RwLock::new(endpoints.into()));
+        // The tunnel completed a handshake with the first developer a minute ago, and none with
+        // any other peer.
+        let handshakes = [(
+            developer_1_public_key,
+            Instant::now() - Duration::from_secs(60),
+        )];
+        let handshakes = Arc::new(RwLock::new(handshakes.into()));
 
         Ok(Self {
             conf,
             db,
             endpoints,
+            handshakes,
             interface,
             public_key,
             internal_address: config.address(),
@@ -272,6 +282,7 @@ impl Server {
             db: self.db.clone(),
             interface: self.interface,
             endpoints: self.endpoints.clone(),
+            handshakes: self.handshakes.clone(),
             public_key: self.public_key.clone(),
             internal_address: self.internal_address,
             quic_port: 54322,

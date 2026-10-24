@@ -1893,6 +1893,7 @@ mod tests {
             peers: vec![peer.clone()],
             cidrs: vec![users_cidr()],
             observed_endpoint: None,
+            handshake_ages: Default::default(),
             invalid_peer_keys: vec![],
         };
         let server_key = KeyPair::generate();
@@ -1926,6 +1927,7 @@ mod tests {
             peers: vec![peer.clone()],
             cidrs: vec![],
             observed_endpoint: None,
+            handshake_ages: Default::default(),
             invalid_peer_keys: vec![],
         };
         let server_key = KeyPair::generate();

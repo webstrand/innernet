@@ -1013,6 +1013,7 @@ mod tests {
                     peers: BASE_PEERS.to_owned(),
                     cidrs: BASE_CIDRS.to_owned(),
                     observed_endpoint: None,
+                    handshake_ages: Default::default(),
                     invalid_peer_keys: vec![],
                 },
                 Relay::Synthesized,
@@ -1375,6 +1376,7 @@ mod tests {
             peers: peers.to_vec(),
             cidrs: vec![],
             observed_endpoint: None,
+            handshake_ages: Default::default(),
             invalid_peer_keys: vec![],
         };
         let state: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -1600,6 +1602,7 @@ mod tests {
                     peers: varied_peers(),
                     cidrs,
                     observed_endpoint: None,
+                    handshake_ages: Default::default(),
                     invalid_peer_keys: vec![],
                 },
                 Relay::Synthesized,
@@ -1791,6 +1794,7 @@ mod tests {
                             peers,
                             cidrs: BASE_CIDRS.clone(),
                             observed_endpoint: None,
+                            handshake_ages: Default::default(),
                             invalid_peer_keys: vec![],
                         };
                         assert!(store.update(&state, Relay::Synthesized).unwrap().is_empty());
@@ -2020,6 +2024,7 @@ mod tests {
                 peers: reported(Some(sign(&renamed))),
                 cidrs: vec![],
                 observed_endpoint: None,
+                handshake_ages: Default::default(),
                 invalid_peer_keys: vec![],
             };
             let relay = match types {

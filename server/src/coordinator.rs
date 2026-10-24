@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use subtle::ConstantTimeEq;
 use tokio::{net::TcpStream, sync::Notify, task::JoinHandle};
@@ -50,6 +50,8 @@ pub struct Hooks {
     pub changed: StoreChanged,
     /// Where the tunnel of the node observes the peers.
     pub endpoints: Endpoints,
+    /// When the tunnel of the node last completed a handshake with each peer.
+    pub handshakes: Handshakes,
 }
 
 pub struct Coordinator {
@@ -71,6 +73,7 @@ impl Coordinator {
         let context = Context {
             db: db.clone(),
             endpoints: hooks.endpoints,
+            handshakes: hooks.handshakes,
             interface: config.network_name,
             public_key,
             internal_address: config.address,
@@ -168,11 +171,17 @@ pub type Db = Arc<Mutex<Store>>;
 /// The endpoints at which the tunnel of the coordinator's node observes the peers, by public key.
 pub type Endpoints = Arc<RwLock<HashMap<String, SocketAddr>>>;
 
+/// When the tunnel of the coordinator's node last completed a handshake with each peer, by public
+/// key, of the handshakes that it completed since the coordinator started.
+pub type Handshakes = Arc<RwLock<HashMap<String, Instant>>>;
+
 #[derive(Clone)]
 pub struct Context {
     pub db: Db,
     /// The endpoints at which the tunnel of the coordinator's node observes the peers.
     pub endpoints: Endpoints,
+    /// When the tunnel of the coordinator's node last completed a handshake with each peer.
+    pub handshakes: Handshakes,
     /// The name of the network.
     pub interface: InterfaceName,
     pub public_key: Key,
