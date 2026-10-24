@@ -15,7 +15,7 @@ name = "innernet-client-core"
 publish = true
 readme = "../README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "3.0.0"
+version = "3.0.1"
 
 [dependencies]
 anyhow = "1"
@@ -32,7 +32,7 @@ hyper = { version = "0.14", default-features = false, features = [
 ] }
 indoc = "2.0.1"
 innernet-node = { version = "3.0.0", path = "../node" }
-innernet-shared = { version = "3.0.0", path = "../shared" }
+innernet-shared = { version = "3.0.1", path = "../shared" }
 ipnet = "2.4"
 log = "0.4"
 quinn = { version = "0.11.12", default-features = false, features = [

@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "innernet"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "innernet-client-core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -939,7 +939,7 @@ version = "2.0.0"
 
 [[package]]
 name = "innernet-server"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "innernet-shared"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "atty",

@@ -14,7 +14,7 @@ name = "innernet-shared"
 publish = true
 readme = "../README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "3.0.0"
+version = "3.0.1"
 
 [dependencies]
 anyhow = "1"
