@@ -9,7 +9,7 @@ name = "wireguard-control"
 publish = true
 readme = "README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "2.0.0"
+version = "3.0.0"
 
 [dependencies]
 base64 = "0.13.1"
@@ -24,7 +24,7 @@ netlink-packet-core.workspace = true
 netlink-packet-generic.workspace = true
 netlink-packet-route.workspace = true
 netlink-packet-wireguard.workspace = true
-netlink-request = { version = "2.0.0", path = "../netlink-request" }
+netlink-request = { version = "3.0.0", path = "../netlink-request" }
 netlink-sys.workspace = true
 
 [target.'cfg(target_os = "openbsd")'.dependencies]

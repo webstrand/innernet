@@ -9,7 +9,7 @@ name = "netlink-request"
 publish = true
 readme = "README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "2.0.0"
+version = "3.0.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core.workspace = true

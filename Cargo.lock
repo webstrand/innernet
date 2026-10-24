@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "innernet"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "innernet-client-core"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -911,14 +911,14 @@ dependencies = [
 
 [[package]]
 name = "innernet-domain"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "innernet-node"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "hickory-proto",
@@ -939,7 +939,7 @@ version = "2.0.0"
 
 [[package]]
 name = "innernet-server"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "innernet-shared"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "netlink-request"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "netlink-packet-core",
  "netlink-packet-generic",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "wireguard-control"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "base64 0.13.1",
  "hex",

@@ -14,7 +14,7 @@ name = "innernet-shared"
 publish = true
 readme = "../README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "2.0.0"
+version = "3.0.0"
 
 [dependencies]
 anyhow = "1"
@@ -26,7 +26,7 @@ colored.workspace = true
 curve25519-dalek = "4"
 dialoguer.workspace = true
 indoc = "2.0.1"
-innernet-domain = { version = "2.0.0", path = "../domain" }
+innernet-domain = { version = "3.0.0", path = "../domain" }
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
 ipnet = { version = "2.4", features = ["serde"] }
 libc = "0.2"
@@ -40,13 +40,13 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8.10"
 url = "2"
-wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+wireguard-control = { version = "3.0.0", path = "../wireguard-control" }
 zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core.workspace = true
 netlink-packet-route.workspace = true
-netlink-request = { version = "2.0.0", path = "../netlink-request" }
+netlink-request = { version = "3.0.0", path = "../netlink-request" }
 netlink-sys.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os= "openbsd"))'.dependencies]
@@ -55,4 +55,4 @@ nix = "0.26"
 [dev-dependencies]
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
-wireguard-control = { version = "2.0.0", path = "../wireguard-control", features = ["test-util"] }
+wireguard-control = { version = "3.0.0", path = "../wireguard-control", features = ["test-util"] }

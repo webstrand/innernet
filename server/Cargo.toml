@@ -14,7 +14,7 @@ name = "innernet-server"
 publish = true
 readme = "../README.md"
 repository = "https://github.com/tonarino/innernet"
-version = "2.0.0"
+version = "3.0.0"
 
 [lib]
 path = "src/lib.rs"
@@ -45,9 +45,9 @@ hyper = { version = "0.14", default-features = false, features = [
 ] }
 indoc = "2.0.1"
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
-innernet-client-core = { version = "2.0.0", path = "../client-core" }
-innernet-node = { version = "2.0.0", path = "../node" }
-innernet-shared = { version = "2.0.0", path = "../shared" }
+innernet-client-core = { version = "3.0.0", path = "../client-core" }
+innernet-node = { version = "3.0.0", path = "../node" }
+innernet-shared = { version = "3.0.0", path = "../shared" }
 ipnet = { version = "2.4", features = ["serde"] }
 libc = "0.2"
 log = "0.4"
@@ -67,7 +67,7 @@ thiserror = "1"
 tokio = { version = "1.28.0", features = ["macros", "net", "rt-multi-thread", "time"] }
 toml = "0.8.10"
 url = "2"
-wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+wireguard-control = { version = "3.0.0", path = "../wireguard-control" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2 = { version = "0.5.2", features = ["all"] }
