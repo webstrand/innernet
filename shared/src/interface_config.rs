@@ -223,8 +223,10 @@ pub struct InterfaceInfo {
     /// which its name resolves, and which must lie within the delegation that it claims.
     pub address: IpNet,
 
-    /// WireGuard private key (base64)
-    pub private_key: String,
+    /// The WireGuard private key, which the table states in exactly one of `private-key` and
+    /// `private-key-file`.
+    #[serde(flatten)]
+    pub private_key: InterfaceKey,
 
     /// The local listen port. A random port will be used if `None`.
     pub listen_port: Option<u16>,
@@ -282,6 +284,93 @@ pub struct InterfaceInfo {
     pub address_settle_ms: Option<u64>,
 }
 
+/// The WireGuard private key of an interface, in base64, and the file that holds it, if the config
+/// names one. The config states the key itself as `private-key`, or the absolute path of a file that
+/// holds it as `private-key-file`, such as a systemd credential, which is read when the config is.
+/// A config written back names the file again, and never holds the key that the file holds.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "InterfaceKeyFields", into = "InterfaceKeyFields")]
+pub struct InterfaceKey {
+    key: String,
+    file: Option<PathBuf>,
+}
+
+impl InterfaceKey {
+    /// The key `key`, in base64, which the config states itself.
+    pub fn inline(key: String) -> Self {
+        Self { key, file: None }
+    }
+
+    /// The file that holds the key, if the config names one.
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+}
+
+impl std::ops::Deref for InterfaceKey {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.key
+    }
+}
+
+/// The keys of the `[interface]` table that state an [`InterfaceKey`].
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct InterfaceKeyFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_key_file: Option<PathBuf>,
+}
+
+impl TryFrom<InterfaceKeyFields> for InterfaceKey {
+    type Error = String;
+
+    fn try_from(fields: InterfaceKeyFields) -> Result<Self, Self::Error> {
+        match (fields.private_key, fields.private_key_file) {
+            (Some(key), None) => Ok(Self::inline(key)),
+            (None, Some(file)) => {
+                if !file.is_absolute() {
+                    return Err(format!(
+                        "the private-key-file {} is not an absolute path",
+                        file.display()
+                    ));
+                }
+                let key = std::fs::read_to_string(&file).map_err(|e| {
+                    format!("the private-key-file {} is unreadable: {e}", file.display())
+                })?;
+                Ok(Self {
+                    key: key.trim().to_string(),
+                    file: Some(file),
+                })
+            },
+            (Some(_), Some(_)) => {
+                Err("the config states both private-key and private-key-file".to_string())
+            },
+            (None, None) => {
+                Err("the config states neither private-key nor private-key-file".to_string())
+            },
+        }
+    }
+}
+
+impl From<InterfaceKey> for InterfaceKeyFields {
+    fn from(key: InterfaceKey) -> Self {
+        match key.file {
+            Some(file) => Self {
+                private_key: None,
+                private_key_file: Some(file),
+            },
+            None => Self {
+                private_key: Some(key.key),
+                private_key_file: None,
+            },
+        }
+    }
+}
+
 /// How long a node waits for the host's addresses to settle when its config doesn't say.
 pub const DEFAULT_ADDRESS_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -311,7 +400,7 @@ impl InterfaceInfo {
     pub fn new(network_name: &InterfaceName, keypair: &KeyPair, address: IpNet) -> Self {
         Self {
             network_name: network_name.to_string(),
-            private_key: keypair.private.to_base64(),
+            private_key: InterfaceKey::inline(keypair.private.to_base64()),
             address,
             listen_port: None,
             external_endpoint: None,
@@ -664,7 +753,7 @@ impl Invitation {
         let interface = InterfaceInfo {
             network_name,
             address,
-            private_key,
+            private_key: InterfaceKey::inline(private_key),
             listen_port,
             external_endpoint: None,
             announce_observed_endpoint: true,
@@ -1086,6 +1175,57 @@ mod tests {
                 .contains("neither a peer's public key nor a peer IP"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_private_key_file() {
+        let dir = std::env::temp_dir().join(format!("innernet-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        std::fs::write(&path, "kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM=\n").unwrap();
+        let with = |line: &str| {
+            toml::from_str::<InterfaceConfig>(&INVITATION.replace(
+                "private-key = \"kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM=\"",
+                line,
+            ))
+        };
+
+        // The key is read from the file, and the config is written back naming the file.
+        let config = with(&format!("private-key-file = {:?}", path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            &*config.interface.private_key,
+            "kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM="
+        );
+        assert_eq!(config.interface.private_key.file(), Some(path.as_path()));
+        let written = config.as_toml();
+        assert!(!written.contains("private-key ="), "{written}");
+        let config: InterfaceConfig = toml::from_str(&written).unwrap();
+        assert_eq!(config.interface.private_key.file(), Some(path.as_path()));
+
+        // An inline key names no file.
+        let config: InterfaceConfig = toml::from_str(INVITATION).unwrap();
+        assert_eq!(config.interface.private_key.file(), None);
+
+        // Neither, both, a relative path and a missing file are refused.
+        let both = format!(
+            "private-key = \"kOg3HWw0ZE4tdhyA7kZGRUwAxp04i48yD3ElXNSNkmM=\"\nprivate-key-file = \
+             {:?}",
+            path.to_str().unwrap()
+        );
+        let missing = format!(
+            "private-key-file = {:?}",
+            dir.join("missing").to_str().unwrap()
+        );
+        for (line, reason) in [
+            ("", "neither"),
+            (both.as_str(), "both"),
+            ("private-key-file = \"key\"", "not an absolute path"),
+            (missing.as_str(), "unreadable"),
+        ] {
+            let error = with(line).unwrap_err().to_string();
+            assert!(error.contains(reason), "{error}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

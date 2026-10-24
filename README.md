@@ -189,6 +189,10 @@ The client writes `/etc/innernet/<interface>.conf` only when it installs the int
 
 ```toml
 [interface]
+private-key = "..."                     # the WireGuard private key, in base64; or, in its place,
+# private-key-file = "/run/credentials/innernet@<interface>.service/key"
+                                        # the absolute path of a file that holds it, which is read
+                                        # with the config and never written into it
 listen-port = 51820                     # the WireGuard listen port; random if unset
 external-endpoint = "203.0.113.7:51820" # the endpoint at which other peers reach this one, when the
                                         # endpoint that the server observes doesn't work; a host of
@@ -208,7 +212,7 @@ The server is a peer like any other, beside which runs the coordinator of the ne
 [interface]
 network-name = "<interface>"
 address = "10.60.0.1/16"   # the server's primary IP, at which the coordinator serves its API
-private-key = "..."
+private-key = "..."        # or private-key-file, as in a client's [interface] table
 listen-port = 51820
 # Any other key of a client's [interface] table: delegation, allowed-ips, extra-addresses,
 # external-endpoint, announce-nameserver, announce-zone, address-settle-ms.

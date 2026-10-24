@@ -16,7 +16,7 @@ use innernet_node::{
 };
 use innernet_shared::{
     announcement::{Announcement, SignedAnnouncement},
-    interface_config::{ResolvedInvitation, FEATURE_TLS},
+    interface_config::{InterfaceKey, ResolvedInvitation, FEATURE_TLS},
     wg, Endpoint, EndpointContents, IoErrorContext, PeerChange, PeerContents, Prefix,
     RedeemContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
@@ -154,7 +154,7 @@ async fn update_keypair(
     log::info!("Generating new keypair.");
     let keypair = wireguard_control::KeyPair::generate();
     let mut config = invitation.clone();
-    config.interface.private_key = keypair.private.to_base64();
+    config.interface.private_key = InterfaceKey::inline(keypair.private.to_base64());
 
     // The data store and the config are ready before the invitation is spent, so that redeeming it
     // leaves both behind. Until the server answers, the invitation is the authority on whether the

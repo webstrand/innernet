@@ -518,7 +518,8 @@ mod tests {
             key
         );
         let mut other = config;
-        other.interface.private_key = Key::generate_private().to_base64();
+        other.interface.private_key =
+            innernet_shared::interface_config::InterfaceKey::inline(Key::generate_private().to_base64());
         assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
         Ok(())
