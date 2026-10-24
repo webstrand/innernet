@@ -35,6 +35,9 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand add-peer 'Add a peer to an existing network'
             cand disable-peer 'Disable an enabled peer'
             cand enable-peer 'Enable a disabled peer'
+            cand add-delegation 'Delegate a prefix of a peer''s CIDR to the peer'
+            cand withdraw-delegation 'Withdraw a delegation from a peer'
+            cand reclaim-delegation 'Mark a delegation of a peer to be reclaimed'
             cand rename-peer 'Rename an existing peer'
             cand add-cidr 'Add a new CIDR to an existing network'
             cand rename-cidr 'Rename an existing CIDR'
@@ -47,6 +50,7 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand --network-cidr 'The network CIDR (ex: 10.42.0.0/16)'
             cand --external-endpoint 'This server''s external endpoint (ex: 100.100.100.100:51820)'
             cand --listen-port 'Port to listen on (for the WireGuard interface)'
+            cand --quic-port 'UDP port of the TLS API, over QUIC at the server''s internal address (default: a free port, which an interactive run offers to change)'
             cand --auto-external-endpoint 'Auto-resolve external endpoint'
             cand -h 'Print help'
             cand --help 'Print help'
@@ -59,16 +63,17 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
         &'innernet-server;serve'= {
             cand --backend 'Specify a WireGuard backend to use. If not set, innernet will auto-select based on availability'
             cand --mtu 'Specify the desired MTU for your interface (default: 1280)'
-            cand --hosts-path 'The path to write hosts to'
-            cand --host-suffix 'Use a different suffix for hosts, than ''INTERFACE.wg'' , ex. --host-suffix ''evilnet'' names peers: PEER.evilnet, and --host-suffix '''' gives peers no suffix, just: PEER'
+            cand --hosts-path 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working'
+            cand --host-suffix 'Use a different suffix for the hostnames of peers that the DNS server answers for, than ''INTERFACE.wg'', ex. --host-suffix ''evilnet'' names peers: PEER.evilnet'
             cand --no-routing 'Whether the routing should be done by innernet or is done by an external tool like e.g. babeld'
-            cand --no-write-hosts 'Don''t write to any hosts files'
+            cand --no-write-hosts 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working'
             cand -h 'Print help'
             cand --help 'Print help'
         }
         &'innernet-server;add-peer'= {
             cand --name 'Name of new peer'
-            cand --ip 'Specify desired IP of new peer (within parent CIDR)'
+            cand --ip 'Specify desired IP of new peer (within parent CIDR), which the peer is offered as a /32 or /128 delegation'
+            cand --delegation 'Offer the new peer this prefix of its CIDR as its delegation, rather than a single IP (eg. ''10.42.5.16/28'')'
             cand --cidr 'Name of CIDR to add new peer under'
             cand --admin 'Make new peer an admin?'
             cand --save-config 'Save the config to the given location'
@@ -89,6 +94,27 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand --yes 'Bypass confirmation'
             cand -h 'Print help'
             cand --help 'Print help'
+        }
+        &'innernet-server;add-delegation'= {
+            cand --name 'Name of the peer whose delegations change'
+            cand --prefix 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)'
+            cand --yes 'Bypass confirmation'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'innernet-server;withdraw-delegation'= {
+            cand --name 'Name of the peer whose delegations change'
+            cand --prefix 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)'
+            cand --yes 'Bypass confirmation'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
+        }
+        &'innernet-server;reclaim-delegation'= {
+            cand --name 'Name of the peer whose delegations change'
+            cand --prefix 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)'
+            cand --yes 'Bypass confirmation'
+            cand -h 'Print help (see more with ''--help'')'
+            cand --help 'Print help (see more with ''--help'')'
         }
         &'innernet-server;rename-peer'= {
             cand --name 'Name of peer to rename'
@@ -129,6 +155,9 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
             cand add-peer 'Add a peer to an existing network'
             cand disable-peer 'Disable an enabled peer'
             cand enable-peer 'Enable a disabled peer'
+            cand add-delegation 'Delegate a prefix of a peer''s CIDR to the peer'
+            cand withdraw-delegation 'Withdraw a delegation from a peer'
+            cand reclaim-delegation 'Mark a delegation of a peer to be reclaimed'
             cand rename-peer 'Rename an existing peer'
             cand add-cidr 'Add a new CIDR to an existing network'
             cand rename-cidr 'Rename an existing CIDR'
@@ -147,6 +176,12 @@ set edit:completion:arg-completer[innernet-server] = {|@words|
         &'innernet-server;help;disable-peer'= {
         }
         &'innernet-server;help;enable-peer'= {
+        }
+        &'innernet-server;help;add-delegation'= {
+        }
+        &'innernet-server;help;withdraw-delegation'= {
+        }
+        &'innernet-server;help;reclaim-delegation'= {
         }
         &'innernet-server;help;rename-peer'= {
         }

@@ -1,27 +1,27 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_innernet_server_global_optspecs
-	string join \n c/config-dir= d/data-dir= no-routing backend= mtu= h/help V/version
+    string join \n c/config-dir= d/data-dir= no-routing backend= mtu= h/help V/version
 end
 
 function __fish_innernet_server_needs_command
-	# Figure out if the current invocation already has a command.
-	set -l cmd (commandline -opc)
-	set -e cmd[1]
-	argparse -s (__fish_innernet_server_global_optspecs) -- $cmd 2>/dev/null
-	or return
-	if set -q argv[1]
-		# Also print the command, so this can be used to figure out what it is.
-		echo $argv[1]
-		return 1
-	end
-	return 0
+    # Figure out if the current invocation already has a command.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    argparse -s (__fish_innernet_server_global_optspecs) -- $cmd 2>/dev/null
+    or return
+    if set -q argv[1]
+        # Also print the command, so this can be used to figure out what it is.
+        echo $argv[1]
+        return 1
+    end
+    return 0
 end
 
 function __fish_innernet_server_using_subcommand
-	set -l cmd (__fish_innernet_server_needs_command)
-	test -z "$cmd"
-	and return 1
-	contains -- $cmd[1] $argv
+    set -l cmd (__fish_innernet_server_needs_command)
+    test -z "$cmd"
+    and return 1
+    contains -- $cmd[1] $argv
 end
 
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -s c -l config-dir -r -F
@@ -38,6 +38,9 @@ complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "ser
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "add-peer" -d 'Add a peer to an existing network'
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "disable-peer" -d 'Disable an enabled peer'
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "enable-peer" -d 'Enable a disabled peer'
+complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "add-delegation" -d 'Delegate a prefix of a peer\'s CIDR to the peer'
+complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "withdraw-delegation" -d 'Withdraw a delegation from a peer'
+complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "reclaim-delegation" -d 'Mark a delegation of a peer to be reclaimed'
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "rename-peer" -d 'Rename an existing peer'
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "add-cidr" -d 'Add a new CIDR to an existing network'
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -f -a "rename-cidr" -d 'Rename an existing CIDR'
@@ -48,6 +51,7 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l 
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l network-cidr -d 'The network CIDR (ex: 10.42.0.0/16)' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l external-endpoint -d 'This server\'s external endpoint (ex: 100.100.100.100:51820)' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l listen-port -d 'Port to listen on (for the WireGuard interface)' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l quic-port -d 'UDP port of the TLS API, over QUIC at the server\'s internal address (default: a free port, which an interactive run offers to change)' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -l auto-external-endpoint -d 'Auto-resolve external endpoint'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand new" -s h -l help -d 'Print help'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand uninstall" -l yes -d 'Bypass confirmation'
@@ -55,13 +59,14 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand uninstal
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l backend -d 'Specify a WireGuard backend to use. If not set, innernet will auto-select based on availability' -r -f -a "kernel\t''
 userspace\t''"
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l mtu -d 'Specify the desired MTU for your interface (default: 1280)' -r
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l hosts-path -d 'The path to write hosts to' -r -F
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l host-suffix -d 'Use a different suffix for hosts, than \'INTERFACE.wg\' , ex. --host-suffix \'evilnet\' names peers: PEER.evilnet, and --host-suffix \'\' gives peers no suffix, just: PEER' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l hosts-path -d 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working' -r -F
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l host-suffix -d 'Use a different suffix for the hostnames of peers that the DNS server answers for, than \'INTERFACE.wg\', ex. --host-suffix \'evilnet\' names peers: PEER.evilnet' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l no-routing -d 'Whether the routing should be done by innernet or is done by an external tool like e.g. babeld'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l no-write-hosts -d 'Don\'t write to any hosts files'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l no-write-hosts -d 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -s h -l help -d 'Print help'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l name -d 'Name of new peer' -r
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l ip -d 'Specify desired IP of new peer (within parent CIDR)' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l ip -d 'Specify desired IP of new peer (within parent CIDR), which the peer is offered as a /32 or /128 delegation' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l delegation -d 'Offer the new peer this prefix of its CIDR as its delegation, rather than a single IP (eg. \'10.42.5.16/28\')' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l cidr -d 'Name of CIDR to add new peer under' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l admin -d 'Make new peer an admin?' -r -f -a "true\t''
 false\t''"
@@ -76,6 +81,18 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand disable-
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand enable-peer" -l name -d 'Name of peer to enable/disable' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand enable-peer" -l yes -d 'Bypass confirmation'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand enable-peer" -s h -l help -d 'Print help'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-delegation" -l name -d 'Name of the peer whose delegations change' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-delegation" -l prefix -d 'The prefix to delegate, withdraw or mark (eg. \'10.42.5.16/28\', or \'10.42.5.9/32\' for a single address)' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-delegation" -l yes -d 'Bypass confirmation'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-delegation" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand withdraw-delegation" -l name -d 'Name of the peer whose delegations change' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand withdraw-delegation" -l prefix -d 'The prefix to delegate, withdraw or mark (eg. \'10.42.5.16/28\', or \'10.42.5.9/32\' for a single address)' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand withdraw-delegation" -l yes -d 'Bypass confirmation'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand withdraw-delegation" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand reclaim-delegation" -l name -d 'Name of the peer whose delegations change' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand reclaim-delegation" -l prefix -d 'The prefix to delegate, withdraw or mark (eg. \'10.42.5.16/28\', or \'10.42.5.9/32\' for a single address)' -r
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand reclaim-delegation" -l yes -d 'Bypass confirmation'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand reclaim-delegation" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand rename-peer" -l name -d 'Name of peer to rename' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand rename-peer" -l new-name -d 'The new name of the peer' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand rename-peer" -l yes -d 'Bypass confirmation'
@@ -93,15 +110,18 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand delete-c
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand delete-cidr" -l yes -d 'Bypass confirmation'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand delete-cidr" -s h -l help -d 'Print help'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand completions" -s h -l help -d 'Print help'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "new" -d 'Create a new network'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "uninstall" -d 'Permanently uninstall a created network, rendering it unusable. Use with care'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "serve" -d 'Serve the coordinating server for an existing network'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "add-peer" -d 'Add a peer to an existing network'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "disable-peer" -d 'Disable an enabled peer'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "enable-peer" -d 'Enable a disabled peer'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "rename-peer" -d 'Rename an existing peer'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "add-cidr" -d 'Add a new CIDR to an existing network'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "rename-cidr" -d 'Rename an existing CIDR'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "delete-cidr" -d 'Delete a CIDR'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "completions" -d 'Generate shell completion scripts'
-complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "new" -d 'Create a new network'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "uninstall" -d 'Permanently uninstall a created network, rendering it unusable. Use with care'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "serve" -d 'Serve the coordinating server for an existing network'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "add-peer" -d 'Add a peer to an existing network'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "disable-peer" -d 'Disable an enabled peer'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "enable-peer" -d 'Enable a disabled peer'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "add-delegation" -d 'Delegate a prefix of a peer\'s CIDR to the peer'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "withdraw-delegation" -d 'Withdraw a delegation from a peer'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "reclaim-delegation" -d 'Mark a delegation of a peer to be reclaimed'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "rename-peer" -d 'Rename an existing peer'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "add-cidr" -d 'Add a new CIDR to an existing network'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "rename-cidr" -d 'Rename an existing CIDR'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "delete-cidr" -d 'Delete a CIDR'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "completions" -d 'Generate shell completion scripts'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand help; and not __fish_seen_subcommand_from new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'

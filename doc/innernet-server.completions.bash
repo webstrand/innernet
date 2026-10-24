@@ -17,76 +17,94 @@ _innernet-server() {
                 cmd="innernet__server"
                 ;;
             innernet__server,add-cidr)
-                cmd="innernet__server__add__cidr"
+                cmd="innernet__server__subcmd__add__subcmd__cidr"
+                ;;
+            innernet__server,add-delegation)
+                cmd="innernet__server__subcmd__add__subcmd__delegation"
                 ;;
             innernet__server,add-peer)
-                cmd="innernet__server__add__peer"
+                cmd="innernet__server__subcmd__add__subcmd__peer"
                 ;;
             innernet__server,completions)
-                cmd="innernet__server__completions"
+                cmd="innernet__server__subcmd__completions"
                 ;;
             innernet__server,delete-cidr)
-                cmd="innernet__server__delete__cidr"
+                cmd="innernet__server__subcmd__delete__subcmd__cidr"
                 ;;
             innernet__server,disable-peer)
-                cmd="innernet__server__disable__peer"
+                cmd="innernet__server__subcmd__disable__subcmd__peer"
                 ;;
             innernet__server,enable-peer)
-                cmd="innernet__server__enable__peer"
+                cmd="innernet__server__subcmd__enable__subcmd__peer"
                 ;;
             innernet__server,help)
-                cmd="innernet__server__help"
+                cmd="innernet__server__subcmd__help"
                 ;;
             innernet__server,new)
-                cmd="innernet__server__new"
+                cmd="innernet__server__subcmd__new"
+                ;;
+            innernet__server,reclaim-delegation)
+                cmd="innernet__server__subcmd__reclaim__subcmd__delegation"
                 ;;
             innernet__server,rename-cidr)
-                cmd="innernet__server__rename__cidr"
+                cmd="innernet__server__subcmd__rename__subcmd__cidr"
                 ;;
             innernet__server,rename-peer)
-                cmd="innernet__server__rename__peer"
+                cmd="innernet__server__subcmd__rename__subcmd__peer"
                 ;;
             innernet__server,serve)
-                cmd="innernet__server__serve"
+                cmd="innernet__server__subcmd__serve"
                 ;;
             innernet__server,uninstall)
-                cmd="innernet__server__uninstall"
+                cmd="innernet__server__subcmd__uninstall"
                 ;;
-            innernet__server__help,add-cidr)
-                cmd="innernet__server__help__add__cidr"
+            innernet__server,withdraw-delegation)
+                cmd="innernet__server__subcmd__withdraw__subcmd__delegation"
                 ;;
-            innernet__server__help,add-peer)
-                cmd="innernet__server__help__add__peer"
+            innernet__server__subcmd__help,add-cidr)
+                cmd="innernet__server__subcmd__help__subcmd__add__subcmd__cidr"
                 ;;
-            innernet__server__help,completions)
-                cmd="innernet__server__help__completions"
+            innernet__server__subcmd__help,add-delegation)
+                cmd="innernet__server__subcmd__help__subcmd__add__subcmd__delegation"
                 ;;
-            innernet__server__help,delete-cidr)
-                cmd="innernet__server__help__delete__cidr"
+            innernet__server__subcmd__help,add-peer)
+                cmd="innernet__server__subcmd__help__subcmd__add__subcmd__peer"
                 ;;
-            innernet__server__help,disable-peer)
-                cmd="innernet__server__help__disable__peer"
+            innernet__server__subcmd__help,completions)
+                cmd="innernet__server__subcmd__help__subcmd__completions"
                 ;;
-            innernet__server__help,enable-peer)
-                cmd="innernet__server__help__enable__peer"
+            innernet__server__subcmd__help,delete-cidr)
+                cmd="innernet__server__subcmd__help__subcmd__delete__subcmd__cidr"
                 ;;
-            innernet__server__help,help)
-                cmd="innernet__server__help__help"
+            innernet__server__subcmd__help,disable-peer)
+                cmd="innernet__server__subcmd__help__subcmd__disable__subcmd__peer"
                 ;;
-            innernet__server__help,new)
-                cmd="innernet__server__help__new"
+            innernet__server__subcmd__help,enable-peer)
+                cmd="innernet__server__subcmd__help__subcmd__enable__subcmd__peer"
                 ;;
-            innernet__server__help,rename-cidr)
-                cmd="innernet__server__help__rename__cidr"
+            innernet__server__subcmd__help,help)
+                cmd="innernet__server__subcmd__help__subcmd__help"
                 ;;
-            innernet__server__help,rename-peer)
-                cmd="innernet__server__help__rename__peer"
+            innernet__server__subcmd__help,new)
+                cmd="innernet__server__subcmd__help__subcmd__new"
                 ;;
-            innernet__server__help,serve)
-                cmd="innernet__server__help__serve"
+            innernet__server__subcmd__help,reclaim-delegation)
+                cmd="innernet__server__subcmd__help__subcmd__reclaim__subcmd__delegation"
                 ;;
-            innernet__server__help,uninstall)
-                cmd="innernet__server__help__uninstall"
+            innernet__server__subcmd__help,rename-cidr)
+                cmd="innernet__server__subcmd__help__subcmd__rename__subcmd__cidr"
+                ;;
+            innernet__server__subcmd__help,rename-peer)
+                cmd="innernet__server__subcmd__help__subcmd__rename__subcmd__peer"
+                ;;
+            innernet__server__subcmd__help,serve)
+                cmd="innernet__server__subcmd__help__subcmd__serve"
+                ;;
+            innernet__server__subcmd__help,uninstall)
+                cmd="innernet__server__subcmd__help__subcmd__uninstall"
+                ;;
+            innernet__server__subcmd__help,withdraw-delegation)
+                cmd="innernet__server__subcmd__help__subcmd__withdraw__subcmd__delegation"
                 ;;
             *)
                 ;;
@@ -95,7 +113,7 @@ _innernet-server() {
 
     case "${cmd}" in
         innernet__server)
-            opts="-c -d -h -V --config-dir --data-dir --no-routing --backend --mtu --help --version new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help"
+            opts="-c -d -h -V --config-dir --data-dir --no-routing --backend --mtu --help --version new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -132,8 +150,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__add__cidr)
-            opts="-h --name --cidr --parent --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__add__subcmd__cidr)
+            opts="-h --name --cidr --parent --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -158,8 +176,30 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__add__peer)
-            opts="-h --name --ip --auto-ip --cidr --admin --yes --save-config --invite-expires --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__add__subcmd__delegation)
+            opts="-h --name --prefix --yes --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --prefix)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__add__subcmd__peer)
+            opts="-h --name --ip --auto-ip --delegation --cidr --admin --yes --save-config --invite-expires --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -170,6 +210,10 @@ _innernet-server() {
                     return 0
                     ;;
                 --ip)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --delegation)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -196,7 +240,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__completions)
+        innernet__subcmd__server__subcmd__completions)
             opts="-h --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -210,8 +254,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__delete__cidr)
-            opts="-h --name --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__delete__subcmd__cidr)
+            opts="-h --name --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -228,8 +272,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__disable__peer)
-            opts="-h --name --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__disable__subcmd__peer)
+            opts="-h --name --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -246,8 +290,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__enable__peer)
-            opts="-h --name --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__enable__subcmd__peer)
+            opts="-h --name --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -264,8 +308,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help)
-            opts="new uninstall serve add-peer disable-peer enable-peer rename-peer add-cidr rename-cidr delete-cidr completions help"
+        innernet__subcmd__server__subcmd__help)
+            opts="new uninstall serve add-peer disable-peer enable-peer add-delegation withdraw-delegation reclaim-delegation rename-peer add-cidr rename-cidr delete-cidr completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -278,7 +322,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__add__cidr)
+        innernet__subcmd__server__subcmd__help__subcmd__add__subcmd__cidr)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -292,7 +336,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__add__peer)
+        innernet__subcmd__server__subcmd__help__subcmd__add__subcmd__delegation)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -306,7 +350,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__completions)
+        innernet__subcmd__server__subcmd__help__subcmd__add__subcmd__peer)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -320,7 +364,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__delete__cidr)
+        innernet__subcmd__server__subcmd__help__subcmd__completions)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -334,7 +378,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__disable__peer)
+        innernet__subcmd__server__subcmd__help__subcmd__delete__subcmd__cidr)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -348,7 +392,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__enable__peer)
+        innernet__subcmd__server__subcmd__help__subcmd__disable__subcmd__peer)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -362,7 +406,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__help)
+        innernet__subcmd__server__subcmd__help__subcmd__enable__subcmd__peer)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -376,7 +420,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__new)
+        innernet__subcmd__server__subcmd__help__subcmd__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -390,7 +434,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__rename__cidr)
+        innernet__subcmd__server__subcmd__help__subcmd__new)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -404,7 +448,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__rename__peer)
+        innernet__subcmd__server__subcmd__help__subcmd__reclaim__subcmd__delegation)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -418,7 +462,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__serve)
+        innernet__subcmd__server__subcmd__help__subcmd__rename__subcmd__cidr)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -432,7 +476,7 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__help__uninstall)
+        innernet__subcmd__server__subcmd__help__subcmd__rename__subcmd__peer)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -446,8 +490,50 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__new)
-            opts="-h --network-name --network-cidr --external-endpoint --auto-external-endpoint --listen-port --help"
+        innernet__subcmd__server__subcmd__help__subcmd__serve)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__help__subcmd__uninstall)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__help__subcmd__withdraw__subcmd__delegation)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__new)
+            opts="-h --network-name --network-cidr --external-endpoint --auto-external-endpoint --listen-port --quic-port --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -469,6 +555,10 @@ _innernet-server() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --quic-port)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -476,8 +566,30 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__rename__cidr)
-            opts="-h --name --new-name --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__reclaim__subcmd__delegation)
+            opts="-h --name --prefix --yes --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --prefix)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__rename__subcmd__cidr)
+            opts="-h --name --new-name --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -498,8 +610,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__rename__peer)
-            opts="-h --name --new-name --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__rename__subcmd__peer)
+            opts="-h --name --new-name --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -520,8 +632,8 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__serve)
-            opts="-h --no-routing --backend --mtu --hosts-path --no-write-hosts --host-suffix --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__serve)
+            opts="-h --no-routing --backend --mtu --hosts-path --no-write-hosts --host-suffix --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -550,13 +662,35 @@ _innernet-server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        innernet__server__uninstall)
-            opts="-h --yes --help <INTERFACE>"
+        innernet__subcmd__server__subcmd__uninstall)
+            opts="-h --yes --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__server__subcmd__withdraw__subcmd__delegation)
+            opts="-h --name --prefix --yes --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --prefix)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

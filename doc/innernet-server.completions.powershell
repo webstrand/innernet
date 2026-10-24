@@ -38,6 +38,9 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a peer to an existing network')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('add-delegation', 'add-delegation', [CompletionResultType]::ParameterValue, 'Delegate a prefix of a peer''s CIDR to the peer')
+            [CompletionResult]::new('withdraw-delegation', 'withdraw-delegation', [CompletionResultType]::ParameterValue, 'Withdraw a delegation from a peer')
+            [CompletionResult]::new('reclaim-delegation', 'reclaim-delegation', [CompletionResultType]::ParameterValue, 'Mark a delegation of a peer to be reclaimed')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename an existing peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR to an existing network')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename an existing CIDR')
@@ -51,6 +54,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('--network-cidr', '--network-cidr', [CompletionResultType]::ParameterName, 'The network CIDR (ex: 10.42.0.0/16)')
             [CompletionResult]::new('--external-endpoint', '--external-endpoint', [CompletionResultType]::ParameterName, 'This server''s external endpoint (ex: 100.100.100.100:51820)')
             [CompletionResult]::new('--listen-port', '--listen-port', [CompletionResultType]::ParameterName, 'Port to listen on (for the WireGuard interface)')
+            [CompletionResult]::new('--quic-port', '--quic-port', [CompletionResultType]::ParameterName, 'UDP port of the TLS API, over QUIC at the server''s internal address (default: a free port, which an interactive run offers to change)')
             [CompletionResult]::new('--auto-external-endpoint', '--auto-external-endpoint', [CompletionResultType]::ParameterName, 'Auto-resolve external endpoint')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
@@ -65,17 +69,18 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
         'innernet-server;serve' {
             [CompletionResult]::new('--backend', '--backend', [CompletionResultType]::ParameterName, 'Specify a WireGuard backend to use. If not set, innernet will auto-select based on availability')
             [CompletionResult]::new('--mtu', '--mtu', [CompletionResultType]::ParameterName, 'Specify the desired MTU for your interface (default: 1280)')
-            [CompletionResult]::new('--hosts-path', '--hosts-path', [CompletionResultType]::ParameterName, 'The path to write hosts to')
-            [CompletionResult]::new('--host-suffix', '--host-suffix', [CompletionResultType]::ParameterName, 'Use a different suffix for hosts, than ''INTERFACE.wg'' , ex. --host-suffix ''evilnet'' names peers: PEER.evilnet, and --host-suffix '''' gives peers no suffix, just: PEER')
+            [CompletionResult]::new('--hosts-path', '--hosts-path', [CompletionResultType]::ParameterName, 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working')
+            [CompletionResult]::new('--host-suffix', '--host-suffix', [CompletionResultType]::ParameterName, 'Use a different suffix for the hostnames of peers that the DNS server answers for, than ''INTERFACE.wg'', ex. --host-suffix ''evilnet'' names peers: PEER.evilnet')
             [CompletionResult]::new('--no-routing', '--no-routing', [CompletionResultType]::ParameterName, 'Whether the routing should be done by innernet or is done by an external tool like e.g. babeld')
-            [CompletionResult]::new('--no-write-hosts', '--no-write-hosts', [CompletionResultType]::ParameterName, 'Don''t write to any hosts files')
+            [CompletionResult]::new('--no-write-hosts', '--no-write-hosts', [CompletionResultType]::ParameterName, 'Ignored: innernet no longer writes a hosts file. Accepted so that existing invocations keep working')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
         'innernet-server;add-peer' {
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of new peer')
-            [CompletionResult]::new('--ip', '--ip', [CompletionResultType]::ParameterName, 'Specify desired IP of new peer (within parent CIDR)')
+            [CompletionResult]::new('--ip', '--ip', [CompletionResultType]::ParameterName, 'Specify desired IP of new peer (within parent CIDR), which the peer is offered as a /32 or /128 delegation')
+            [CompletionResult]::new('--delegation', '--delegation', [CompletionResultType]::ParameterName, 'Offer the new peer this prefix of its CIDR as its delegation, rather than a single IP (eg. ''10.42.5.16/28'')')
             [CompletionResult]::new('--cidr', '--cidr', [CompletionResultType]::ParameterName, 'Name of CIDR to add new peer under')
             [CompletionResult]::new('--admin', '--admin', [CompletionResultType]::ParameterName, 'Make new peer an admin?')
             [CompletionResult]::new('--save-config', '--save-config', [CompletionResultType]::ParameterName, 'Save the config to the given location')
@@ -98,6 +103,30 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'innernet-server;add-delegation' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer whose delegations change')
+            [CompletionResult]::new('--prefix', '--prefix', [CompletionResultType]::ParameterName, 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'innernet-server;withdraw-delegation' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer whose delegations change')
+            [CompletionResult]::new('--prefix', '--prefix', [CompletionResultType]::ParameterName, 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'innernet-server;reclaim-delegation' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name of the peer whose delegations change')
+            [CompletionResult]::new('--prefix', '--prefix', [CompletionResultType]::ParameterName, 'The prefix to delegate, withdraw or mark (eg. ''10.42.5.16/28'', or ''10.42.5.9/32'' for a single address)')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             break
         }
         'innernet-server;rename-peer' {
@@ -144,6 +173,9 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a peer to an existing network')
             [CompletionResult]::new('disable-peer', 'disable-peer', [CompletionResultType]::ParameterValue, 'Disable an enabled peer')
             [CompletionResult]::new('enable-peer', 'enable-peer', [CompletionResultType]::ParameterValue, 'Enable a disabled peer')
+            [CompletionResult]::new('add-delegation', 'add-delegation', [CompletionResultType]::ParameterValue, 'Delegate a prefix of a peer''s CIDR to the peer')
+            [CompletionResult]::new('withdraw-delegation', 'withdraw-delegation', [CompletionResultType]::ParameterValue, 'Withdraw a delegation from a peer')
+            [CompletionResult]::new('reclaim-delegation', 'reclaim-delegation', [CompletionResultType]::ParameterValue, 'Mark a delegation of a peer to be reclaimed')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename an existing peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR to an existing network')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename an existing CIDR')
@@ -168,6 +200,15 @@ Register-ArgumentCompleter -Native -CommandName 'innernet-server' -ScriptBlock {
             break
         }
         'innernet-server;help;enable-peer' {
+            break
+        }
+        'innernet-server;help;add-delegation' {
+            break
+        }
+        'innernet-server;help;withdraw-delegation' {
+            break
+        }
+        'innernet-server;help;reclaim-delegation' {
             break
         }
         'innernet-server;help;rename-peer' {
