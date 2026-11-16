@@ -163,6 +163,8 @@ Domains=~<interface>.wg
 
 With dnsmasq, the line `server=/<interface>.wg/127.0.0.55` does so.
 
+The DNS server also answers reverse lookups (PTR queries) for the addresses of the network, the prefix of the node's own address. It answers the reverse name of the address of an enabled peer's name with that name, so that a service that checks a client's address against its name, by a reverse lookup confirmed by a forward one, finds the peer's name. Its reverse zone is the reverse name of the network, shortened to whole labels, such as `255.7.in-addr.arpa` for `7.255.0.0/16`, or `10.in-addr.arpa` for `10.64.0.0/10`; the DNS server logs it when it starts. A reverse name of the network at which no peer's name lies doesn't exist (NXDOMAIN), and a reverse name of the reverse zone outside the network is refused. The operator must route the reverse zone to the DNS server too, such as with `Domains=~<interface>.wg ~255.7.in-addr.arpa` in the file above, or the line `server=/255.7.in-addr.arpa/127.0.0.55` with dnsmasq. A peer's nameserver never answers a reverse lookup.
+
 A peer can offer a nameserver, at an address within its delegations, for its own name and the names under it, such as `www.<peer>.<interface>.wg`:
 
 ```toml

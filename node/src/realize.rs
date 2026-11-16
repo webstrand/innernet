@@ -171,6 +171,8 @@ impl TunnelBackend for WireGuard {
 pub struct DnsServer {
     pub interface: InterfaceName,
     pub host_suffix: Option<String>,
+    /// The network, whose reverse names the server answers for, as [`Names::of`] takes it.
+    pub network: IpNet,
     pub forwarding: Forwarding,
     pub server: Server,
 }
@@ -180,6 +182,7 @@ impl NamePublisher for DnsServer {
         self.server.set_names(Names::of(
             &self.interface,
             self.host_suffix.as_deref(),
+            self.network,
             &self.forwarding,
             snapshot,
         ));
@@ -192,16 +195,20 @@ impl NamePublisher for DnsServer {
 pub struct DnsService {
     pub interface: InterfaceName,
     pub host_suffix: Option<String>,
+    /// The network, whose reverse names the server answers for, as [`Names::of`] takes it, such
+    /// as the address of the node's interface. A new network takes effect at the next update.
+    pub network: IpNet,
     /// The running server, with the listen address of the table that started it, which may differ
     /// from the address that it listens at in its port.
     running: Option<(SocketAddr, DnsServer)>,
 }
 
 impl DnsService {
-    pub fn new(interface: InterfaceName, host_suffix: Option<String>) -> Self {
+    pub fn new(interface: InterfaceName, host_suffix: Option<String>, network: IpNet) -> Self {
         Self {
             interface,
             host_suffix,
+            network,
             running: None,
         }
     }
@@ -228,6 +235,7 @@ impl DnsService {
         };
         if let Some((_, running)) = &mut self.running {
             running.forwarding = forward.clone();
+            running.network = self.network;
             // Publishing to a running server never fails.
             let _ = running.publish(snapshot);
             return;
@@ -235,18 +243,22 @@ impl DnsService {
         let names = Names::of(
             &self.interface,
             self.host_suffix.as_deref(),
+            self.network,
             forward,
             snapshot,
         );
         match Server::spawn(*listen, names) {
             Ok(server) => {
                 log::info!(
-                    "{name}: answering DNS for the names of peers at {}.",
+                    "{name}: answering DNS for the names of peers, and for the reverse zone {}, \
+                     at {}.",
+                    crate::dns::reverse_zone(&self.network.trunc()),
                     server.listen
                 );
                 let published = DnsServer {
                     interface: self.interface,
                     host_suffix: self.host_suffix.clone(),
+                    network: self.network,
                     forwarding: forward.clone(),
                     server,
                 };

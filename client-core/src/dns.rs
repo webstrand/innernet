@@ -5,6 +5,7 @@ use crate::{data_store::DataStore, interface::InterfaceConfig};
 use anyhow::Error;
 use innernet_node::{realize::DnsService, snapshot::Snapshot};
 use innernet_shared::interface_config::DnsInfo;
+use ipnet::IpNet;
 use std::{collections::BTreeMap, path::Path};
 use wireguard_control::InterfaceName;
 
@@ -45,11 +46,19 @@ impl Servers {
             let name = interface.to_string();
             match configured(interface, config_dir, data_dir) {
                 Ok(configured) => {
+                    let network = configured.as_ref().map(|(_, network, _)| *network);
                     let service = self.running.entry(name).or_insert_with(|| {
-                        DnsService::new(*interface, host_suffix.map(str::to_string))
+                        DnsService::new(
+                            *interface,
+                            host_suffix.map(str::to_string),
+                            network.unwrap_or_default(),
+                        )
                     });
                     match &configured {
-                        Some((dns, snapshot)) => service.update(Some(dns), snapshot).await,
+                        Some((dns, network, snapshot)) => {
+                            service.network = *network;
+                            service.update(Some(dns), snapshot).await
+                        },
                         None => service.update(None, &Snapshot::default()).await,
                     }
                 },
@@ -62,19 +71,20 @@ impl Servers {
     }
 }
 
-/// The `[dns]` table of the config of `interface` in `config_dir`, and the snapshot of its data
-/// store in `data_dir`, or `None` if its config has no DNS server.
+/// The `[dns]` table of the config of `interface` in `config_dir`, the address of its interface,
+/// which gives the network, and the snapshot of its data store in `data_dir`, or `None` if its
+/// config has no DNS server.
 fn configured(
     interface: &InterfaceName,
     config_dir: &Path,
     data_dir: &Path,
-) -> Result<Option<(DnsInfo, Snapshot)>, Error> {
+) -> Result<Option<(DnsInfo, IpNet, Snapshot)>, Error> {
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let Some(dns) = config.dns.clone() else {
         return Ok(None);
     };
     let store = DataStore::open(data_dir, interface, &config)?;
-    Ok(Some((dns, store.snapshot(None)?)))
+    Ok(Some((dns, config.interface.address, store.snapshot(None)?)))
 }
 
 #[cfg(test)]

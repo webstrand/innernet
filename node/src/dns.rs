@@ -19,8 +19,19 @@
 //! whose address lies outside the delegation that the peer claims, so that it only ever points at
 //! the peer's own addresses.
 //!
-//! A name under the hostnames of several peers is the longest one's. The DNS server refuses
-//! queries for names outside the zone.
+//! A name under the hostnames of several peers is the longest one's.
+//!
+//! The DNS server is authoritative too for the reverse names of the addresses of the network, the
+//! prefix of the node's own address, under `in-addr.arpa` or `ip6.arpa`. Its reverse zone is the
+//! reverse name of the network, shortened to a whole label where the network's prefix length isn't
+//! a multiple of 8 bits for IPv4 or 4 bits for IPv6, such as `10.in-addr.arpa` for `10.64.0.0/10`.
+//! It answers a PTR query for the reverse name of the address of a hostname, as it answers for the
+//! hostname, with every hostname at that address. A reverse name of the network at which no
+//! hostname lies doesn't exist, and a reverse name of the reverse zone outside the network is
+//! refused, so that another DNS server can answer for it. A peer's nameserver never answers a
+//! reverse name.
+//!
+//! The DNS server refuses queries for names outside both zones.
 //!
 //! The DNS server answers over UDP and TCP at the same address. It runs at most
 //! [`MAX_IN_FLIGHT`] queries at a time and refuses the rest, and gives each exchange with a
@@ -30,18 +41,19 @@
 use crate::snapshot::Snapshot;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
-    rr::{Name, RData, Record, RecordType},
+    rr::{rdata::PTR, Name, RData, Record, RecordType},
 };
 use innernet_shared::{
     interface_config::Forwarding, peer_hostname, peer_zone, PeerContents, Prefix,
 };
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::{
     collections::BTreeMap,
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, PoisonError, RwLock,
@@ -79,6 +91,8 @@ const UNPRIVILEGED_PORT_START: u16 = 1024;
 pub struct Names {
     /// The zone of the names of the peers, for which the DNS server is authoritative.
     pub zone: Name,
+    /// The network, whose reverse names the DNS server answers for, if it answers for any.
+    pub network: Option<IpNet>,
     /// The address of the hostname of each peer that has a name.
     pub hosts: BTreeMap<Name, IpAddr>,
     /// Where queries go for the hostname of each peer to whose nameserver the DNS server
@@ -87,17 +101,20 @@ pub struct Names {
 }
 
 impl Names {
-    /// The names that `snapshot` publishes for `interface`, with the hostnames of the peers under
-    /// `host_suffix`: the hosts of its names, and the forwards of its peers that offer a
-    /// nameserver and that `forwarding` selects.
+    /// The names that `snapshot` publishes for `interface` of `network`, with the hostnames of the
+    /// peers under `host_suffix`: the hosts of its names, and the forwards of its peers that offer
+    /// a nameserver and that `forwarding` selects. `network` may be any address of the network
+    /// with its prefix length, such as the node's own address.
     pub fn of(
         interface: &InterfaceName,
         host_suffix: Option<&str>,
+        network: IpNet,
         forwarding: &Forwarding,
         snapshot: &Snapshot,
     ) -> Self {
         Self {
             zone: fqdn(&peer_zone(interface, host_suffix)).unwrap_or_default(),
+            network: Some(network.trunc()),
             hosts: hosts(interface, host_suffix, &snapshot.names),
             forwards: forwards(interface, host_suffix, forwarding, &snapshot.peers),
         }
@@ -246,6 +263,9 @@ fn forward_query(names: &Names, query: &[u8]) -> Result<Forwarded, Vec<u8>> {
     if message.queries.len() != 1 {
         return Err(error_response(query, ResponseCode::Refused));
     }
+    if let Some(response) = reverse_response(names, &message, query) {
+        return Err(response);
+    }
     let name = message.queries[0].name().clone();
     let forward = route(&names.forwards, &name);
     let host = names
@@ -299,6 +319,147 @@ fn host_response(message: &Message, query: &[u8], host: &Name, ip: IpAddr) -> Ve
     response
         .to_vec()
         .unwrap_or_else(|_| error_response(query, ResponseCode::ServFail))
+}
+
+/// The number of bits of an address that each label of a reverse name of its family holds.
+fn label_bits(network: &IpNet) -> u8 {
+    match network {
+        IpNet::V4(_) => 8,
+        IpNet::V6(_) => 4,
+    }
+}
+
+/// The reverse zone of `network`: the reverse name of its prefix, shortened to whole labels.
+pub fn reverse_zone(network: &IpNet) -> Name {
+    let bits = label_bits(network);
+    let labels = usize::from(network.prefix_len() / bits);
+    let (suffix, mut digits) = match network {
+        IpNet::V4(net) => (
+            "in-addr.arpa.",
+            net.addr()
+                .octets()
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>(),
+        ),
+        IpNet::V6(net) => (
+            "ip6.arpa.",
+            net.addr()
+                .octets()
+                .iter()
+                .flat_map(|octet| [octet >> 4, octet & 0xf])
+                .map(|nibble| format!("{nibble:x}"))
+                .collect(),
+        ),
+    };
+    digits.truncate(labels);
+    digits.reverse();
+    digits.push(suffix.into());
+    Name::from_ascii(digits.join(".")).expect("a reverse name is a valid name")
+}
+
+/// The prefix that `name`, a reverse name under `in-addr.arpa` or `ip6.arpa`, stands for, by as
+/// many labels from the right as are an octet in decimal without leading zeros or a hexadecimal
+/// digit, and whether further labels follow, which no address has. `None` if `name` isn't under
+/// either.
+fn parse_reverse(name: &Name) -> Option<(IpNet, bool)> {
+    let mut labels = name.iter().rev();
+    if !labels.next()?.eq_ignore_ascii_case(b"arpa") {
+        return None;
+    }
+    let space = labels.next()?;
+    let (bits, max): (u8, u8) = if space.eq_ignore_ascii_case(b"in-addr") {
+        (8, 32)
+    } else if space.eq_ignore_ascii_case(b"ip6") {
+        (4, 128)
+    } else {
+        return None;
+    };
+    let digit = |label: &[u8]| -> Option<u128> {
+        let label = std::str::from_utf8(label).ok()?;
+        match bits {
+            8 if label.bytes().all(|b| b.is_ascii_digit())
+                && (label == "0" || !label.starts_with('0')) =>
+            {
+                label.parse::<u8>().ok().map(u128::from)
+            },
+            4 if label.len() == 1 => label.chars().next()?.to_digit(16).map(u128::from),
+            _ => None,
+        }
+    };
+    let (mut address, mut length, mut rest) = (0u128, 0u8, false);
+    for label in labels {
+        match digit(label).filter(|_| length < max) {
+            Some(value) => {
+                length += bits;
+                address |= value << (max - length);
+            },
+            None => {
+                rest = true;
+                break;
+            },
+        }
+    }
+    let prefix = match max {
+        32 => IpNet::V4(Ipv4Net::new(Ipv4Addr::from(address as u32), length).ok()?),
+        _ => IpNet::V6(Ipv6Net::new(Ipv6Addr::from(address), length).ok()?),
+    };
+    Some((prefix, rest))
+}
+
+/// The response to `message`, the standard query `query` of one question, for a reverse name of
+/// the reverse zone of the network of `names` that lies within the network or contains it, or
+/// `None` for any other name: for the reverse name of an address, a PTR record for each hostname
+/// of `names` at that address if the query asks for one, or for any type, and no record
+/// otherwise; for a shorter reverse name, no record if the reverse zone is at that name or a
+/// hostname lies under it. Any other reverse name of the network doesn't exist. The response is
+/// authoritative.
+fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Vec<u8>> {
+    let network = names.network?;
+    let question = &message.queries[0];
+    let (prefix, rest) = parse_reverse(question.name())?;
+    let apex = network.prefix_len() / label_bits(&network) * label_bits(&network);
+    let in_zone =
+        network.contains(&prefix) || (prefix.contains(&network) && prefix.prefix_len() >= apex);
+    if !in_zone {
+        return None;
+    }
+    if rest {
+        return Some(authoritative(message, query, ResponseCode::NXDomain));
+    }
+    let under = |ip: &IpAddr| prefix.contains(ip);
+    if prefix.prefix_len() < prefix.max_prefix_len() {
+        let exists = prefix.prefix_len() == apex || names.hosts.values().any(under);
+        let code = match exists {
+            true => ResponseCode::NoError,
+            false => ResponseCode::NXDomain,
+        };
+        return Some(authoritative(message, query, code));
+    }
+    let hostnames: Vec<&Name> = names
+        .hosts
+        .iter()
+        .filter(|(_, ip)| under(ip))
+        .map(|(hostname, _)| hostname)
+        .collect();
+    if hostnames.is_empty() {
+        return Some(authoritative(message, query, ResponseCode::NXDomain));
+    }
+    let mut response = authoritative_response(message);
+    if matches!(question.query_type(), RecordType::PTR | RecordType::ANY) {
+        for hostname in hostnames {
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                HOST_TTL,
+                RData::PTR(PTR(hostname.clone())),
+            ));
+        }
+    }
+    Some(
+        response
+            .to_vec()
+            .unwrap_or_else(|_| error_response(query, ResponseCode::ServFail)),
+    )
 }
 
 /// Restores the names of a nameserver's `response` to what the client asked about: the queried
@@ -904,6 +1065,7 @@ mod tests {
             ]
             .into(),
             forwards: vec![forward()],
+            ..Default::default()
         };
         let respond = |qname: &str, query_type| {
             Message::from_vec(&forward_query(&names, &query_of(qname, query_type)).unwrap_err())
@@ -961,6 +1123,7 @@ mod tests {
             zone: name("e2e.wg."),
             hosts: [host.clone()].into(),
             forwards: vec![forward()],
+            ..Default::default()
         };
         let forwarded = forward_query(&forwarded, &query("b.e2e.wg.")).unwrap();
         assert_eq!(forwarded.forwarded_name, name("example.com."));
@@ -969,12 +1132,171 @@ mod tests {
             zone: name("e2e.wg."),
             hosts: [host].into(),
             forwards: vec![],
+            ..Default::default()
         };
         let response = forward_query(&not_forwarded, &query("b.e2e.wg.")).unwrap_err();
         let response = Message::from_vec(&response).unwrap();
         assert_eq!(response.answers[0].data, RData::A(A::new(10, 66, 1, 33)));
         let response = forward_query(&not_forwarded, &query("www.b.e2e.wg.")).unwrap_err();
         assert_eq!(response_code(&response), ResponseCode::NXDomain);
+    }
+
+    #[test]
+    fn test_reverse_zone() {
+        for (network, zone) in [
+            ("7.255.1.1/16", "255.7.in-addr.arpa."),
+            ("10.64.0.0/10", "10.in-addr.arpa."),
+            ("10.66.1.0/24", "1.66.10.in-addr.arpa."),
+            ("fd00:1:2::/48", "2.0.0.0.1.0.0.0.0.0.d.f.ip6.arpa."),
+            ("fd00:1:2::/50", "2.0.0.0.1.0.0.0.0.0.d.f.ip6.arpa."),
+        ] {
+            let network: IpNet = network.parse().unwrap();
+            assert_eq!(reverse_zone(&network.trunc()), name(zone), "{network}");
+        }
+    }
+
+    #[test]
+    fn test_parse_reverse() {
+        let parse = |qname: &str| parse_reverse(&name(qname));
+        assert_eq!(
+            parse("2.1.255.7.IN-ADDR.arpa."),
+            Some(("7.255.1.2/32".parse().unwrap(), false))
+        );
+        assert_eq!(
+            parse("255.7.in-addr.arpa."),
+            Some(("7.255.0.0/16".parse().unwrap(), false))
+        );
+        assert_eq!(
+            parse("in-addr.arpa."),
+            Some(("0.0.0.0/0".parse().unwrap(), false))
+        );
+        // A label that is no octet, or one beyond the address, ends the prefix.
+        for qname in [
+            "x.1.255.7.in-addr.arpa.",
+            "01.1.255.7.in-addr.arpa.",
+            "256.1.255.7.in-addr.arpa.",
+        ] {
+            assert_eq!(
+                parse(qname),
+                Some(("7.255.1.0/24".parse().unwrap(), true)),
+                "{qname}"
+            );
+        }
+        // A label that a name in text can't hold, but one on the wire can.
+        let plus =
+            Name::from_labels([&b"+1"[..], b"1", b"255", b"7", b"in-addr", b"arpa"]).unwrap();
+        assert_eq!(
+            parse_reverse(&plus),
+            Some(("7.255.1.0/24".parse().unwrap(), true))
+        );
+        assert_eq!(
+            parse("9.2.1.255.7.in-addr.arpa."),
+            Some(("7.255.1.2/32".parse().unwrap(), true))
+        );
+        assert_eq!(
+            parse(&format!(
+                "1.{}2.0.0.0.1.0.0.0.0.0.D.f.ip6.arpa.",
+                "0.".repeat(19)
+            )),
+            Some(("fd00:1:2::1/128".parse().unwrap(), false))
+        );
+        assert_eq!(
+            parse("12.d.f.ip6.arpa."),
+            Some(("fd00::/8".parse().unwrap(), true))
+        );
+        assert_eq!(parse("1.2.home.arpa."), None);
+        assert_eq!(parse("a.e2e.wg."), None);
+    }
+
+    #[test]
+    fn test_answers_reverse_names() {
+        let names = Names {
+            zone: name("e2e.wg."),
+            network: Some("10.64.0.0/10".parse().unwrap()),
+            hosts: [
+                (name("a.e2e.wg."), "10.66.1.1".parse().unwrap()),
+                (name("b.e2e.wg."), "10.66.1.2".parse().unwrap()),
+                (name("also-b.e2e.wg."), "10.66.1.2".parse().unwrap()),
+            ]
+            .into(),
+            forwards: vec![forward()],
+        };
+        let respond = |qname: &str, query_type| {
+            Message::from_vec(&forward_query(&names, &query_of(qname, query_type)).unwrap_err())
+                .unwrap()
+        };
+
+        // The reverse name of a host's address names the host, under the name as the client
+        // spelled it, and every host at the address.
+        let response = respond("1.1.66.10.IN-ADDR.ARPA.", RecordType::PTR);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.metadata.authoritative);
+        assert!(response.answers[0]
+            .name
+            .eq_case(&name("1.1.66.10.IN-ADDR.ARPA.")));
+        assert_eq!(response.answers[0].data, RData::PTR(PTR(name("a.e2e.wg."))));
+        assert_eq!(response.answers[0].ttl, HOST_TTL);
+        let mut targets: Vec<RData> = respond("2.1.66.10.in-addr.arpa.", RecordType::ANY)
+            .answers
+            .into_iter()
+            .map(|record| record.data)
+            .collect();
+        targets.sort_by_key(|data| data.to_string());
+        assert_eq!(
+            targets,
+            [
+                RData::PTR(PTR(name("also-b.e2e.wg."))),
+                RData::PTR(PTR(name("b.e2e.wg."))),
+            ]
+        );
+        // Any other type of record of it is none.
+        let response = respond("1.1.66.10.in-addr.arpa.", RecordType::A);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
+
+        // The reverse zone, and a shorter reverse name under which a host lies, exist without a
+        // record; any other reverse name of the network doesn't exist.
+        for (qname, code) in [
+            ("10.in-addr.arpa.", ResponseCode::NoError),
+            ("66.10.in-addr.arpa.", ResponseCode::NoError),
+            ("1.66.10.in-addr.arpa.", ResponseCode::NoError),
+            ("2.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+            ("3.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+            ("x.1.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+            ("www.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+        ] {
+            let response = respond(qname, RecordType::PTR);
+            assert_eq!(response.metadata.response_code, code, "{qname}");
+            assert!(response.metadata.authoritative, "{qname}");
+            assert!(response.answers.is_empty(), "{qname}");
+        }
+
+        // A reverse name outside the network, if within the reverse zone, or above the reverse
+        // zone, or of the other family, is refused.
+        for qname in [
+            "1.1.1.10.in-addr.arpa.",
+            "1.10.in-addr.arpa.",
+            "in-addr.arpa.",
+            "1.1.168.192.in-addr.arpa.",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa.",
+        ] {
+            assert_eq!(
+                respond(qname, RecordType::PTR).metadata.response_code,
+                ResponseCode::Refused,
+                "{qname}"
+            );
+        }
+
+        // Without a network, the DNS server answers for no reverse name.
+        let names = Names {
+            network: None,
+            ..names.clone()
+        };
+        let response = forward_query(
+            &names,
+            &query_of("1.1.66.10.in-addr.arpa.", RecordType::PTR),
+        );
+        assert_eq!(response_code(&response.unwrap_err()), ResponseCode::Refused);
     }
 
     #[test]
@@ -1427,6 +1749,7 @@ mod tests {
                     nameserver: nameserver_addr,
                     ..forward()
                 }],
+                ..Default::default()
             },
         )
         .unwrap();

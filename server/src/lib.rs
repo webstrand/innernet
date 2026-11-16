@@ -298,7 +298,11 @@ pub async fn serve(
         tunnel: Box::new(tunnel),
         names: config.dns.clone().map(|dns| {
             (
-                DnsService::new(interface, hosts_opts.host_suffix.clone()),
+                DnsService::new(
+                    interface,
+                    hosts_opts.host_suffix.clone(),
+                    config.interface.address,
+                ),
                 dns,
             )
         }),
@@ -531,8 +535,9 @@ mod tests {
             key
         );
         let mut other = config;
-        other.interface.private_key =
-            innernet_shared::interface_config::InterfaceKey::inline(Key::generate_private().to_base64());
+        other.interface.private_key = innernet_shared::interface_config::InterfaceKey::inline(
+            Key::generate_private().to_base64(),
+        );
         assert!(check_database_matches_config(&server.db().lock(), &other).is_err());
 
         Ok(())
