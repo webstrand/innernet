@@ -28,8 +28,12 @@
 //! It answers a PTR query for the reverse name of the address of a hostname, as it answers for the
 //! hostname, with every hostname at that address. A reverse name of the network at which no
 //! hostname lies doesn't exist, and a reverse name of the reverse zone outside the network is
-//! refused, so that another DNS server can answer for it. A peer's nameserver never answers a
-//! reverse name.
+//! refused, so that another DNS server can answer for it. The reverse name of any other address of
+//! the delegation that a peer claims goes, unchanged, to the peer's nameserver, if the DNS server
+//! forwards to it; the DNS server keeps only the PTR records of that name whose target, with the
+//! zone replaced by the hostname, lies under the peer's hostname, so that the nameserver only ever
+//! names the peer's own addresses with the peer's own names. The address of a hostname is always
+//! the DNS server's own to answer.
 //!
 //! The DNS server refuses queries for names outside both zones.
 //!
@@ -244,6 +248,9 @@ struct Forwarded {
     /// The largest response that the client accepts over UDP.
     max_udp_size: usize,
     forward: Forward,
+    /// Whether the name is the reverse name of an address of the peer's delegation, which is
+    /// forwarded as it is, and whose response is restored as [`restore_reverse`] does.
+    reverse: bool,
 }
 
 /// Prepares `query` for forwarding, or returns the response to send back instead: the address of
@@ -263,8 +270,20 @@ fn forward_query(names: &Names, query: &[u8]) -> Result<Forwarded, Vec<u8>> {
     if message.queries.len() != 1 {
         return Err(error_response(query, ResponseCode::Refused));
     }
-    if let Some(response) = reverse_response(names, &message, query) {
-        return Err(response);
+    match reverse_response(names, &message, query) {
+        Some(Reverse::Answer(response)) => return Err(response),
+        Some(Reverse::Forward(forward)) => {
+            let name = message.queries[0].name().clone();
+            return Ok(Forwarded {
+                query: query.to_vec(),
+                forwarded_name: name.clone(),
+                name,
+                max_udp_size: usize::from(message.max_payload()),
+                forward: forward.clone(),
+                reverse: true,
+            });
+        },
+        None => {},
     }
     let name = message.queries[0].name().clone();
     let forward = route(&names.forwards, &name);
@@ -292,6 +311,7 @@ fn forward_query(names: &Names, query: &[u8]) -> Result<Forwarded, Vec<u8>> {
             forwarded_name,
             max_udp_size: usize::from(message.max_payload()),
             forward: forward.clone(),
+            reverse: false,
         }),
         Err(_) => Err(error_response(query, ResponseCode::ServFail)),
     }
@@ -407,14 +427,25 @@ fn parse_reverse(name: &Name) -> Option<(IpNet, bool)> {
     Some((prefix, rest))
 }
 
-/// The response to `message`, the standard query `query` of one question, for a reverse name of
-/// the reverse zone of the network of `names` that lies within the network or contains it, or
-/// `None` for any other name: for the reverse name of an address, a PTR record for each hostname
-/// of `names` at that address if the query asks for one, or for any type, and no record
-/// otherwise; for a shorter reverse name, no record if the reverse zone is at that name or a
-/// hostname lies under it. Any other reverse name of the network doesn't exist. The response is
-/// authoritative.
-fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Vec<u8>> {
+/// How the DNS server answers a reverse name of its reverse zone.
+enum Reverse<'a> {
+    /// With this response.
+    Answer(Vec<u8>),
+    /// By forwarding the query to the nameserver of the peer of this forward, whose delegation
+    /// holds the address.
+    Forward(&'a Forward),
+}
+
+/// How to answer `message`, the standard query `query` of one question, for a reverse name of the
+/// reverse zone of the network of `names` that lies within the network or contains it, or `None`
+/// for any other name. For the reverse name of an address, the response holds a PTR record for
+/// each hostname of `names` at that address if the query asks for one, or for any type, and no
+/// record otherwise; where no hostname lies at the address, the query goes to the nameserver of
+/// the forward whose delegation holds it, if any. For a shorter reverse name, the response holds
+/// no record if the reverse zone is at that name, or a hostname or the delegation of a forward
+/// lies under it or holds it. Any other reverse name of the network doesn't exist. The response
+/// is authoritative.
+fn reverse_response<'a>(names: &'a Names, message: &Message, query: &[u8]) -> Option<Reverse<'a>> {
     let network = names.network?;
     let question = &message.queries[0];
     let (prefix, rest) = parse_reverse(question.name())?;
@@ -424,17 +455,22 @@ fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Ve
     if !in_zone {
         return None;
     }
+    let answer = |code| Some(Reverse::Answer(authoritative(message, query, code)));
     if rest {
-        return Some(authoritative(message, query, ResponseCode::NXDomain));
+        return answer(ResponseCode::NXDomain);
     }
     let under = |ip: &IpAddr| prefix.contains(ip);
     if prefix.prefix_len() < prefix.max_prefix_len() {
-        let exists = prefix.prefix_len() == apex || names.hosts.values().any(under);
-        let code = match exists {
+        let delegated = names.forwards.iter().any(|forward| {
+            forward.delegation.iter().any(|delegation| {
+                prefix.contains(&delegation.net()) || delegation.net().contains(&prefix)
+            })
+        });
+        let exists = prefix.prefix_len() == apex || names.hosts.values().any(under) || delegated;
+        return answer(match exists {
             true => ResponseCode::NoError,
             false => ResponseCode::NXDomain,
-        };
-        return Some(authoritative(message, query, code));
+        });
     }
     let hostnames: Vec<&Name> = names
         .hosts
@@ -443,7 +479,16 @@ fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Ve
         .map(|(hostname, _)| hostname)
         .collect();
     if hostnames.is_empty() {
-        return Some(authoritative(message, query, ResponseCode::NXDomain));
+        let address = prefix.addr();
+        return match names.forwards.iter().find(|forward| {
+            forward
+                .delegation
+                .iter()
+                .any(|delegation| delegation.contains_addr(&address))
+        }) {
+            Some(forward) => Some(Reverse::Forward(forward)),
+            None => answer(ResponseCode::NXDomain),
+        };
     }
     let mut response = authoritative_response(message);
     if matches!(question.query_type(), RecordType::PTR | RecordType::ANY) {
@@ -455,11 +500,11 @@ fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Ve
             ));
         }
     }
-    Some(
+    Some(Reverse::Answer(
         response
             .to_vec()
             .unwrap_or_else(|_| error_response(query, ResponseCode::ServFail)),
-    )
+    ))
 }
 
 /// Restores the names of a nameserver's `response` to what the client asked about: the queried
@@ -474,6 +519,9 @@ fn reverse_response(names: &Names, message: &Message, query: &[u8]) -> Option<Ve
 /// elsewhere, is left as it is.
 fn restore_response(forwarded: &Forwarded, response: &[u8]) -> Option<Message> {
     let mut message = Message::from_vec(response).ok()?;
+    if forwarded.reverse {
+        return Some(restore_reverse(forwarded, message));
+    }
     let Forward {
         hostname,
         zone,
@@ -537,6 +585,41 @@ fn restore_response(forwarded: &Forwarded, response: &[u8]) -> Option<Message> {
     }
     message.signature = None;
     Some(message)
+}
+
+/// Restores a nameserver's `message`, its response to the reverse name of an address of the peer's
+/// delegation, to what the client asked about: the queried name as the client spelled it, and only
+/// the PTR records of that name whose target, with the zone replaced by the hostname, lies under
+/// the hostname, so that a peer's nameserver only ever names the peer's own addresses with the
+/// peer's own names. Every other record is dropped, those of the authority and additional sections
+/// included.
+fn restore_reverse(forwarded: &Forwarded, mut message: Message) -> Message {
+    let Forward { hostname, zone, .. } = &forwarded.forward;
+    for query in &mut message.queries {
+        if *query.name() == forwarded.name {
+            query.set_name(forwarded.name.clone());
+        }
+    }
+    message.answers.retain_mut(|record| {
+        if record.name != forwarded.name {
+            return false;
+        }
+        let RData::PTR(PTR(target)) = &mut record.data else {
+            return false;
+        };
+        if let Some(restored) = replace_suffix(target, zone, hostname) {
+            *target = restored;
+        }
+        if !hostname.zone_of(target) {
+            return false;
+        }
+        record.name = forwarded.name.clone();
+        true
+    });
+    message.authorities.clear();
+    message.additionals.clear();
+    message.signature = None;
+    message
 }
 
 /// `message` as a response to a client over UDP, within `max_size`, the largest that the client
@@ -1261,7 +1344,7 @@ mod tests {
             ("66.10.in-addr.arpa.", ResponseCode::NoError),
             ("1.66.10.in-addr.arpa.", ResponseCode::NoError),
             ("2.66.10.in-addr.arpa.", ResponseCode::NXDomain),
-            ("3.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+            ("3.2.66.10.in-addr.arpa.", ResponseCode::NXDomain),
             ("x.1.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
             ("www.1.66.10.in-addr.arpa.", ResponseCode::NXDomain),
         ] {
@@ -1297,6 +1380,112 @@ mod tests {
             &query_of("1.1.66.10.in-addr.arpa.", RecordType::PTR),
         );
         assert_eq!(response_code(&response.unwrap_err()), ResponseCode::Refused);
+    }
+
+    #[test]
+    fn test_forwards_reverse_names_within_the_delegation() {
+        let names = Names {
+            zone: name("e2e.wg."),
+            network: Some("10.64.0.0/10".parse().unwrap()),
+            hosts: [(name("b.e2e.wg."), "10.66.1.1".parse().unwrap())].into(),
+            forwards: vec![forward()],
+        };
+        let ptr = |qname: &str| forward_query(&names, &query_of(qname, RecordType::PTR));
+
+        // The reverse name of an address of the delegation goes unchanged to the nameserver.
+        let forwarded = ptr("34.1.66.10.IN-ADDR.arpa.").unwrap();
+        assert!(forwarded.reverse);
+        assert_eq!(forwarded.forward, forward());
+        assert!(forwarded.forwarded_name.eq_case(&name("34.1.66.10.IN-ADDR.arpa.")));
+        let message = Message::from_vec(&forwarded.query).unwrap();
+        assert!(message.queries[0]
+            .name()
+            .eq_case(&name("34.1.66.10.IN-ADDR.arpa.")));
+
+        // The address of a hostname is the DNS server's own to answer, and an address outside
+        // every delegation doesn't exist.
+        let response = Message::from_vec(&ptr("1.1.66.10.in-addr.arpa.").unwrap_err()).unwrap();
+        assert_eq!(response.answers[0].data, RData::PTR(PTR(name("b.e2e.wg."))));
+        assert_eq!(
+            response_code(&ptr("1.2.66.10.in-addr.arpa.").unwrap_err()),
+            ResponseCode::NXDomain
+        );
+
+        // A shorter reverse name exists where a delegation lies under it.
+        let names = Names {
+            forwards: vec![Forward {
+                delegation: vec!["10.66.2.32/28".parse().unwrap()],
+                ..forward()
+            }],
+            ..names
+        };
+        for (qname, code) in [
+            ("2.66.10.in-addr.arpa.", ResponseCode::NoError),
+            ("3.66.10.in-addr.arpa.", ResponseCode::NXDomain),
+        ] {
+            let response = forward_query(&names, &query_of(qname, RecordType::PTR));
+            assert_eq!(response_code(&response.unwrap_err()), code, "{qname}");
+        }
+    }
+
+    #[test]
+    fn test_restores_reverse_responses() {
+        // A nameserver names only the queried address, and only with the peer's own names.
+        let names = Names {
+            zone: name("e2e.wg."),
+            network: Some("10.64.0.0/10".parse().unwrap()),
+            forwards: vec![forward()],
+            ..Default::default()
+        };
+        let qname = "34.1.66.10.IN-ADDR.arpa.";
+        let forwarded = forward_query(&names, &query_of(qname, RecordType::PTR)).unwrap();
+        let mut response = Message::from_vec(&nameserver_response(
+            &forwarded,
+            vec![
+                record(
+                    "34.1.66.10.in-addr.arpa.",
+                    RData::PTR(PTR(name("www.example.com."))),
+                ),
+                record(qname, RData::PTR(PTR(name("example.com.")))),
+                record(qname, RData::PTR(PTR(name("x.b.e2e.wg.")))),
+                record(qname, RData::PTR(PTR(name("a.e2e.wg.")))),
+                record(qname, RData::PTR(PTR(name("bank.com.")))),
+                record(qname, RData::TXT(TXT::new(vec!["x".into()]))),
+                record(
+                    "35.1.66.10.in-addr.arpa.",
+                    RData::PTR(PTR(name("www.example.com."))),
+                ),
+            ],
+        ))
+        .unwrap();
+        response.add_authority(record(
+            "1.66.10.in-addr.arpa.",
+            RData::SOA(SOA::new(
+                name("ns.example.com."),
+                name("admin.example.com."),
+                1,
+                60,
+                60,
+                60,
+                60,
+            )),
+        ));
+        let restored = restore_response(&forwarded, &response.to_vec().unwrap()).unwrap();
+        assert!(restored.queries[0].name().eq_case(&name(qname)));
+        let targets: Vec<&RData> = restored.answers.iter().map(|r| &r.data).collect();
+        assert_eq!(
+            targets,
+            [
+                &RData::PTR(PTR(name("www.b.e2e.wg."))),
+                &RData::PTR(PTR(name("b.e2e.wg."))),
+                &RData::PTR(PTR(name("x.b.e2e.wg."))),
+            ]
+        );
+        assert!(restored
+            .answers
+            .iter()
+            .all(|record| record.name.eq_case(&name(qname))));
+        assert!(restored.authorities.is_empty());
     }
 
     #[test]
