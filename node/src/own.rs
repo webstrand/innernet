@@ -51,12 +51,17 @@ pub fn sign(
 
 /// What the node announces, as the config of its interface, `interface`, selects it from `own`,
 /// its record as the coordinator assigns it, with the ranges that the server assigns it as its
-/// delegations: it claims the prefixes of `delegation` that lie within one of those ranges, or
-/// every range whole by default, and its name, with only the claims of `claim_types`, the types that the server
-/// checks; it states the prefixes of `allowed-ips`, shrunk to the delegation that it claims, or
-/// all of that delegation by default, the address of its interface as its primary IP, and its
-/// endpoints, in the order in which peers try them: the preferred endpoint, then `candidates`, at
-/// most [`announcement::MAX_ENDPOINTS`] in all.
+/// delegations: it claims the prefixes of `delegation` that lie within one of those ranges, or the
+/// address of its interface alone by default, whatever else the server assigns, and its name, with
+/// only the claims of `claim_types`, the types that the server checks; it states the prefixes of
+/// `allowed-ips`, shrunk to the delegation that it claims, or all of that delegation by default,
+/// the address of its interface as its primary IP, and its endpoints, in the order in which peers
+/// try them: the preferred endpoint, then `candidates`, at most [`announcement::MAX_ENDPOINTS`] in
+/// all.
+///
+/// The server alone can't extend what the node claims, nor what other peers route to it: an
+/// assigned range that the node doesn't claim whole is logged once, and the operator claims it
+/// through `delegation`.
 ///
 /// The preferred endpoint is `external-endpoint`, or, if `announce-observed-endpoint` allows it,
 /// `observed`, the endpoint at which the server observes this client, which also completes the
@@ -76,9 +81,10 @@ pub fn own_announcement(
     last: Option<u64>,
     now: u64,
 ) -> Announcement {
+    let primary_ip = interface.address.addr();
     let selected = match &interface.delegation {
         Some(selected) => selected.clone(),
-        None => own.delegations.clone(),
+        None => vec![Prefix::host(primary_ip)],
     };
     let mut delegation: Vec<Prefix> = vec![];
     for prefix in selected {
@@ -93,6 +99,14 @@ pub fn own_announcement(
         }
     }
     delegation.sort();
+    for range in &own.delegations {
+        if !delegation.iter().any(|claimed| claimed.contains(range)) {
+            warn_once(format!(
+                "not claiming all of {range}, which the server assigns to this client; the \
+                 delegation key of the config claims it."
+            ));
+        }
+    }
 
     let allowed_ips = match &interface.allowed_ips {
         Some(allowed) => {
@@ -109,7 +123,6 @@ pub fn own_announcement(
         None => delegation.clone(),
     };
 
-    let primary_ip = interface.address.addr();
     if !delegation
         .iter()
         .any(|prefix| prefix.contains_addr(&primary_ip))
@@ -311,9 +324,9 @@ mod tests {
             announcement.check_assigned(&assigned, own().name.as_ref())
         };
 
-        // By default, every assigned range is claimed whole, and stated as the allowed IPs, the
-        // address of the interface is the primary IP, and the observed endpoint is announced as
-        // the preferred endpoint, before the candidates.
+        // By default, only the address of the interface is claimed, and stated as the allowed
+        // IPs, whatever else the server assigns; it is the primary IP, and the observed endpoint
+        // is announced as the preferred endpoint, before the candidates.
         let candidates: Vec<Endpoint> = vec!["192.0.2.1:51820".parse().unwrap()];
         let announcement = own_announcement(
             &config(serde_json::json!({})),
@@ -324,9 +337,10 @@ mod tests {
             None,
             7,
         );
-        assert_eq!(announcement.claims.delegation, own().delegations);
+        let primary: Vec<Prefix> = vec!["10.0.1.1/32".parse().unwrap()];
+        assert_eq!(announcement.claims.delegation, primary);
         assert_eq!(announcement.claims.name, own().name);
-        assert_eq!(announcement.allowed_ips, own().delegations);
+        assert_eq!(announcement.allowed_ips, primary);
         assert_eq!(announcement.primary_ip, Some("10.0.1.1".parse().unwrap()));
         assert_eq!(
             announcement.endpoints,

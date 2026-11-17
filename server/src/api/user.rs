@@ -1530,7 +1530,11 @@ mod tests {
         let part = Prefix::new(ipnet::IpNet::new(wider.first(), wider.prefix_len() + 1)?)?;
         let keypair = server.keypair(test::DEVELOPER1_PEER_ID);
         let stored = || DatabasePeer::get_from_public_key(&server.db().lock(), &keypair.public);
-        assert_eq!(stored()?.effective().delegations.len(), 2);
+        // Until it announces, the peer claims only its primary IP, whatever the server assigns.
+        assert_eq!(
+            stored()?.effective().delegations,
+            [Prefix::host(developer1_ip())]
+        );
 
         let host = Prefix::host(developer1_ip());
         let narrowed = Announcement {

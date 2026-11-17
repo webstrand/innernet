@@ -1099,7 +1099,8 @@ mod tests {
         for table in ["prefix_pins", "announcements", "peers"] {
             assert_eq!(rows(table, &old_key)?, 0, "{table}");
         }
-        assert_eq!(rows("prefix_pins", &new_key)?, 2);
+        // Until it announces, the peer claims only the lowest address of its delegations.
+        assert_eq!(rows("prefix_pins", &new_key)?, 1);
         assert_eq!(rows("announcements", &new_key)?, 1);
         let redeemed = DatabasePeer::get_by_address(&store, within.parse()?)?;
         assert_eq!(redeemed.public_key, new_key.to_base64());

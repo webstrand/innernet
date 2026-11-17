@@ -491,6 +491,15 @@ pass "the server invites w with a /28, without naming an address"
 client adm add-delegation e2e --name a --prefix 10.66.1.64/28 --yes || fail "add-delegation as adm"
 [ "$(db "SELECT count(*) FROM delegations WHERE $(by_key "$a_key")")" = 2 ] ||
     fail "adm didn't delegate 10.66.1.64/28 to a"
+# a claims no more than its primary IP unless its config selects more.
+python3 -I - "$work/a/conf/e2e.conf" <<'EOF'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+address = re.search(r'(?m)^address = "([^/"]+)', text).group(1)
+text = text.replace("[interface]\n", f'[interface]\ndelegation = ["{address}/32", "10.66.1.64/28"]\n', 1)
+open(path, "w").write(text)
+EOF
 for peer in a adm; do
     client "$peer" fetch e2e || fail "fetch as $peer"
 done

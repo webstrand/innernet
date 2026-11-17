@@ -239,21 +239,24 @@ impl Announcement {
     }
 
     /// The announcement that the server makes for a peer that has never announced, from `peer`,
-    /// what it records of the peer: it claims every delegation of the peer and its name, accepts
-    /// traffic for all of its delegation, has the lowest address of its delegation as its primary
-    /// IP, and is reached at the endpoint that the server records, then at the candidates that
-    /// it records, into which the server has put the endpoint that it observes, as
-    /// [`legacy_endpoints`] orders them. Its timestamp is 0, so that the first announcement that
-    /// the peer signs is newer.
+    /// what it records of the peer: it has the lowest address of its delegation as its primary IP,
+    /// the address that a client that predates announcements takes on, and claims that address
+    /// alone, besides its name, and accepts traffic for it alone, whatever else the server
+    /// assigns the peer, since such a client uses no other address. It is reached at the endpoint
+    /// that the server records, then at the candidates that it records, into which the server has
+    /// put the endpoint that it observes, as [`legacy_endpoints`] orders them. Its timestamp is 0,
+    /// so that the first announcement that the peer signs is newer.
     pub fn synthetic(peer: &PeerContents) -> Self {
+        let primary_ip = hosts_fallback(&peer.delegations);
+        let held: Vec<Prefix> = primary_ip.map(Prefix::host).into_iter().collect();
         Self {
             timestamp: 0,
             claims: Claims {
-                delegation: peer.delegations.clone(),
+                delegation: held.clone(),
                 name: peer.name.clone(),
             },
-            allowed_ips: peer.delegations.clone(),
-            primary_ip: hosts_fallback(&peer.delegations),
+            allowed_ips: held,
+            primary_ip,
             endpoints: legacy_endpoints(peer.endpoint.as_ref(), &peer.candidates),
             nameserver: None,
         }
@@ -561,7 +564,7 @@ impl PeerContents {
     /// decoded is routed nothing.
     pub fn effective(&self) -> PeerContents {
         match self.announcement.as_ref().map(SignedAnnouncement::decode) {
-            None => self.effective_with(None),
+            None => self.effective_with(Some(&Announcement::synthetic(self))),
             Some(Ok(announcement)) => self.effective_with(Some(&announcement)),
             Some(Err(e)) => {
                 log::warn!(
@@ -1218,25 +1221,19 @@ mod tests {
         let (keypair, private_key) = keys();
         let mut peer = peer(&keypair.public);
 
-        // A peer that has never announced takes effect as the server reports it.
+        // A peer that has never announced takes effect as the unsigned announcement that the
+        // server makes of it: it claims, and is routed, only the lowest address of the
+        // delegations that the server records, whatever else they hold.
         let synthetic = peer.effective();
-        assert_eq!(synthetic, peer);
+        let lowest = prefixes(&["10.0.0.0/32"]);
         assert_eq!(
-            synthetic.allowed_ips(),
-            peer.delegations
-                .iter()
-                .map(Prefix::allowed_ip)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            synthetic.hosts_fallback(),
-            Some("10.0.0.0".parse().unwrap())
-        );
-        assert_eq!(
+            synthetic,
             peer.effective_with(Some(&Announcement::synthetic(&peer)))
-                .allowed_ips(),
-            synthetic.allowed_ips()
         );
+        assert_eq!(synthetic.delegations, lowest);
+        assert_eq!(synthetic.allowed_ips, Some(lowest));
+        assert_eq!(synthetic.primary_ip, Some("10.0.0.0".parse().unwrap()));
+        assert_eq!(synthetic.name, peer.name);
         // The unsigned announcement orders the endpoint that the server records before the
         // candidates, which leave it out, at most MAX_ENDPOINTS in all.
         let endpoint: Endpoint = "198.51.100.1:1".parse().unwrap();

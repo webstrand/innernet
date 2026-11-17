@@ -246,8 +246,10 @@ pub struct InterfaceInfo {
     pub announce_observed_endpoint: bool,
 
     /// The delegation that this client claims in its announcements: prefixes each within one of
-    /// the ranges that the server assigns it, or `None` for every assigned range whole. The
-    /// addresses that it claims are its own: no other key may take them while it claims them.
+    /// the ranges that the server assigns it, or `None` for the address of `address` alone,
+    /// whatever else the server assigns, so that the server alone can't extend what this client
+    /// claims. The addresses that it claims are its own: no other key may take them while it
+    /// claims them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<Vec<Prefix>>,
 

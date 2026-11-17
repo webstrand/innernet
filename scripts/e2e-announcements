@@ -253,8 +253,19 @@ step "a peer claims its ranges, and states what it accepts traffic for"
 client b add-delegation e2e --name a --prefix 10.66.1.64/28 --yes || fail "add-delegation as b"
 client a fetch e2e || fail "fetch as a"
 client b fetch e2e || fail "fetch as b"
+grep -q "not claiming all of 10.66.1.64/28" "$work/a.log" ||
+    fail "a didn't log the range that it doesn't claim"
+if routed b "$a_key" | grep -qF 10.66.1.64/28; then
+    fail "b routes to a a range that a doesn't claim"
+fi
+[ "$(routed b "$a_key")" = "$a_ip/32" ] || fail "b doesn't route a's primary IP alone to a"
+pass "a claims only its primary IP by default, whatever the server assigns it"
+
+set_interface a delegation "[\"$a_ip/32\", \"10.66.1.64/28\"]"
+client a fetch e2e || fail "fetch as a"
+client b fetch e2e || fail "fetch as b"
 routed b "$a_key" | grep -qF 10.66.1.64/28 || fail "b doesn't route a's whole delegation to a"
-pass "a claims its new range whole by default, which b routes to it"
+pass "a claims its new range once its config selects it, which b routes to it"
 
 # a accepts traffic for part of its delegation: a null route for the rest.
 set_interface a allowed-ips "[\"$a_ip/32\", \"10.66.1.64/29\"]"
@@ -295,7 +306,7 @@ if routed b "$a_key" | grep -qF 10.66.1.128/28; then
     fail "b routes to a a prefix beyond its ranges"
 fi
 pass "a claims only within its ranges"
-set_interface a delegation
+set_interface a delegation "[\"$a_ip/32\", \"10.66.1.64/28\"]"
 client a fetch e2e || fail "fetch as a"
 
 step "the server never withdraws what a peer claims, but reclaims what it gives up"

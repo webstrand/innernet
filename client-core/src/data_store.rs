@@ -1073,35 +1073,34 @@ mod tests {
                 .collect()
         };
 
-        // A peer's delegations are routed to it, and each is pinned to its key.
+        // A peer that has never announced claims, and is routed, only the lowest address of the
+        // delegations that the server reports, the address that a client that predates
+        // announcements takes on, and only that address is pinned to its key.
         let mut wider = BASE_PEERS.clone();
         wider[0].delegations = delegations(&["10.0.0.1/32", "10.0.0.32/28"]);
         assert!(store.update_peers(&wider).is_empty());
         assert_eq!(store.peers().unwrap(), &wider[..]);
         assert_eq!(rows_of(&store, "delegations", &BASE_PEERS[0].public_key), 2);
-        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
+        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 1);
+        assert_eq!(
+            store.effective_peers().unwrap()[0].allowed_ips,
+            Some(delegations(&["10.0.0.1/32"]))
+        );
 
-        // A withdrawn delegation is no longer routed, but stays pinned: another key is refused
-        // within it, which drops that peer whole.
+        // A withdrawn delegation that the peer never claimed is free for another key.
         assert!(store.update_peers(&BASE_PEERS).is_empty());
         assert_eq!(store.peers().unwrap(), *BASE_PEERS);
-        assert_eq!(rows_of(&store, "prefix_pins", &BASE_PEERS[0].public_key), 2);
         let mut other = BASE_PEERS[0].clone();
         other.name = Some("other".parse().unwrap());
         other.public_key = other_key.to_string();
         other.delegations = delegations(&["10.0.0.2/32", "10.0.0.40/29"]);
-        let reported = [BASE_PEERS[0].clone(), other.clone()];
-        let dropped = store.update_peers(&reported);
-        assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, &other);
-        assert_eq!(store.peers().unwrap(), *BASE_PEERS);
-
-        // A delegation that covers a prefix pinned to another key is refused, and the stored
-        // record of the peer is kept as it was.
-        other.delegations = delegations(&["10.0.0.2/32"]);
         assert!(store
             .update_peers(&[BASE_PEERS[0].clone(), other.clone()])
             .is_empty());
+        assert_eq!(rows_of(&store, "prefix_pins", other_key), 1);
+
+        // A delegation that overlaps another peer's is refused, and the stored record of the peer
+        // is kept as it was.
         let mut covering = other.clone();
         covering.delegations = delegations(&["10.0.0.2/32", "10.0.0.0/30"]);
         covering.name = Some("renamed".parse().unwrap());
@@ -1111,6 +1110,10 @@ mod tests {
             store.peers().unwrap(),
             [BASE_PEERS[0].clone(), other.clone()]
         );
+        other.delegations = delegations(&["10.0.0.2/32"]);
+        assert!(store
+            .update_peers(&[BASE_PEERS[0].clone(), other.clone()])
+            .is_empty());
 
         // A peer may have no delegation, and is then listed last, without a CIDR.
         let mut without = other.clone();
@@ -1893,7 +1896,8 @@ mod tests {
         let all_types = announcement::CLAIM_TYPES.map(String::from);
 
         // A peer that has never announced takes effect as the unsigned announcement that the
-        // server makes of it, and its delegations and its name are pinned to its key.
+        // server makes of it: it claims and is routed only the lowest address of its
+        // delegations, which is pinned to its key with its name.
         let mut store = open(true);
         let synthetic = Announcement::synthetic(&announcing_peer(&keypair));
         assert!(store
@@ -1901,15 +1905,13 @@ mod tests {
                 SignedAnnouncement::unsigned(&synthetic).unwrap()
             )))
             .is_empty());
+        let lowest = prefixes(&["10.0.1.0/32"]);
         let effective = store.effective_peers().unwrap().remove(0);
-        assert_eq!(effective.delegations, announcing_peer(&keypair).delegations);
-        assert_eq!(
-            effective.allowed_ips(),
-            announcing_peer(&keypair).allowed_ips()
-        );
+        assert_eq!(effective.delegations, lowest);
+        assert_eq!(effective.allowed_ips, Some(lowest.clone()));
         assert!(!announces(&store));
         assert!(!store.announces(&key).unwrap());
-        assert_eq!(pins(&store), announcing_peer(&keypair).delegations);
+        assert_eq!(pins(&store), lowest);
         assert_eq!(
             store.peers().unwrap()[0].name,
             announcing_peer(&keypair).name

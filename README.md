@@ -135,14 +135,16 @@ sudo innernet reclaim-delegation <interface> --name <peer> --prefix <subnet>
 
 or the same subcommands of `innernet-server`. The client subcommands require a server that speaks TLS. The server refuses to withdraw a delegation that the peer still announces. `reclaim-delegation` marks the delegation instead, and the server withdraws it once the peer no longer announces it.
 
-A client announces all of its delegations by default. The `[interface]` section of its config restricts what it announces and what other peers route to it:
+By default, a client announces only its primary IP, the address of its config, and other peers route only that address to it, whatever else the server delegates to it, so that the server alone can't route other addresses to the client. A client that predates announcements likewise holds only the lowest address of its delegations. The client logs each delegation that it doesn't announce whole; the operator selects what the client announces, and what other peers route to it, in the `[interface]` section of its config:
 
 ```toml
 [interface]
-delegation = ["10.60.64.2/32", "10.60.64.16/28"]  # the subnets that the client announces
-allowed-ips = ["10.60.64.2/32", "10.60.64.16/29"] # the subnets that other peers route to the client
+delegation = ["10.60.64.2/32", "10.60.64.16/28"]  # the subnets that the client announces (default: its primary IP)
+allowed-ips = ["10.60.64.2/32", "10.60.64.16/29"] # the subnets that other peers route to the client (default: all that it announces)
 extra-addresses = ["10.60.64.17"]                 # addresses that the client assigns to its interface besides `address`
 ```
+
+`delegation` must list the primary IP, which the server requires within what the client announces.
 
 ### DNS
 
